@@ -31,12 +31,12 @@
 
 #### 1.2.1 双通路冒烟测试
 
-**所有非文档 PR** 须通过 op-router agent 分别调用 Triton / AscendC 侧 agent，端到端跑通（编译通过 + 精度正确）。
+**所有非文档 PR** 须分别验证 Triton / AscendC 两条主流程，端到端跑通（编译通过 + 精度正确）。
 
-**执行方式**：使用 `op-router` agent 在 OpenCode 中执行评测：
+**执行方式**：使用当前仓库中的主 Agent 执行评测：
 
-- **Triton 通路**：调用 `AKG-triton` Agent 生成一个基础算子（如 level1 problem1），验证编译通过 + 精度正确
-- **AscendC 通路**：调用 `lingxi-ascendc` Agent 生成一个基础算子（如 level1 problem1），验证编译通过 + 精度正确
+- **Triton 通路**：调用 `triton-ascend-coder` 生成一个基础算子（如 level1 problem1），验证编译通过 + 精度正确
+- **AscendC 通路**：调用 `ascend-kernel-developer` 生成一个基础算子（如 level1 problem1），验证编译通过 + 精度正确
 
 两条通路都通过后在 PR 模板中标记结果。若因环境原因无法运行，须在 PR 中说明。
 
@@ -57,13 +57,14 @@
 
 > "其他"指 Benchmark、框架改动、Bug 修复、文档等类型的 PR。
 
-**执行方式**：使用 `benchmark-Scheduler` agent 在 OpenCode 中执行评测：
+**执行方式**：使用仓库自带的 benchmark 脚本执行评测：
 
 ```text
-评测KernelBench中Level 1的2, 4, 10, 11, 12, 13, 14, 15, 16, 17, 33, 34, 35, 36, 41, 42, 43, 44, 45, 46, 48, 50, 51, 53, 54, 57, 61, 63, 64, 67, 82, 87, 99, 100和Level 2的6, 12, 17, 23, 30, 94的任务,agent_workspace是<你的AscendOpGenAgent路径>
+bash utils/run_benchmark_triton.sh --benchmark-dir <KernelBench路径> --level <level> --ids <任务列表> --output <输出目录>
+bash utils/run_benchmark_ascendc.sh --benchmark-dir <NPUKernelBench路径> --level <level> --ids <任务列表> --output <输出目录>
 ```
 
-评测完成后，将 `agent_report.md` 中的数据与 [`benchmarks/BASELINE.md`](benchmarks/BASELINE.md) 逐项对比，在 PR 模板中填写结果。
+评测完成后，将输出目录中的报告与 [`benchmarks/BASELINE.md`](benchmarks/BASELINE.md) 逐项对比，在 PR 模板中填写结果。
 
 
 ### 1.3 基线管理
@@ -94,7 +95,7 @@
 
 1. **创建 Agent**：`agents/<name>.md`
 2. **创建 Skill**：`skills/<skill-name>/`
-3. **注册到 op-router**：在 [`agents/op-router.md`](agents/op-router.md) 添加路由分支（PR 待合入，暂未上仓）
+3. **接入主流程或子 Agent 编排**：根据功能归属，更新对应主 Agent 的工作流与文档说明
 4. **添加 Benchmark Case**：至少 5 个 case
 5. **提供基线数据**：跑一轮 benchmark，追加到 [`benchmarks/BASELINE.md`](benchmarks/BASELINE.md)
 6. **提交 PR**：按第一节规范填写模板

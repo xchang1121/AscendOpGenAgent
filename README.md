@@ -76,12 +76,15 @@ cd AscendOpGenAgent
 
 **操作步骤**：
 
-1. 在 AscendOpGenAgent 目录下配置 Agent和skills：
+1. 在 AscendOpGenAgent 目录下配置 Agent、子 Agent 和 skills：
 ```bash
 mkdir -p .claude
+mkdir -p .claude/agents
 mkdir -p .claude/skills
-mv agents/triton-ascend-coder.md .claude/CLAUDE.md
-mv skills/triton/* .claude/skills/
+cp agents/triton-ascend-coder.md .claude/CLAUDE.md
+cp agents/kernel-generator.md .claude/agents/
+cp agents/kernel-verifier.md .claude/agents/
+cp -r skills/triton/* .claude/skills/
 ```
 
 2. 进入 AscendOpGenAgent 目录，启动 claude：
@@ -104,13 +107,18 @@ claude
 
 **操作步骤**：
 
-1. 在 AscendOpGenAgent 目录下创建 `.claude` 目录并配置 Agent：
+1. 在 AscendOpGenAgent 目录下创建 `.claude` 目录并配置主 Agent、子 Agent 和 skills：
 ```bash
 mkdir -p .claude
+mkdir -p .claude/agents
 mkdir -p .claude/skills
-mv agents/triton-ascend-coder.md .claude/CLAUDE.md
-mv skills/triton/* .claude/skills/
+cp agents/triton-ascend-coder.md .claude/CLAUDE.md
+cp agents/kernel-generator.md .claude/agents/
+cp agents/kernel-verifier.md .claude/agents/
+cp -r skills/triton/* .claude/skills/
 ```
+
+> 当前 Triton benchmark 依赖 `triton-ascend-coder` 主 Agent，以及 `kernel-generator`、`kernel-verifier` 两个子 Agent。
 
 2. 进入 AscendOpGenAgent 目录，执行批量调度脚本：
 
@@ -231,47 +239,6 @@ bash utils/run_benchmark_ascendc.sh \
 #### AscendC
 关于 AscendC 的相关数据，请参阅[`benchmarks/BASELINE_0408.md`](benchmarks/BASELINE_0408.md) 
 
-
-
-## 项目结构
-
-```text
-AscendOpGenAgent/
-├── .gitignore
-├── LICENSE
-├── README.en.md
-├── README.md
-├── agents/                     # Agent 定义目录
-│   ├── AKG-triton.md           # 主编排 Agent
-│   ├── benchmark-scheduler.md
-│   ├── kernelgen-workflow.md   # 子 Agent（代码生成工作流）
-│   ├── ascend-kernel-developer.md
-│   └── performance-optimizer.md
-├── benchmarks/                 # 评测数据集存放目录
-│   ├── KernelBench/
-│   │   ├── level1/             # Level 1 测试用例 (100个)
-│   │   ├── level2/             # Level 2 测试用例 (99个)
-│   │   ├── level3/             # Level 3 测试用例 (52个)
-│   │   └── level4/             # Level 4 测试用例 (20个)
-│   └── NPUKernelBench/
-│       └── level1/             # NPU KernelBench Level 1 测试用例 (31个)
-└── skills/                     # Skill 实现目录
-    ├── ascendc_evalution/
-    ├── ascend_benchmark_evaluator/
-    ├── ascendc/
-    ├── benchmark-evaluator/    # 批量评测 Skill
-    ├── dsl_baseline_generation/
-    ├── dsl_lowering/
-    ├── functional_conversion/
-    ├── kernel-designer/
-    ├── kernel-generator/       # 代码生成 Skill
-    ├── kernel-verifier/        # 验证与性能测试 Skill
-    ├── latency-optimizer/
-    ├── op-task-extractor/      # 任务提取 Skill
-    ├── op_desc_generation/
-    └── reference_generation/
-
-```
 
 
 ## 许可证

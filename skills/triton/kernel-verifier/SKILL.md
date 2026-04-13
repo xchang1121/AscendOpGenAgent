@@ -192,7 +192,7 @@ python3 /path/to/kernel-verifier/scripts/benchmark.py \
     --output /tmp/workspace/softmax/iter_0/perf_result.json
 ```
 
-> **注意**：`--output` 路径由调用方指定，性能报告将写入该路径。通常由 `kernelgen-workflow` SubAgent 指定为 `{output-path}/iter_{iteration}/perf_result.json`。
+> **注意**：`--output` 路径由调用方指定，性能报告将写入该路径。通常由 `triton-ascend-coder` 主 Agent 在调用 `kernel-verifier` 子 Agent 时指定为 `{output-path}/iter_{iteration}/perf_result.json`。
 
 **参数说明**：
 

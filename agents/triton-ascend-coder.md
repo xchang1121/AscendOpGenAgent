@@ -8,13 +8,12 @@ tools:
   edit: true
   bash: true
   skill: true
+  agent: true
   read: true
 
 skills:
   - op-task-extractor
   - kernel-designer
-  - kernel-generator
-  - kernel-verifier
   - latency-optimizer
 ---
 
@@ -36,8 +35,8 @@ skills:
 Phase 0: 参数确认
 Phase 1: 任务构建          (op-task-extractor)
 Phase 2: 算法设计          (kernel-designer)
-Phase 3: 代码生成与验证    (kernel-generator + kernel-verifier, 迭代)
-Phase 4: 性能优化与验证    (latency-optimizer + kernel-verifier, 迭代)
+Phase 3: 代码生成与验证    (kernel-generator 子 Agent + kernel-verifier 子 Agent, 迭代)
+Phase 4: 性能优化与验证    (latency-optimizer + kernel-verifier 子 Agent, 迭代)
 Phase 5: 输出报告
 ```
 
@@ -102,38 +101,75 @@ conductor_suggestion = ""
 ```
 while iteration < max_iterations:
 
+    iter_dir = {工作目录}/output/iter_{iteration}
+    generated_code_path = iter_dir/generated_code.py
+    verify_dir = iter_dir/verify
+    perf_output_path = iter_dir/perf_result.json
+
     ── 3.1 代码生成 ──────────────────────────────────
-    调用 kernel-generator skill
+    调用 kernel-generator 子 Agent，并明确传入：
+      - op_name
+      - task_desc
+      - arch
+      - output_path = generated_code_path
+      - 首轮附加: sketch, user_requirements
+      - 重试附加: previous_code, verifier_error, conductor_suggestion
 
-    首次 (iteration == 0):
-      传入: op_name, task_desc, arch, sketch, user_requirements
-    重试 (iteration > 0):
-      传入: 上述 + previous_code + verifier_error + conductor_suggestion
+    要求 kernel-generator 子 Agent：
+      - 必须把完整代码写入 generated_code_path
+      - 不做验证，不跑 benchmark
+      - 仅返回简短执行结果
 
-    产物 → {工作目录}/output/iter_{iteration}/generated_code.py
-
-    ── 3.2 AST 预检查 ────────────────────────────────
-    执行 validate_triton_impl.py 检测 PyTorch 退化
-
-    退化 (exit code != 0):
-      verifier_error = "A-PyTorchFallback-Type{N}: ..."
+    若 generated_code_path 未生成:
+      verifier_error = "A-GenerationFailed: 子 Agent 未产出代码文件"
       → 跳到 3.4 Conductor
 
-    通过 (exit code == 0):
-      → 继续 3.3
+    ── 3.2 AST 预检查 + 功能验证 ──────────────────────
+    调用 kernel-verifier 子 Agent，传入：
+      - mode = verify
+      - op_name
+      - task_file_path = {工作目录}/{op_name}.py
+      - generated_code_path
+      - verify_dir
+      - triton_impl_name = triton_ascend_impl
 
-    ── 3.3 功能验证 ──────────────────────────────────
-    调用 kernel-verifier skill (verify.py)
-
-    在 {工作目录}/output/iter_{iteration}/verify/ 下创建:
-      - {op_name}_torch.py               (来自任务文件)
-      - {op_name}_triton_ascend_impl.py   (来自生成代码)
+    要求 kernel-verifier 子 Agent：
+      - 先执行 validate_triton_impl.py
+      - 再创建 verify_dir 下的标准验证文件
+      - 再执行 verify.py
+      - 返回成功/失败，以及原始错误输出
 
     验证通过:
-      复制 iter_{iteration}/generated_code.py → {工作目录}/output/generated_code.py
-      → 跳到 3.5 性能测试
+      复制 generated_code_path → {工作目录}/output/generated_code.py
+      previous_code = generated_code_path 的完整内容
+      → 继续 3.3
 
     验证失败:
+      verifier_error = kernel-verifier 子 Agent 返回的原始错误输出
+      previous_code = generated_code_path 的完整内容
+      删除 {工作目录}/output/generated_code.py（如存在）
+      → 跳到 3.4 Conductor
+
+    ── 3.3 性能测试 ──────────────────────────────────
+    调用 kernel-verifier 子 Agent，传入：
+      - mode = benchmark
+      - op_name
+      - verify_dir
+      - triton_impl_name = triton_ascend_impl
+      - warmup = 5
+      - repeats = 50
+      - output_path = perf_output_path
+
+    要求 kernel-verifier 子 Agent：
+      - 必须执行 benchmark.py
+      - 必须写出 perf_output_path
+
+    benchmark 成功:
+      复制 perf_output_path → {工作目录}/output/perf_result.json
+      记录 perf_data，break
+
+    benchmark 失败:
+      verifier_error = "B-BenchmarkFailed: benchmark.py 执行失败"
       删除 {工作目录}/output/generated_code.py（如存在）
       → 跳到 3.4 Conductor
 
@@ -155,14 +191,6 @@ while iteration < max_iterations:
         → 保存日志到 iter_{iteration}/log.md
         → iteration++
         → continue
-
-    ── 3.5 性能测试 ──────────────────────────────────
-    调用 kernel-verifier skill (benchmark.py)
-
-    产物 → {工作目录}/output/iter_{iteration}/perf_result.json
-    复制 → {工作目录}/output/perf_result.json
-
-    记录 perf_data，break
 
 ⚠️ Phase 3 验证通过后，**必须**进入 Phase 4 执行性能优化，**严禁**跳过。
 
@@ -234,33 +262,63 @@ baseline_code = Phase 3 产出的 generated_code.py
 ```
 while opt_iteration < max_opt_iterations:
 
+    opt_iter_dir = {工作目录}/output/opt_iter_{opt_iteration}
+    optimized_code_path = opt_iter_dir/optimized_code.py
+    verify_dir = opt_iter_dir/verify
+    baseline_perf_output = opt_iter_dir/baseline_perf_result.json
+    optimized_perf_output = opt_iter_dir/optimized_perf_result.json
+
     ── 4.1 代码分析 + 优化策略 + 代码重写 ────────────
     调用 latency-optimizer skill
 
-    产物 → {工作目录}/output/opt_iter_{opt_iteration}/optimized_code.py
+    产物 → optimized_code_path
     复制 → {工作目录}/output/optimized_code.py
 
     ── 4.2 双重验证 ──────────────────────────────────
-    调用 kernel-verifier skill 执行两次精度比对
+    调用 kernel-verifier 子 Agent 执行两次精度比对
 
-    在 {工作目录}/output/opt_iter_{opt_iteration}/verify/ 下创建:
+    在 verify_dir 下创建:
       - {op_name}_torch.py              (PyTorch 参考)
       - {op_name}_triton_baseline.py    (Phase 3 基线)
       - {op_name}_triton_optimized.py   (优化后)
 
-    第一次: verify.py --triton_impl_name triton_baseline
-    第二次: verify.py --triton_impl_name triton_optimized
+    第一次调用传入:
+      - mode = verify
+      - op_name
+      - task_file_path = {工作目录}/{op_name}.py
+      - generated_code_path = {工作目录}/output/generated_code.py
+      - verify_dir
+      - triton_impl_name = triton_baseline
+
+    第二次调用传入:
+      - mode = verify
+      - op_name
+      - task_file_path = {工作目录}/{op_name}.py
+      - generated_code_path = optimized_code_path
+      - verify_dir
+      - triton_impl_name = triton_optimized
 
     两次都通过 → 继续 4.3
     任一失败   → 跳到 4.5
 
     ── 4.3 双重性能测试 ──────────────────────────────
-    调用 kernel-verifier skill (benchmark.py) 两次
+    第一次调用 kernel-verifier 子 Agent，传入:
+      - mode = benchmark
+      - op_name
+      - verify_dir
+      - triton_impl_name = triton_baseline
+      - warmup = 5
+      - repeats = 50
+      - output_path = baseline_perf_output
 
-    第一次: benchmark --triton_impl_name triton_baseline
-      → baseline_perf_result.json
-    第二次: benchmark --triton_impl_name triton_optimized
-      → optimized_perf_result.json
+    第二次调用 kernel-verifier 子 Agent，传入:
+      - mode = benchmark
+      - op_name
+      - verify_dir
+      - triton_impl_name = triton_optimized
+      - warmup = 5
+      - repeats = 50
+      - output_path = optimized_perf_output
 
     计算 speedup_vs_baseline = baseline_latency / optimized_latency
 
@@ -414,7 +472,7 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 | A 类连续上限 | 同一子类型连续 ≥ 3 次 → 自动终止 |
 | 禁止 PyTorch 退化 | forward() 中禁止 torch.*/F.* 计算操作 |
 | 文件操作范围 | 限制在工作目录内 |
-| 验证方式 | 必须调用 kernel-verifier skill 的脚本，禁止自创测试 |
+| 验证方式 | 必须调用 kernel-verifier 子 Agent 及其标准脚本，禁止自创测试 |
 | 语言 | 思考、分析、日志使用中文；代码、路径使用英文 |
 | 时间戳/随机数 | 必须通过 bash 获取，禁止 LLM 模拟 |
 
