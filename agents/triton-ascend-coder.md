@@ -325,10 +325,106 @@ while opt_iteration < max_opt_iterations:
 达到 max_opt_iterations → 优化失败
 ```
 
+### 4.6 Block Size Scaling（必须执行）
+
+常规优化迭代（4.1–4.5）结束后，无论优化是否成功，都进入 Block Size Scaling。
+此步骤基于 `latency-optimizer` skill 的 `references/block_size_scaling.md` 策略。
+
+#### 适用范围
+
+仅针对单维度 BLOCK_SIZE 参数（如 `BLOCK_SIZE`、`XBLOCK`）。
+若 kernel 含多维分块参数（如 `BLOCK_M`/`BLOCK_N`/`BLOCK_K` 同时存在），或 BLOCK_SIZE 由 `triton.autotune` 管理，则跳过本步骤。
+
+#### 输入
+
+```
+best_code = 当前全局最优代码
+           （Phase 4 常规优化成功 → optimized_code，否则 → Phase 3 的 generated_code）
+best_perf = 对应的 perf_result.json
+```
+
+#### 状态变量
+
+```
+scale_iteration = 0
+current_block_size = 从 best_code 中解析出的 BLOCK_SIZE 值
+best_block_size = current_block_size
+best_latency = best_perf 中的 avg_latency_ms
+best_scaled_code = best_code
+results = []   # 记录所有 {block_size, latency} 或 {block_size, "failed"}
+```
+
+#### 流程
+
+```
+while True:
+    candidate_block_size = current_block_size * 2
+
+    if candidate_block_size > 65536:
+      break   # 超过 Triton Ascend 单块元素数硬限制
+
+    scale_iter_dir = {工作目录}/output/block_scale/scale_{scale_iteration}
+
+    ── 4.6.1 代码改写 ──────────────────────────────
+    从 best_code 复制一份，将 forward() 中 BLOCK_SIZE 赋值替换为 candidate_block_size。
+    Kernel 内部逻辑不变（已参数化），只改调用参数。
+    写入 scale_iter_dir/scaled_code.py
+
+    ── 4.6.2 验证 ──────────────────────────────────
+    调用 kernel-verifier 子 Agent 对 scaled_code.py 执行标准 verify。
+
+    要求：
+      - 必须传入 npu，verifier 负责确保在正确设备上执行
+
+    verify 失败:
+      results.append({candidate_block_size, "verify_failed"})
+      → break（到达硬件上限，停止搜索）
+
+    ── 4.6.3 性能测试 ──────────────────────────────
+    调用 kernel-verifier 子 Agent 对 scaled_code.py 执行标准 benchmark。
+    写出 scale_iter_dir/perf_result.json
+
+    benchmark 失败:
+      results.append({candidate_block_size, "benchmark_failed"})
+      → break
+
+    benchmark 成功:
+      记录 candidate_latency
+      results.append({candidate_block_size, candidate_latency})
+
+      if candidate_latency < best_latency:
+        best_latency = candidate_latency
+        best_block_size = candidate_block_size
+        best_scaled_code = scaled_code.py 内容
+
+    ── 4.6.4 推进 ──────────────────────────────────
+    current_block_size = candidate_block_size
+    scale_iteration++
+    continue
+```
+
+#### 搜索结束后
+
+```
+if best_block_size != 原始 BLOCK_SIZE:
+  将 best_scaled_code 晋升为 {工作目录}/output/optimized_code.py（覆盖）
+  将对应 perf_result.json 晋升为 {工作目录}/output/perf_result.json
+
+写入 {工作目录}/output/block_scale/summary.json:
+{
+  "original_block_size": 原始值,
+  "best_block_size": best_block_size,
+  "trials": results,
+  "speedup_vs_original": original_latency / best_latency
+}
+```
+
+→ 进入 Phase 5
+
 ### Phase 4 失败处理
 
-- Phase 4 失败 → **不输出优化报告**，以 Phase 3 的 `generated_code.py` 和性能数据为最终结果
-- Phase 4 成功 → 以 `optimized_code.py` 为最终结果
+- Phase 4 常规优化失败且 Block Size Scaling 无收益 → 以 Phase 3 的 `generated_code.py` 和性能数据为最终结果
+- Phase 4 有任何优化成功（常规优化或 Block Size Scaling）→ 以 `optimized_code.py` 为最终结果
 - 两种情况都进入 Phase 5
 
 ---
@@ -361,6 +457,13 @@ while opt_iteration < max_opt_iterations:
     "avg_latency_ms": 0.5678,
     "speedup_vs_torch": 2.17,
     "speedup_vs_baseline": 1.35
+  },
+  "block_size_scaling": {
+    "executed": true,
+    "original_block_size": 1024,
+    "best_block_size": 4096,
+    "trials": 3,
+    "speedup_vs_pre_scaling": 1.23
   }
 }
 ```
@@ -386,6 +489,13 @@ Phase 4 失败时（Phase 3 成功，优化未成功）：
   "perf_data": {
     "avg_latency_ms": 0.8000,
     "speedup_vs_torch": 1.50
+  },
+  "block_size_scaling": {
+    "executed": true,
+    "original_block_size": 1024,
+    "best_block_size": 1024,
+    "trials": 2,
+    "speedup_vs_pre_scaling": 1.0
   }
 }
 ```
@@ -420,8 +530,18 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 │   │   ├── baseline_perf_result.json
 │   │   ├── optimized_perf_result.json
 │   │   └── log.md
-│   └── opt_iter_1/                       # Phase 4 第 1 轮（如有）
-│       └── ...
+│   ├── opt_iter_1/                       # Phase 4 第 1 轮（如有）
+│   │   └── ...
+│   ├── block_scale/                      # Phase 4.6: Block Size Scaling
+│   │   ├── scale_0/
+│   │   │   ├── scaled_code.py
+│   │   │   ├── verify/
+│   │   │   │   ├── {op_name}_torch.py
+│   │   │   │   └── {op_name}_triton_ascend_impl.py
+│   │   │   └── perf_result.json
+│   │   ├── scale_1/
+│   │   │   └── ...
+│   │   └── summary.json                  # Scaling 搜索结果汇总
 ├── {op_name}_generated.py                # Phase 5: 最终代码
 ├── summary.json                          # 执行摘要
 └── report.md                             # 最终报告
@@ -437,8 +557,10 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 | Phase 3 | 达到 max_iterations | 输出失败报告，任务结束 |
 | Phase 3 | B 类环境错误 | 立即终止，任务失败 |
 | Phase 3 | C 类重复错误 | 立即终止，任务失败 |
-| Phase 4 | 达到 max_opt_iterations | 以 Phase 3 结果继续 |
+| Phase 4 | 达到 max_opt_iterations | 进入 Block Size Scaling |
 | Phase 4 | B 类环境错误 | 终止优化，以 Phase 3 结果继续 |
+| Phase 4.6 | verify 失败 | 停止搜索，以搜索前最优结果继续 |
+| Phase 4.6 | benchmark 失败 | 停止搜索，以搜索前最优结果继续 |
 
 ---
 
@@ -447,7 +569,8 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 | 约束 | 说明 |
 |------|------|
 | Phase 3 最大迭代 | 5 次，禁止超出 |
-| Phase 4 最大迭代 | 3 次，禁止超出 |
+| Phase 4 最大迭代 | 3 次（常规优化），禁止超出 |
+| Phase 4.6 搜索上限 | BLOCK_SIZE 倍增至超过 65536 或 verify 失败为止 |
 | Phase 4 成功底线 | 性能超过基线 Triton 实现 5% |
 | A 类连续上限 | 同一子类型连续 ≥ 3 次 → 自动终止 |
 | 禁止 PyTorch 退化 | forward() 中禁止 torch.*/F.* 计算操作 |

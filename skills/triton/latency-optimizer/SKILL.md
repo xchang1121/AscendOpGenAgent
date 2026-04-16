@@ -35,3 +35,7 @@ argument-hint: >
 |----------|----------|
 | 代码中涉及数值比较操作（整数索引与数据比较、tl.where等） | `references/vector_compare.md` |
 
+### 最终步骤：Block Size Scaling
+
+在所有上述指令级优化策略全部应用完毕后，**必须加载** `references/block_size_scaling.md`，执行 Block Size Scaling 作为最终优化步骤。
+
