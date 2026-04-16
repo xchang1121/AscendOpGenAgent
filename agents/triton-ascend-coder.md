@@ -250,17 +250,23 @@ while iteration < max_iterations:
 
 ⚠️ **Phase 4 是必须执行的阶段，禁止跳过。** Phase 3 验证通过后，无论性能数据如何，都必须进入 Phase 4 尝试优化。
 
+### 入口条件
+
+Phase 3 的 verify 和 benchmark 都通过 → 进入 Phase 4
+
 ### 状态变量
 
 ```
 opt_iteration = 0
 max_opt_iterations = 3
-best_code = ""
+best_code = Phase 3 产出的 generated_code.py
 best_speedup = 0.0
 baseline_code = Phase 3 产出的 generated_code.py
+baseline_perf = Phase 3 产出的 perf_result.json
+phase4_success = false
 ```
 
-### 迭代循环
+### 常规优化迭代循环（4.1–4.5）
 
 ```
 while opt_iteration < max_opt_iterations:
@@ -276,16 +282,23 @@ while opt_iteration < max_opt_iterations:
     mkdir -p verify_dir
 
     ── 4.1 代码分析 + 优化策略 + 代码重写 ────────────
-    调用 latency-optimizer skill
+    调用 latency-optimizer skill，传入：
+      - 输入代码：best_code（第一轮为 Phase 3 的 generated_code.py，后续为上轮优化结果）
+      - 输出路径：optimized_code_path
+      - 运行时上下文：npu, arch
 
-    产物 → optimized_code_path
-    复制 → {工作目录}/output/optimized_code.py
+    要求：
+      - latency-optimizer 必须产出 optimized_code_path
+      - 若 latency-optimizer 报告"无更多优化点"，记录此状态并跳到 4.6
+      - 若代码生成失败，记录错误并跳到 4.5
 
     ── 4.2 双重验证 ──────────────────────────────────
     调用 kernel-verifier 子 Agent，分别对 baseline 和 optimized 版本执行标准 verify 流程。
 
     要求：
       - 必须传入 npu，verifier 负责确保在正确设备上执行
+      - baseline 版本：使用 best_code
+      - optimized 版本：使用 optimized_code_path
       - 验证目录布局和验证脚本调用方式由 verifier 执行层负责
       - 主 Agent 只关心 baseline / optimized 两次验证是否都通过
 
@@ -304,26 +317,35 @@ while opt_iteration < max_opt_iterations:
 
     ── 4.4 结果判定 ──────────────────────────────────
 
-    speedup_vs_baseline ≥ 1.05:
-      → 优化成功，更新 best_code / best_speedup
-      → break，进入 Phase 5
+    if speedup_vs_baseline ≥ 1.05:
+      → 优化成功
+      → best_code = optimized_code_path 的完整内容
+      → best_speedup = speedup_vs_baseline
+      → phase4_success = true
+      → 复制 optimized_code_path → {工作目录}/output/optimized_code.py
+      → 复制 optimized_perf_output → {工作目录}/output/perf_result.json
+      → break（退出常规优化循环，进入 4.6）
 
-    latency-optimizer 报告无更多优化点:
-      → 终止，优化失败
+    else if latency-optimizer 报告无更多优化点:
+      → 优化无收益且无更多策略
+      → break（退出常规优化循环，进入 4.6）
 
-    否则:
-      → opt_iteration++，continue
+    else:
+      → 优化无收益但仍有策略可尝试
+      → opt_iteration++
+      → continue
 
     ── 4.5 分析决策 (验证失败时) ─────────────────────
-    A 类 (优化引入逻辑错误) → 回退，调整策略，continue
-    B 类 (环境错误) → 终止
-    C 类 (无法继续) → 终止
+    A 类 (优化引入逻辑错误) → 记录错误，opt_iteration++，continue
+    B 类 (环境错误) → 记录错误，break（退出常规优化循环，进入 4.6）
+    C 类 (无法继续) → 记录错误，break（退出常规优化循环，进入 4.6）
 
-    opt_iteration++
-    continue
-
-达到 max_opt_iterations → 优化失败
+达到 max_opt_iterations → 常规优化循环结束，进入 4.6
 ```
+
+### 常规优化循环出口
+
+无论常规优化是否成功，都必须进入 Phase 4.6 Block Size Scaling。
 
 ### 4.6 Block Size Scaling（必须执行）
 
@@ -339,8 +361,9 @@ while opt_iteration < max_opt_iterations:
 
 ```
 best_code = 当前全局最优代码
-           （Phase 4 常规优化成功 → optimized_code，否则 → Phase 3 的 generated_code）
+           （Phase 4 常规优化成功 → {工作目录}/output/optimized_code.py，否则 → Phase 3 的 generated_code.py）
 best_perf = 对应的 perf_result.json
+           （Phase 4 常规优化成功 → {工作目录}/output/perf_result.json，否则 → Phase 3 的 perf_result.json）
 ```
 
 #### 状态变量
@@ -420,6 +443,10 @@ if best_block_size != 原始 BLOCK_SIZE:
 ```
 
 → 进入 Phase 5
+
+### Phase 4 完成条件
+
+Phase 4.6 Block Size Scaling 结束后，无论搜索是否找到更优的 block size，都进入 Phase 5。
 
 ### Phase 4 失败处理
 
