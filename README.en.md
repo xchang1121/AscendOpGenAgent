@@ -76,11 +76,14 @@ Suitable for developers who need to quickly generate and verify the Triton imple
 
 **Steps**:
 
-1. Configure the Agent and skills in the AscendOpGenAgent directory:
+1. Configure the Agent, sub-agents, and skills in the AscendOpGenAgent directory:
 ```bash
 mkdir -p .claude
+mkdir -p .claude/agents
 mkdir -p .claude/skills
 cp agents/triton-ascend-coder.md .claude/CLAUDE.md
+cp agents/kernel-generator.md .claude/agents/
+cp agents/kernel-verifier.md .claude/agents/
 cp -r skills/triton/* .claude/skills/
 ```
 
@@ -104,13 +107,18 @@ Suitable for batch generation and evaluation of multiple operators with support 
 
 **Steps**:
 
-1. Create the `.claude` directory in the AscendOpGenAgent directory and configure the Agent:
+1. Create the `.claude` directory in the AscendOpGenAgent directory and configure the main Agent, sub-agents, and skills:
 ```bash
 mkdir -p .claude
+mkdir -p .claude/agents
 mkdir -p .claude/skills
-mv agents/triton-ascend-coder.md .claude/CLAUDE.md
-mv skills/triton/* .claude/skills/
+cp agents/triton-ascend-coder.md .claude/CLAUDE.md
+cp agents/kernel-generator.md .claude/agents/
+cp agents/kernel-verifier.md .claude/agents/
+cp -r skills/triton/* .claude/skills/
 ```
+
+> The current Triton benchmark depends on the `triton-ascend-coder` main Agent and the `kernel-generator` and `kernel-verifier` sub-agents.
 
 2. Enter the AscendOpGenAgent directory and execute the batch scheduling script:
 
@@ -233,44 +241,6 @@ Please refer to [`benchmarks/BASELINE_0408.md`](benchmarks/BASELINE_0408.md) for
 
 Please refer to [`benchmarks/BASELINE_0408.md`](benchmarks/BASELINE_0408.md) for AscendC-related data.
 
-## Project Structure
-
-```text
-AscendOpGenAgent/
-├── .gitignore
-├── LICENSE
-├── README.en.md
-├── README.md
-├── agents/                     # Agent definition directory
-│   ├── AKG-triton.md           # Main orchestration Agent
-│   ├── benchmark-scheduler.md
-│   ├── kernelgen-workflow.md   # Sub-Agent (Code generation workflow)
-│   ├── lingxi_code.md
-│   └── performance-optimizer.md
-├── benchmarks/                 # Evaluation dataset storage directory
-│   ├── KernelBench/
-│   │   ├── level1/             # Level 1 test cases (100 tasks)
-│   │   ├── level2/             # Level 2 test cases (99 tasks)
-│   │   ├── level3/             # Level 3 test cases (52 tasks)
-│   │   └── level4/             # Level 4 test cases (20 tasks)
-│   └── NPUKernelBench/
-│       └── level1/             # NPU KernelBench Level 1 test cases (31 tasks)
-└── skills/                     # Skill implementation directory
-    ├── ascendc_evalution/
-    ├── ascend_benchmark_evaluator/
-    ├── ascend_call_generation/
-    ├── benchmark-evaluator/    # Batch evaluation Skill
-    ├── dsl_baseline_generation/
-    ├── dsl_lowering/
-    ├── functional_conversion/
-    ├── kernel-designer/
-    ├── kernel-generator/       # Code generation Skill
-    ├── kernel-verifier/        # Verification and performance testing Skill
-    ├── latency-optimizer/
-    ├── op-task-extractor/      # Task extraction Skill
-    ├── op_desc_generation/
-    └── reference_generation/
-```
 
 
 ## License

@@ -137,6 +137,38 @@ class ModelNew(nn.Module):
 
 如果算子涉及多种类型（如融合算子），加载所有相关文档。
 
+### 手写优化案例（按需加载，相对路径索引）
+
+根据任务描述中的算子类型和错误反馈，从 kernel-designer 的案例库中选择**最相关的 1-2 个**加载。选择依据：算子类型匹配 > 数据规模接近 > 优化模式相似。
+
+| 类别 | 案例文件 | 核心优化 |
+|------|---------|---------|
+| **Elementwise** | `@../kernel-designer/references/cases/elemwise-broadcast-2d.md` | 2D 广播：小维不切分、循环外加载 |
+| | `@../kernel-designer/references/cases/elemwise-broadcast-3d.md` | 跨轴 3D 广播：两阶段 kernel |
+| | `@../kernel-designer/references/cases/elemwise-cast.md` | int8→fp16：二次切分 + 用满 UB |
+| | `@../kernel-designer/references/cases/elemwise-concat.md` | Slice+Concat 融合：精确切片 load |
+| | `@../kernel-designer/references/cases/elemwise-zeros.md` | 小 shape：少核、减调度开销 |
+| **Index** | `@../kernel-designer/references/cases/index-histogram.md` | 直方图：预排序 + 二分查找 |
+| | `@../kernel-designer/references/cases/index-put.md` | 批量 load 索引到 UB、get_element 复用 |
+| **MatMul** | `@../kernel-designer/references/cases/matmul-swizzle2d.md` | 固定核心数 grid、Swizzle2D 块重排 |
+| **Reduction** | `@../kernel-designer/references/cases/reduction-amax-large.md` | M≪N：reduce 轴多核 + 原子 + 二次切分 |
+| | `@../kernel-designer/references/cases/reduction-amax-medium.md` | 中等规模：矩阵累加再归约 |
+| | `@../kernel-designer/references/cases/reduction-amax-small.md` | 极小 shape：grid=1 最优 |
+| | `@../kernel-designer/references/cases/reduction-amin-atomic.md` | 原子 amin：两种原子方案对比 |
+| | `@../kernel-designer/references/cases/reduction-amin-large.md` | 超大 1D：二次切分 + 重组 |
+| | `@../kernel-designer/references/cases/reduction-amin-medium.md` | 大 N 维 amin：矩阵 min 再轴归约 |
+| | `@../kernel-designer/references/cases/reduction-amin-small.md` | 1D amin：并行度平衡 |
+| | `@../kernel-designer/references/cases/reduction-mean-large.md` | mean 行二次切分 |
+| | `@../kernel-designer/references/cases/reduction-mean-medium.md` | mean reduce 第一轴：重组 |
+| | `@../kernel-designer/references/cases/reduction-prod-small.md` | prod：tl.reduce + 自定义 mul |
+| | `@../kernel-designer/references/cases/reduction-sum-fused.md` | elemwise + sum 融合 |
+| | `@../kernel-designer/references/cases/reduction-sum-large.md` | 大规模 sum：重组 |
+| | `@../kernel-designer/references/cases/reduction-weighted-swiglu.md` | 3D SwiGLU backward：reshape + 行二次切分 |
+
+**加载时机**：
+- **首次生成**：根据 `op_name` 和 `task_desc` 判断算子类型，选择 1-2 个最相关案例
+- **迭代修复**：若前轮出现特定错误（如 grid 配置错误、内存访问模式不优），选择相关案例中的对应优化示例
+
 ---
 
 ## 算法草图使用规则

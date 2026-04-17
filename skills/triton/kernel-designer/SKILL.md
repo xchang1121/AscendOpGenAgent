@@ -39,21 +39,21 @@ argument-hint: >
 
 - `@references/sketch-design.md` — UnifiedSketch DSL 语法规范、核心操作、设计模式、最佳实践
 
-- **硬件规格**（按 `arch` 选择对应文件，位于 `kernel-generator/references/` 目录）：
+- **硬件规格**（按 `arch` 选择对应文件，位于 `./skills/triton/kernel-generator/references/` 目录）：
 
   | arch | 文档 |
   |------|------|
-  | ascend910b4 | `kernel-generator/references/hw-ascend910b4.md` |
-  | ascend910b3 | `kernel-generator/references/hw-ascend910b3.md` |
-  | ascend910b2c | `kernel-generator/references/hw-ascend910b2c.md` |
-  | ascend910b2 | `kernel-generator/references/hw-ascend910b2.md` |
-  | ascend910b1 | `kernel-generator/references/hw-ascend910b1.md` |
-  | ascend910_9362 | `kernel-generator/references/hw-ascend910-9362.md` |
-  | ascend910_9372 | `kernel-generator/references/hw-ascend910-9372.md` |
-  | ascend910_9381 | `kernel-generator/references/hw-ascend910-9381.md` |
-  | ascend910_9382 | `kernel-generator/references/hw-ascend910-9382.md` |
-  | ascend910_9391 | `kernel-generator/references/hw-ascend910-9391.md` |
-  | ascend910_9392 | `kernel-generator/references/hw-ascend910-9392.md` |
+  | ascend910b4 | `./skills/triton/kernel-generator/references/hw-ascend910b4.md` |
+  | ascend910b3 | `./skills/triton/kernel-generator/references/hw-ascend910b3.md` |
+  | ascend910b2c | `./skills/triton/kernel-generator/references/hw-ascend910b2c.md` |
+  | ascend910b2 | `./skills/triton/kernel-generator/references/hw-ascend910b2.md` |
+  | ascend910b1 | `./skills/triton/kernel-generator/references/hw-ascend910b1.md` |
+  | ascend910_9362 | `./skills/triton/kernel-generator/references/hw-ascend910-9362.md` |
+  | ascend910_9372 | `./skills/triton/kernel-generator/references/hw-ascend910-9372.md` |
+  | ascend910_9381 | `./skills/triton/kernel-generator/references/hw-ascend910-9381.md` |
+  | ascend910_9382 | `./skills/triton/kernel-generator/references/hw-ascend910-9382.md` |
+  | ascend910_9391 | `./skills/triton/kernel-generator/references/hw-ascend910-9391.md` |
+  | ascend910_9392 | `./skills/triton/kernel-generator/references/hw-ascend910-9392.md` |
 
   使用 `read` 工具读取对应架构的硬件规格文件。
 

@@ -195,10 +195,10 @@ if [[ "$USE_PARALLEL" == true ]]; then
 
                     START_TIME=$(date +%s)
 
-                    PROMPT="使用当前agent生成triton-ascend算子，npu=${npu}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
+                    PROMPT="使用当前agent及其subagent工作流生成、验证并评测triton-ascend算子，npu=${npu}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
 
                     if claude -p "$PROMPT" \
-                        --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)' \
+                        --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)' 'Agent(*)' \
                         >> "${OUTPUT_DIR}/npu_${npu}.log" 2>&1; then
 
                         END_TIME=$(date +%s)
@@ -261,10 +261,10 @@ else
 
         START_TIME=$(date +%s)
 
-        PROMPT="使用当前agent生成triton-ascend算子，npu=${NPU_ID}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
+        PROMPT="使用当前agent及其subagent工作流生成、验证并评测triton-ascend算子，npu=${NPU_ID}，算子描述文件为 ${file}，输出到 ${TARGET_OP_DIR}/"
 
         if claude -p "$PROMPT" \
-            --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)'; then
+            --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 'Skill(*)' 'Agent(*)'; then
             END_TIME=$(date +%s)
             ELAPSED=$((END_TIME - START_TIME))
             echo "| ${id} | ${filename} | ✅ 成功 | ${ELAPSED} |" >> "$REPORT_FILE"
