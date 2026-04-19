@@ -98,11 +98,12 @@ x = tl.load(ptr + row_idx * stride + cols, mask=mask)
 
 # 特征 4：未使用编译优化选项（multibuffer、unit_flag）
 kernel[grid](...)  # 未传入 multibuffer、unit_flag
+
 ```
 
 **判断逻辑**：
 - 检查 Grid 大小是否接近物理核数（40-48）
-  - 如果 Grid >> 48 或 Grid << 48 → 涉及
+  - 如果 Grid >> 48 或 Grid << 48 或者 Grid值无从判断 → 涉及
 - 检查每个 program 处理的数据量
   - 如果每个 program 只处理少量数据（如 1 行）→ 涉及
 - 检查是否使用了编译优化选项
@@ -339,32 +340,9 @@ for i in range(HEAD_NUM):
 
 ---
 
-### 优化点 11：BLOCK_SIZE 调优
+### 优化点 11：Autotune 自动调优
 
-**适用条件**：代码中存在可调整的 BLOCK_SIZE 参数，且 BLOCK_SIZE 未经过充分调优
-
-**典型代码特征**：
-```python
-@triton.jit
-def kernel(A, C, M, N,
-            BLOCK_M: tl.constexpr = 128,  # BLOCK_SIZE 可能需要调优
-            BLOCK_N: tl.constexpr = 128):
-```
-
-**判断逻辑**：
-- 如果代码中存在 BLOCK_SIZE 参数（BLOCK_M、BLOCK_N、BLOCK_K 等）且未进行系统性调优 → 涉及
-- 如果 BLOCK_SIZE 已经过充分调优（如通过 benchmark 确定了最优值，或已使用 autotune）→ 不涉及，跳过
-- 检查 BLOCK_SIZE 是否超过分块维度大小（会导致 padding 问题）→ 涉及
-
-**命中条件**：代码中存在 BLOCK_SIZE 参数，且当前值可能不是最优配置
-
-**参考文档**：`references/block_size_tuning.md`
-
----
-
-### 优化点 12：Autotune 自动调优
-
-**适用条件**：代码中存在多个可调参数，且未使用 autotune 进行自动搜索
+**适用条件**：代码中存在一个或者多个可调参数（例如BLOCK_SIZE、BLOCK_M等），且这些参数未经过充分调优，考虑到其他优化点可能引入可调超参数，最后再优化该优化点
 
 **典型代码特征**：
 ```python
@@ -390,21 +368,27 @@ kernel[grid](..., BLOCK_M=128, BLOCK_N=128)
 ---
 
 ## 优化流程
-
 ```
-1. 按顺序检查优化点 1 → 2 → 3 → ... → 12
+1. 按顺序检查优化点 1 → 2 → 3 → ... → 11
 2. 对于当前优化点，先判断是否命中（代码特征满足 + 适用条件成立）：
    - 未命中 → 跳过，检查下一优化点
    - 命中 → 参考对应文档，应用优化策略
 3. 应用优化后，必须加载 references/checklist.md 检查代码规范
 4. 如果代码规范不满足 → 修改代码直到满足规范
-5. 代码规范满足后 → 返回优化后的代码
+5. 代码规范满足后 → 返回优化后的代码，回到1继续检查优化点
 ```
 
 **重要约束**：
 - ⚠️ **只能使用本 skill 规定的优化方式，禁止使用任何超出本 skill 之外的优化方式**
 - ⚠️ **必须先命中优化点的「命中条件」，才能加载参考文档；未命中则跳过**
-- 一次优化迭代只能使用一个优化点
+- 一次优化迭代只能使用一个优化点，可以有多轮优化，示例：
+```
+  第一轮：检查 1→2→3→...，命中优化点 X，应用后验证
+  第二轮：检查 1→2→...，命中优化点 Y，应用后验证
+  第三轮：检查 1→2→...，命中优化点 Z，应用后验证
+  ...
+  直到所有优化点都不命中
+```
 - 一次只能参考一个文档
 
 ## 优化验证规则
@@ -432,6 +416,5 @@ kernel[grid](..., BLOCK_M=128, BLOCK_N=128)
 | Libdevice 函数使用 | `references/libdevice-usage.md` |
 | 循环不变量外提 | `references/loop-invariant-hoisting.md` |
 | Load 指令重排序 | `references/load-order.md` |
-| BLOCK_SIZE 调优 | `references/block_size_tuning.md` |
 | Autotune 自动调优 | `references/autotune.md` |
 | 代码规范检查 | `references/checklist.md` |
