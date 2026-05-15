@@ -169,6 +169,10 @@ else:
 is_invalid = tok < 0  # int 类型比较，退化为标量
 c = a // b  # int 类型除法，退化为标量
 d = a % b   # int 类型取余，退化为标量
+
+# 特征 5：atomic_* 标量操作
+for idx in range(0, BLOCK_SIZE):
+    tl.atomic_add(output_ptr + idx, block_sum)  # 标量的原子加
 ```
 
 **判断逻辑**：
@@ -176,6 +180,7 @@ d = a % b   # int 类型取余，退化为标量
 - 检查是否存在标量累加器（如 `sum_val = 0.0`）
 - 检查是否存在 `if-else` 控制流处理向量数据
 - 检查是否存在 `int32/int64` 类型的比较、除法、取余操作
+- 检查是否存在 `atomic_add` 这一类的 `atomic_*` 标量操作
 - 如果存在以上任一情况 → 涉及
 - 如果所有操作都已使用向量形式 → 不涉及，跳过
 
