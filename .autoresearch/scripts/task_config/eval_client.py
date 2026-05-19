@@ -27,7 +27,15 @@ import sys
 from typing import Optional
 
 from .loader import TaskConfig
-from .metric_policy import EvalResult
+from .metric_policy import EvalOutcome, EvalResult
+
+# Subprocess JSON-tail parser is the shared util — used to be duplicated
+# here as `_last_json_line` and in phase_machine.state_store as
+# `parse_last_json_line`.
+_scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+from utils.json_io import parse_last_json_line as _last_json_line  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +67,7 @@ def _count_ref_cases(task_dir: str, config: TaskConfig) -> int:
         sys.path.insert(0, ref_dir)
     try:
         import importlib.util
-        from input_groups import resolve as _resolve  # type: ignore
+        from utils.input_groups import resolve as _resolve  # type: ignore
         spec = importlib.util.spec_from_file_location(
             f"_count_ref_{config.name}", ref_path)
         if spec is None or spec.loader is None:
@@ -115,18 +123,6 @@ def _override_base_from_progress(task_dir: str) -> Optional[float]:
 # Result assembly
 # ---------------------------------------------------------------------------
 
-def _last_json_line(s: str) -> dict | None:
-    """Pull the final `{...}` JSON object from a multi-line log."""
-    for line in reversed((s or "").splitlines()):
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                pass
-    return None
-
-
 def _finite(v) -> bool:
     return isinstance(v, (int, float)) and 0 < v < float("inf")
 
@@ -172,7 +168,13 @@ def _assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
     """
     verify_log = verify_resp.get("log", "")
     verify_ok = bool(verify_resp.get("success", False))
-    verify_json = _last_json_line(verify_log) or {}
+    # error_source / verify_block come from eval_runner directly (it
+    # parses .eval_result.json — eval_kernel doesn't print the verify
+    # dict to stderr). Fall back to the log JSON tail for legacy producers.
+    error_source = verify_resp.get("error_source") if not verify_ok else None
+    verify_json = (verify_resp.get("verify_block")
+                   or _last_json_line(verify_log)
+                   or {})
 
     gen_time, gen_art = _resolve_profile(profile_resp, "gen_time",
                                          "generation_profile_result.json")
@@ -191,7 +193,22 @@ def _assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
         [i for i, t in enumerate(per_gen) if not _finite(t)]
         if per_gen is not None else []
     )
-    correctness = verify_ok and not crashed_shapes
+
+    # Outcome — see EvalOutcome docstring for definitions.
+    # error_source="ref" supersedes the verify/profile decision: a broken
+    # reference invalidates the whole eval regardless of what the profile
+    # happened to produce. Scaffold gates on this to refuse activation.
+    if error_source == "ref":
+        outcome = EvalOutcome.REF_FAIL
+    elif per_gen is None and not verify_ok:
+        outcome = EvalOutcome.FRAMEWORK_ERROR
+    elif not verify_ok:
+        outcome = EvalOutcome.KERNEL_VERIFY_FAIL
+    elif crashed_shapes:
+        outcome = EvalOutcome.KERNEL_PROFILE_CRASH
+    else:
+        outcome = EvalOutcome.OK
+    correctness = outcome == EvalOutcome.OK
 
     metrics: dict = {}
 
@@ -275,20 +292,28 @@ def _assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
             if isinstance(worst_max, (int, float)):
                 metrics["correctness_worst_max_abs"] = worst_max
 
-    if correctness:
+    if outcome == EvalOutcome.OK:
         error = None
-    elif crashed_shapes and verify_ok:
-        error = (f"profile crashed on {len(crashed_shapes)} of "
+    elif outcome == EvalOutcome.REF_FAIL:
+        error = (f"reference.py failed: "
+                 f"{verify_json.get('error') or '(no detail)'}")
+    elif outcome == EvalOutcome.KERNEL_PROFILE_CRASH:
+        error = (f"kernel crashed during profile on {len(crashed_shapes)} of "
                  f"{len(per_gen)} shapes")
     else:
-        error = "verify failed (kernel broken); ref profile may still be present"
+        error = {
+            EvalOutcome.FRAMEWORK_ERROR:
+                "eval framework produced no per-shape data (timeout / crash / OOM)",
+            EvalOutcome.KERNEL_VERIFY_FAIL: "kernel output != reference",
+        }[outcome]
 
     profile_log = profile_resp.get("log", "")
     return EvalResult(
-        correctness=correctness,
+        outcome=outcome,
         metrics=metrics,
         error=error,
         raw_output=(verify_log + "\n" + profile_log)[-4096:],
+        error_source=error_source,
     )
 
 
@@ -300,11 +325,11 @@ def run_local_eval(task_dir: str, config: TaskConfig,
                    device_id: Optional[int] = None) -> EvalResult:
     """Drive a single `eval_kernel.py` subprocess (verify + profile_gen
     + optional profile_base) and assemble an EvalResult."""
-    # eval_runner is a top-level script (one level up from this package).
+    # eval_runner lives in scripts/utils/.
     _scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _scripts_dir not in sys.path:
         sys.path.insert(0, _scripts_dir)
-    from eval_runner import local_eval
+    from utils.eval_runner import local_eval
 
     if device_id is not None:
         dev = int(device_id)
@@ -367,14 +392,14 @@ def run_eval(task_dir: str, config: TaskConfig,
     _scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _scripts_dir not in sys.path:
         sys.path.insert(0, _scripts_dir)
-    from eval_runner import detect_local_backend
+    from utils.eval_runner import detect_local_backend
     ok, why = detect_local_backend()
     if ok:
         print(f"[eval] ascend runtime ok: {why}", file=sys.stderr)
         return run_local_eval(task_dir, config, device_id=device_id)
 
     return EvalResult(
-        correctness=False,
+        outcome=EvalOutcome.FRAMEWORK_ERROR,
         error=(
             f"ascend runtime unavailable: {why}. Install torch + "
             f"torch_npu + CANN locally."

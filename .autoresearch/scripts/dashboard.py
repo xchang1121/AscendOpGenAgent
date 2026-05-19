@@ -17,6 +17,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import phase_machine as _pm
+from task_config.metric_policy import STUCK_BASELINE_OUTCOMES
+from utils.json_io import load_jsonl as _shared_load_jsonl
+from utils.json_io import _read_whole_file as _shared_read_whole_file
 
 # ---------------------------------------------------------------------------
 # Non-blocking keyboard input (cross-platform)
@@ -95,21 +98,7 @@ CYAN = "\033[36m"
 RESET = "\033[0m"
 
 
-def _read_raw(path):
-    # Read everything until EOF — single os.read() returns at most one chunk
-    # and short-reads on regular files (multi-shape history.jsonl trivially
-    # passes 256 KB after ~25 rounds with 60 cases).
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        chunks = []
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks).decode("utf-8", errors="replace")
-    finally:
-        os.close(fd)
+_read_raw = _shared_read_whole_file  # canonical loader lives in utils.json_io
 
 
 def load_json(path):
@@ -118,20 +107,7 @@ def load_json(path):
     return json.loads(_read_raw(path))
 
 
-def load_jsonl(path):
-    """Load all entries from a JSONL file; silently drops malformed lines."""
-    if not os.path.exists(path):
-        return []
-    out = []
-    for line in _read_raw(path).split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
-    return out
+load_jsonl = _shared_load_jsonl
 
 
 def load_plan(path):
@@ -208,7 +184,10 @@ def render(task_dir, history_offset=0, history_window=None):
     best_commit = progress.get("best_commit", "?")
     failures = progress.get("consecutive_failures", 0)
     plan_ver = progress.get("plan_version", 0)
-    status = progress.get("status", "?")
+    # Status was a redundant field on Progress that just tracked "has a
+    # plan been validated yet?". Derive it here from plan.md presence so
+    # the dashboard label stays identical for users.
+    status = "active" if os.path.exists(_pm.plan_path(task_dir)) else "no_plan"
     updated_raw = progress.get("last_updated", "?")
     # Convert UTC to local time
     try:
@@ -240,20 +219,70 @@ def render(task_dir, history_offset=0, history_window=None):
     lines.append(f"  {BOLD}Task:{RESET}     {task}")
     lines.append(f"  {BOLD}Status:{RESET}   {status_color}{status}{RESET}  (plan v{plan_ver})")
     lines.append(f"  {BOLD}Updated:{RESET}  {DIM}{updated}{RESET}")
+
+    # Task-level abort banner. Fires only for outcomes the agent cannot
+    # fix from inside the optimisation loop — REF_FAIL (broken source
+    # file) and FRAMEWORK_ERROR (eval pipeline crashed). Distinct from
+    # the per-component Seed / Baseline lines below: those describe
+    # whether each artefact was measurable; the banner says the WHOLE
+    # task is stuck and points at the recovery action.
+    outcome = progress.get("baseline_outcome")
+    err_src = progress.get("baseline_error_source") or ""
+    if outcome == "ref_fail":
+        lines.append("")
+        suffix = f" (error_source={err_src})" if err_src else ""
+        lines.append(f"  {BOLD}{RED}ABORTED:{RESET}  {RED}REF BROKEN{RESET}  "
+                     f"reference.py is invalid{suffix}.")
+        lines.append(f"           {DIM}Fix the source --ref file and re-run "
+                     f"/autoresearch from scratch.{RESET}")
+    elif outcome == "framework_error":
+        lines.append("")
+        lines.append(f"  {BOLD}{YELLOW}ABORTED:{RESET}  "
+                     f"{YELLOW}EVAL FRAMEWORK CRASHED{RESET}  "
+                     f"no per-shape data produced.")
+        lines.append(f"           {DIM}Check device / OOM / eval.timeout, then "
+                     f"retry baseline.py.{RESET}")
+
     lines.append("")
     lines.append(f"  {BOLD}Budget:{RESET}   {budget_color}{budget_bar} {rounds}/{max_rounds}{RESET}")
-    seed = progress.get("seed_metric")
+
+    # Baseline (PyTorch reference timing). Can be missing when the eval
+    # framework crashed before ref was measured (framework_error) or
+    # when the reference itself was broken (ref_fail).
     baseline_tags = {
         "ref": f"{DIM}(PyTorch reference){RESET}",
         "seed_fallback": f"{YELLOW}(fallback: seed — ref profile failed){RESET}",
     }
-    baseline_tag = baseline_tags.get(progress.get("baseline_source"), f"{DIM}(source unknown){RESET}")
-    lines.append(f"  {BOLD}Baseline:{RESET} {baseline}  {baseline_tag}")
-    if seed is None:
-        lines.append(f"  {BOLD}Seed:{RESET}     {RED}FAILED TO PROFILE{RESET}  "
-                     f"{DIM}(seed kernel passed verify but produced no timing){RESET}")
-    elif seed != baseline:
-        lines.append(f"  {BOLD}Seed:{RESET}     {seed}  {DIM}(initial kernel){RESET}")
+    if baseline is None:
+        lines.append(f"  {BOLD}Baseline:{RESET} {DIM}— (not measured){RESET}")
+    else:
+        baseline_tag = baseline_tags.get(progress.get("baseline_source"),
+                                          f"{DIM}(source unknown){RESET}")
+        lines.append(f"  {BOLD}Baseline:{RESET} {baseline}  {baseline_tag}")
+
+    # Seed (initial kernel timing). This line reports on the SEED KERNEL
+    # specifically — was its forward pass measured? — not on task-level
+    # health. Task-level aborts (ref_fail, framework_error) already
+    # surface in the banner above; here they collapse to "not measured".
+    seed = progress.get("seed_metric")
+    if seed is not None:
+        if seed != baseline:
+            lines.append(f"  {BOLD}Seed:{RESET}     {seed}  {DIM}(initial kernel){RESET}")
+        # else: redundant with Baseline line (seed_fallback path), suppress
+    elif outcome == "kernel_verify_fail":
+        lines.append(f"  {BOLD}Seed:{RESET}     {RED}FAILED{RESET}  "
+                     f"{DIM}(kernel output != reference; timing dropped){RESET}")
+    elif outcome == "kernel_profile_crash":
+        lines.append(f"  {BOLD}Seed:{RESET}     {RED}FAILED{RESET}  "
+                     f"{DIM}(kernel crashed during profile phase){RESET}")
+    elif outcome in STUCK_BASELINE_OUTCOMES:
+        # Seed never got a chance to be measured cleanly; the banner
+        # above explains why. Don't repeat the cause here.
+        lines.append(f"  {BOLD}Seed:{RESET}     {DIM}— (not measured; see ABORTED above){RESET}")
+    else:
+        # Legacy progress without baseline_outcome, or some other
+        # un-classified state. Keep a neutral fallback.
+        lines.append(f"  {BOLD}Seed:{RESET}     {DIM}— (no timing recorded){RESET}")
     lines.append(f"  {BOLD}Best:{RESET}     {GREEN}{best}{RESET}  ({improv_str})")
     lines.append(f"  {BOLD}Commit:{RESET}   {best_commit}")
     lines.append(f"  {BOLD}Failures:{RESET} {fail_color}{failures}{RESET} consecutive" +
@@ -389,48 +418,10 @@ def render(task_dir, history_offset=0, history_window=None):
 
 
 def _auto_detect_task_dir() -> str:
-    """Auto-detect task_dir: latest-modified ar_tasks/ dir wins.
-
-    Uses file modification times (specifically .ar_state/progress.json or .phase)
-    to pick the actively running task, not the one pointed to by stale .active_task.
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-
-    # Find all task dirs and pick the one with most recent activity
-    tasks_dir = os.path.join(project_root, "ar_tasks")
-    if os.path.isdir(tasks_dir):
-        subdirs_with_mtime = []
-        for d in os.listdir(tasks_dir):
-            full = os.path.join(tasks_dir, d)
-            if os.path.isdir(full) and os.path.exists(os.path.join(full, "task.yaml")):
-                # Prefer progress.json or .phase mtime (indicates active work),
-                # fallback to dir mtime
-                candidates = [
-                    _pm.progress_path(full),
-                    _pm.state_path(full, ".phase"),
-                    full,
-                ]
-                latest_mtime = 0
-                for c in candidates:
-                    if os.path.exists(c):
-                        latest_mtime = max(latest_mtime, os.path.getmtime(c))
-                subdirs_with_mtime.append((full, latest_mtime))
-
-        if subdirs_with_mtime:
-            # Pick most recently modified
-            subdirs_with_mtime.sort(key=lambda x: x[1], reverse=True)
-            return subdirs_with_mtime[0][0]
-
-    # Fallback: .active_task pointer written by hook_post_bash on activation
-    active_file = os.path.join(project_root, ".autoresearch", ".active_task")
-    if os.path.exists(active_file):
-        with open(active_file, "r") as f:
-            td = f.read().strip()
-        if td and os.path.isdir(td):
-            return td
-
-    return ""
+    """Auto-detect task_dir via phase_machine.find_active_task_dir — the
+    single shared rule used by resume / dashboard / batch (was three
+    slightly different rules; see find_active_task_dir docstring)."""
+    return _pm.find_active_task_dir() or ""
 
 
 def main():

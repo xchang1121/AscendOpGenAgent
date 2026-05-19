@@ -179,8 +179,10 @@ def local_eval(task_dir: str, op_name: str,
                  and override_base_time_us < float("inf"))
     phases = ["verify", "profile_gen"] + ([] if skip_base else ["profile_base"])
 
-    scripts_dir = os.path.dirname(os.path.abspath(__file__))
-    eval_script = os.path.join(scripts_dir, "eval_kernel.py")
+    # __file__ is scripts/utils/eval_runner.py — climb one level then
+    # dive into engine/ where eval_kernel.py lives post-restructure.
+    scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    eval_script = os.path.join(scripts_dir, "engine", "eval_kernel.py")
     # CANN's C runtime writes "[Warning]: tiling struct ..." to stdout
     # without trailing newlines, which would concatenate onto our JSON
     # if we tried to parse stdout. Use a sidecar file instead.
@@ -225,11 +227,22 @@ def local_eval(task_dir: str, op_name: str,
 
     verify_correct = (isinstance(verify_block, dict)
                       and bool(verify_block.get("correctness")))
+    # error_source: "ref" | "kernel" | None. run_verify tags it on the
+    # verify_block; eval_client reads it via verify_resp to decide
+    # REF_FAIL vs KERNEL_VERIFY_FAIL.
+    error_source = (verify_block.get("error_source")
+                    if isinstance(verify_block, dict) else None)
     verify_resp = {
         "success": verify_correct,
         "log": log_combined,
         "artifacts": {},
         "returncode": rc,
+        "error_source": error_source,
+        # Pass the full verify_block through so eval_client can pull
+        # failed_indices / per_case / diagnostics for DIAGNOSE context
+        # without re-parsing the log JSON tail (eval_kernel writes its
+        # structured result to .eval_result.json, not to stderr).
+        "verify_block": verify_block if isinstance(verify_block, dict) else {},
     }
 
     artifacts: dict[str, str] = {}

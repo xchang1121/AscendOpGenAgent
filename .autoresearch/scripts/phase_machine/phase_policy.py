@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from .state_store import (
-    INIT, GENERATE_REF, GENERATE_KERNEL, BASELINE, PLAN, EDIT,
+    INIT, BASELINE, PLAN, EDIT,
     DIAGNOSE, REPLAN, FINISH,
     PLAN_FILE, PLAN_ITEMS_FILE,
     load_progress, plan_path,
@@ -45,13 +45,19 @@ from .validators import get_active_item, has_pending_items
 # `-m` (runs module instead). Earlier rounds had a generic `--[\w-]+`
 # fallback; the result was that `python --version
 # .autoresearch/scripts/X.py` falsely classified as AR(X.py), and
-# hook_post_bash thought X.py had run.
+# hooks/post_bash thought X.py had run.
 #
 # Optional `(?:\S*?/)?` before `.autoresearch/scripts/` accepts both
 # relative invocations (`python .autoresearch/scripts/X.py`) and
 # absolute prefixes (`python /repo/.autoresearch/scripts/X.py`,
 # `python C:/repo/.autoresearch/scripts/X.py` after backslash
 # normalization).
+#
+# Optional `(?:engine/)?` after `.autoresearch/scripts/` accepts both
+# the post-restructure layout (engine/ holds blessed CLIs like
+# pipeline.py / baseline.py / create_plan.py / parse_args.py) and the
+# top-level lifecycle scripts (dashboard.py, scaffold.py, resume.py)
+# that stay at scripts/ root.
 # Common Python flags allowed by both `py` and `python*` (don't affect
 # script execution semantics; just runtime tweaks).
 _COMMON_PY_FLAGS = (
@@ -74,6 +80,7 @@ _CANONICAL_AR_RE = re.compile(
     r'python(?:\d+(?:\.\d+)?)?(?:\s+(?:' + _COMMON_PY_FLAGS + r'))*'
     r')'
     r'\s+(?:\S*?/)?\.autoresearch/scripts/'      # script (with optional path prefix)
+    r'(?:engine/)?'                              # optional engine/ subdir
     r'([A-Za-z_]\w*\.py)\b'                      #   group 1 = basename
     r'(?:\s+(?:'                                 # script args
     # Quoted strings: backtick and `$(` are forbidden (caught by the
@@ -302,16 +309,23 @@ def parse_canonical_ar(command: str) -> Optional[str]:
 
 def parse_invoked_ar_script(command: str) -> Optional[str]:
     """Basename of the AR script invocation, or None. Used by
-    hook_post_bash for routing on baseline.py / pipeline.py /
+    hooks/post_bash for routing on baseline.py / pipeline.py /
     create_plan.py."""
     return parse_canonical_ar(command)
 
 
 def parse_script_names(command: str) -> List[Tuple[str, str]]:
     """Return [(path, basename)] for the AR script in `command`, or [].
-    Used by hook_guard_bash's hallucinated-name pre-check."""
+    Used by hooks/guard_bash's hallucinated-name pre-check.
+
+    Path is the canonical engine/-rooted form for blessed CLIs and the
+    flat scripts/ form for top-level lifecycle scripts. Consumers only
+    care about the basename today; the path is informational."""
     invoked = parse_canonical_ar(command)
-    return [(f".autoresearch/scripts/{invoked}", invoked)] if invoked else []
+    if not invoked:
+        return []
+    sub = "" if invoked in _LIFECYCLE_SCRIPTS else "engine/"
+    return [(f".autoresearch/scripts/{sub}{invoked}", invoked)]
 
 
 def is_single_foreground_ar_invocation(command: str, *, script: str) -> tuple:
@@ -332,31 +346,27 @@ def is_single_foreground_ar_invocation(command: str, *, script: str) -> tuple:
 # someone tried `python .autoresearch/scripts/<x>.py task` directly.
 # An earlier version did substring-banning on the raw command, but
 # that falsely blocked harmless mentions like `echo quick_check.py`
-# or `git diff -- .autoresearch/scripts/settle.py` (READONLY shapes
+# or `git diff -- .autoresearch/scripts/engine/settle.py` (READONLY shapes
 # that mention the name in args, not invocations).
 _SUBPROCESS_ONLY_AR_SCRIPTS = {
-    "eval_wrapper.py":    "subprocess-only (invoked by pipeline.py)",
-    "keep_or_discard.py": "subprocess-only (invoked by pipeline.py)",
-    "quick_check.py":     "subprocess-only (invoked by pipeline.py)",
-    "settle.py":          "subprocess-only (invoked by pipeline.py)",
-    "_baseline_init.py":  "subprocess-only (invoked by baseline.py)",
+    "eval_wrapper.py": "subprocess-only (invoked by pipeline.py / baseline.py)",
+    "quick_check.py":  "subprocess-only (invoked by pipeline.py)",
+    "settle.py":       "subprocess-only (invoked by pipeline.py)",
 }
 
 # Per-phase: which AR script names may run.
 # LIFECYCLE scripts are always allowed (handled separately, not duplicated).
 # Subprocess-only scripts above are blocked everywhere.
 # EDIT-recovery (create_plan.py while .pending_settle.json exists) is
-# layered on top by hook_guard_bash; this table reflects the normal path.
+# layered on top by hooks/guard_bash; this table reflects the normal path.
 _AR_ALLOWED_BY_PHASE = {
-    INIT:            frozenset(),
-    GENERATE_REF:    frozenset(),
-    GENERATE_KERNEL: frozenset(),
-    BASELINE:        frozenset({"baseline.py"}),
-    DIAGNOSE:        frozenset({"create_plan.py"}),
-    PLAN:            frozenset({"create_plan.py"}),
-    REPLAN:          frozenset({"create_plan.py"}),
-    EDIT:            frozenset({"pipeline.py"}),
-    FINISH:          frozenset(),
+    INIT:     frozenset(),
+    BASELINE: frozenset({"baseline.py"}),
+    DIAGNOSE: frozenset({"create_plan.py"}),
+    PLAN:     frozenset({"create_plan.py"}),
+    REPLAN:   frozenset({"create_plan.py"}),
+    EDIT:     frozenset({"pipeline.py"}),
+    FINISH:   frozenset(),
 }
 
 # Per-phase: do we accept OTHER (ad-hoc shell, anything not classified
@@ -364,31 +374,31 @@ _AR_ALLOWED_BY_PHASE = {
 # accept. AR-mention-but-not-canonical is rejected in EVERY phase
 # (handled in check_bash, not via this table).
 _OTHER_ALLOWED_BY_PHASE = {
-    INIT:            False,
-    GENERATE_REF:    False,
-    GENERATE_KERNEL: False,
-    BASELINE:        False,
-    DIAGNOSE:        False,
-    PLAN:            True,
-    REPLAN:          True,
-    EDIT:            True,
-    FINISH:          True,
+    INIT:     False,
+    BASELINE: False,
+    DIAGNOSE: False,
+    PLAN:     True,
+    REPLAN:   True,
+    EDIT:     True,
+    FINISH:   True,
 }
 
 # Edit/Write rules: which file classes may be written per phase.
-#   "ref"      — reference.py
 #   "editable" — anything in task.yaml:editable_files
 # plan.md is never in any set — it's machine-generated.
+# reference.py is fixed at scaffold time and not editable thereafter.
 _EDIT_RULES = {
-    GENERATE_REF:    {"ref"},
-    GENERATE_KERNEL: {"editable"},
-    EDIT:            {"editable"},
+    EDIT: {"editable"},
 }
 
 
 _CANONICAL_FORM_REJECTION = (
     "AR scripts must be invoked directly: "
-    "`python .autoresearch/scripts/<name>.py <task_dir> [args...]`. "
+    "`python .autoresearch/scripts/engine/<name>.py <task_dir> [args...]` "
+    "for blessed CLIs (pipeline, baseline, create_plan, eval_wrapper, "
+    "quick_check, settle, parse_args), or "
+    "`python .autoresearch/scripts/<name>.py` for top-level scripts "
+    "(scaffold, resume, dashboard). "
     "Allowed alongside: env-var assignments, real Python flags "
     "(`-O`, `-u`, `-X dev`, ...), and FD redirection (`> log`, `2>&1`). "
     "Not supported: short-circuit flags (`--version`, `-c`, `-m`), "
@@ -421,7 +431,7 @@ def check_bash(phase: str, command: str) -> tuple:
     """
     if "git commit" in command:
         return False, ("manual 'git commit' forbidden — commits are "
-                       "produced by pipeline.py via keep_or_discard")
+                       "produced by pipeline.py via workflow.record_round")
 
     shape = classify(command)
 
@@ -513,7 +523,7 @@ def check_edit(phase: str, rel_path: str, editable_files,
                 f"plan.md is machine-generated — never hand-edit it. Write "
                 f"your <items>...</items> XML to .ar_state/{PLAN_ITEMS_FILE} "
                 f"with the Write tool, then run "
-                f"`python .autoresearch/scripts/create_plan.py \"<task_dir>\"`."
+                f"`python .autoresearch/scripts/engine/create_plan.py \"<task_dir>\"`."
             )
         return False, (
             f"{rel_path!r} is machine-maintained state. Only "
@@ -524,8 +534,6 @@ def check_edit(phase: str, rel_path: str, editable_files,
         )
 
     allowed_classes = _EDIT_RULES.get(phase, set())
-    if "ref" in allowed_classes and rel_path == "reference.py":
-        return True, ""
     if "editable" in allowed_classes and rel_path in set(editable_files or ()):
         return True, ""
 
@@ -558,30 +566,45 @@ def compute_next_phase(task_dir: str) -> str:
 
 
 def compute_resume_phase(task_dir: str) -> str:
-    """Determine phase for resuming after interruption."""
+    """Determine phase for resuming after interruption.
+
+    Mirrors PhaseController.on_baseline_settled for outcomes the live
+    hook never advanced past BASELINE — REF_FAIL / FRAMEWORK_ERROR keep
+    the task pinned at BASELINE so stop_save can let the agent exit
+    with a clear "fix --ref" / "fix env" message. Without that parity,
+    resuming a ref_fail task would land in PLAN and the agent would
+    burn max_rounds trying to plan around a broken reference."""
     progress = load_progress(task_dir)
     if not progress:
         return BASELINE
 
-    status = progress.get("status", "no_plan")
     eval_rounds = progress.get("eval_rounds", 0)
     max_rounds = progress.get("max_rounds", 999)
 
     if eval_rounds >= max_rounds:
         return FINISH
 
-    # Baseline didn't settle cleanly → demote to GENERATE_KERNEL so Edit on
-    # kernel.py is permitted again (BASELINE phase blocks editable_files
-    # writes). Mirrors hook_post_bash's live-session demotion: both
-    # seed_metric=None (no timing) and baseline_correctness=False (wrong
-    # output) count as failure. A seed that profiled but didn't verify is
-    # still a broken seed — letting resume enter PLAN would build a plan
-    # against a reference that the kernel doesn't actually match.
-    if (progress.get("seed_metric") is None
-            or progress.get("baseline_correctness") is False):
-        return GENERATE_KERNEL
+    # Stuck states from a previous baseline: keep at BASELINE so
+    # stop_save._is_stuck fires and the agent can Stop. The carve-out
+    # MUST match on_baseline_settled exactly — both import the same
+    # STUCK_BASELINE_OUTCOMES set so they cannot drift.
+    import sys as _sys, os as _os
+    _scripts_dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _scripts_dir not in _sys.path:
+        _sys.path.insert(0, _scripts_dir)
+    from task_config.metric_policy import STUCK_BASELINE_OUTCOMES
+    if progress.get("baseline_outcome") in STUCK_BASELINE_OUTCOMES:
+        return BASELINE
 
-    if not os.path.exists(plan_path(task_dir)) or status == "no_plan":
+    # Kernel-side baseline failure: route to PLAN. seed_metric=None (no
+    # timing) and baseline_outcome != "ok" (kernel verify/profile crash)
+    # both mean the seed needs rewriting; PLAN guidance surfaces a SEED
+    # FAILED block pushing the agent to rewrite kernel.py as plan items.
+    if (progress.get("seed_metric") is None
+            or progress.get("baseline_outcome") != "ok"):
+        return PLAN
+
+    if not os.path.exists(plan_path(task_dir)):
         return PLAN
 
     if get_active_item(task_dir) is not None or has_pending_items(task_dir):

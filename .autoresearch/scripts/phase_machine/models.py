@@ -42,13 +42,16 @@ class Progress:
     baseline_metric: Optional[float] = None
     baseline_commit: Optional[str] = None
     baseline_source: Optional[str] = None      # "ref" | "seed_fallback"
-    baseline_correctness: bool = False
+    baseline_outcome: Optional[str] = None     # task_config.EvalOutcome value
+    # error_source: "ref" | "kernel" | None. Set by run_verify's tagged
+    # try/excepts. "ref" => scaffold rejects + user must fix --ref source.
+    # "kernel" => normal seed-fail recovery via PLAN. None on success.
+    baseline_error_source: Optional[str] = None
     seed_metric: Optional[float] = None
 
     # Plan
     plan_version: int = 0
     next_pid: int = 0
-    status: str = "no_plan"
 
     # Multi-shape detail (single-shape ops keep these absent)
     num_cases: Optional[int] = None
