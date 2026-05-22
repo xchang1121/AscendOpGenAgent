@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Single-subprocess orchestrator: verify + profile_gen (+ profile_base).
 
-Verification logic lives in the kernel-verifier skill — this script does
-NOT reimplement `run_single_case`:
+The actual verification + measurement logic lives in the kernel-verifier
+skill — this script does NOT reimplement either:
 
     skills/triton/kernel-verifier/scripts/verify.py     run_single_case
+    skills/triton/kernel-verifier/scripts/benchmark.py  measure_single
 
-Timing uses an inline NPU-event helper (`_measure_npu_event_ms` below),
-NOT the skill's `measure_single` — the skill's profiler-based path pays
-~3 sec/case in CANN parse overhead, which on 51-case multi-shape ops
-(pad / interpolate / repeat_interleave) dominates wall-clock 10× over
-actual measurement work. The skill code stays untouched; only the
-in-engine helper changed.
+Timing routes through skill `run_single_benchmark` (mid layer, not
+low-level `measure_single`) so skill stays the single source of truth
+for profiler config, fallback ladder, and per-case progress logs. Warm
+rounds (profile_gen only) use `skip_framework=True`; cold rounds pair
+fw + impl in one call. `profile_base` alone — used by autoresearch's
+two-subprocess design (a ref pass isolated so kernel UB faults can't
+take ref timing down with them) — drops to `measure_single` direct
+since the skill mid layer has no impl-skipped mode.
+
+`measure_single` pays ~3 sec/case in CANN parse — NPU events would be
+faster but read 10-16× high on small kernels (host dispatch gaps), so
+we accept the slow eval for honest absolute numbers.
 
 Why a single-subprocess orchestrator instead of just spawning the two
 skill CLIs separately?
@@ -40,9 +47,9 @@ Standalone reproducer:
         --warmup 10 --repeats 100 --phases verify,profile_gen,profile_base
 
 Precision: per-dtype rtol+atol; fp16 / bf16 / fp32 thresholds in
-skill verify.compare(). autoresearch's metric is on-device elapsed time
-from `torch.npu.Event(enable_timing=True)` — same device-time semantics
-the profiler reports, just measured without the profiler context.
+skill verify.compare(). autoresearch's metric is profiler-based device
+op time (skill benchmark.measure_single) — directly comparable to
+numbers agents quote from running the kernel-verifier skill standalone.
 """
 from __future__ import annotations
 
@@ -113,42 +120,6 @@ def _seed_npu():
         torch.npu.manual_seed(0)
     except Exception:
         pass
-
-
-def _measure_npu_event_ms(model, inputs, warmup: int, repeats: int) -> float:
-    """Mean per-call device time in milliseconds via NPU events.
-
-    Why inline here (and not in the skill): the skill's profiler-based
-    `measure_single` pays ~3 sec/case in CANN parse overhead — on
-    multi-shape ops (51 cases for pad / interpolate) that dominates
-    wall-clock 10× over the actual kernel work. NPU events give the same
-    device-time metric with none of that overhead.
-
-    Per-operator breakdown is not available from this path; the skill's
-    `measure_single` is still the right call when an agent wants per-op
-    timing standalone. autoresearch's eval_client only consumes the
-    aggregate latency so this trade is free here.
-    """
-    import torch
-    import torch_npu  # noqa: F401
-
-    torch.npu.reset_peak_memory_stats()
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model(*inputs)
-    torch.npu.synchronize()
-
-    ev_start = torch.npu.Event(enable_timing=True)
-    ev_end = torch.npu.Event(enable_timing=True)
-    ev_start.record()
-    with torch.no_grad():
-        for _ in range(repeats):
-            _ = model(*inputs)
-    ev_end.record()
-    torch.npu.synchronize()
-
-    elapsed_ms = ev_start.elapsed_time(ev_end)
-    return round(elapsed_ms / max(1, repeats), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -332,59 +303,10 @@ def run_verify(ref_mod, kernel_mod, cases_cpu, init_inputs, device,
     }
 
 
-def run_profile(target_cls, ref_mod, cases_cpu, init_inputs, device,
-                warmup: int, repeats: int, mode: str,
-                skill_benchmark) -> dict:
-    """Per-case latency via inline `_measure_npu_event_ms`.
-
-    `skill_benchmark` is still passed in so we can reuse its
-    `cleanup_npu_memory` between cases — that helper lives in the skill
-    and we don't want to duplicate it here. Timing itself does not go
-    through the skill (see `_measure_npu_event_ms` for the why).
-
-    `mode` is "gen" (kernel) or "base" (PyTorch reference); kept on the
-    per-shape dict so downstream readers can tell which side a timing
-    came from.
-    """
+def _aggregate_per_shape(per_shape: list, warmup: int, repeats: int) -> dict:
+    """Shared aggregator: mean over finite per-case timings. Matches the
+    geomean filter `eval_client` applies for per-shape speedup."""
     import math
-    from utils.input_groups import describe_case as _describe_case
-
-    per_shape: list = []
-    for idx, case in enumerate(cases_cpu):
-        model = None
-        try:
-            _seed_npu()
-            model = _build_target(target_cls, init_inputs, device)
-            inputs_dev = [x.to(device) if hasattr(x, "to") else x
-                          for x in case]
-            latency_ms = _measure_npu_event_ms(
-                model, inputs_dev, warmup, repeats,
-            )
-            if (latency_ms is None or latency_ms <= 0
-                    or latency_ms == float("inf")):
-                raise RuntimeError(
-                    f"_measure_npu_event_ms returned invalid "
-                    f"ms={latency_ms!r}")
-            avg_us = float(latency_ms) * 1000.0
-            method = "npu_event"
-        except Exception as e:
-            print(f"[profile {mode}] case {idx} benchmark failed: {e} "
-                  f"(case marked inf so it doesn't poison the aggregate)",
-                  file=sys.stderr)
-            traceback.print_exc()
-            avg_us = float("inf")
-            method = None
-        per_shape.append({
-            "idx": idx,
-            "case_desc": _describe_case(case, model),
-            "avg_time_us": avg_us,
-            "method": method,
-        })
-        del model
-        skill_benchmark.cleanup_npu_memory()
-
-    # Aggregate over cases that produced finite timing — `eval_client`
-    # already filters per-shape speedups the same way for the geomean.
     finites = [s["avg_time_us"] for s in per_shape
                if isinstance(s["avg_time_us"], (int, float))
                and math.isfinite(s["avg_time_us"])]
@@ -397,6 +319,109 @@ def run_profile(target_cls, ref_mod, cases_cpu, init_inputs, device,
         "run_times": repeats,
         "num_cases": len(per_shape),
         "per_shape": per_shape,
+    }
+
+
+def run_profile_ref_only(ref_mod, cases_cpu, init_inputs, device,
+                         warmup: int, repeats: int,
+                         skill_benchmark) -> dict:
+    """Ref-side only — used by autoresearch's isolated ref subprocess.
+
+    Skill's mid layer requires an impl_model and always measures it, so
+    we drop to `measure_single` directly here. Same per-case skeleton
+    as the paired path; just one model and one timing per case.
+    """
+    from utils.input_groups import describe_case as _describe_case
+    per_shape: list = []
+    for idx, case in enumerate(cases_cpu):
+        model = None
+        try:
+            _seed_npu()
+            model = _build_target(ref_mod.Model, init_inputs, device)
+            inputs_dev = [x.to(device) if hasattr(x, "to") else x for x in case]
+            _, ms, _ = skill_benchmark.measure_single(
+                model, inputs_dev, warmup, repeats,
+                f"ar_eval_base_case{idx}", device=device,
+            )
+            us = (float(ms) * 1000.0
+                  if isinstance(ms, (int, float)) and ms > 0 and ms == ms
+                  else float("inf"))
+            method = "profiler" if us != float("inf") else None
+        except Exception as e:
+            print(f"[profile_base] case {idx}: {e}", file=sys.stderr)
+            traceback.print_exc()
+            us, method = float("inf"), None
+        per_shape.append({"idx": idx, "case_desc": _describe_case(case, model),
+                          "avg_time_us": us, "method": method})
+        del model
+        skill_benchmark.cleanup_npu_memory()
+    return _aggregate_per_shape(per_shape, warmup, repeats)
+
+
+def run_profile_paired(ref_mod, kernel_mod, cases_cpu, init_inputs, device,
+                       warmup: int, repeats: int,
+                       do_base: bool, skill_benchmark) -> dict:
+    """Paired pass via skill `run_single_benchmark` per case.
+
+    Skill's mid layer always measures impl (no impl-skipped mode), so
+    profile_gen is implicit. `do_base` toggles `skip_framework`: cold
+    round measures both sides, warm round only impl. Returns
+    `{"base": <profile_dict>|None, "gen": <profile_dict>}`.
+
+    Ref-only subprocess (without kernel_mod) goes through `run_profile_ref_only`
+    instead — see module docstring.
+    """
+    from utils.input_groups import describe_case as _describe_case
+
+    config = skill_benchmark.BenchmarkConfig(
+        op_name="ar_eval", verify_dir="",
+        warmup=warmup, repeats=repeats,
+        skip_framework=not do_base, framework_latency_ms=0.0,
+    )
+
+    def _row(idx: int, desc: str, ms) -> dict:
+        us = (float(ms) * 1000.0
+              if isinstance(ms, (int, float)) and ms > 0 and ms == ms
+              else float("inf"))
+        return {"idx": idx, "case_desc": desc, "avg_time_us": us,
+                "method": "profiler" if us != float("inf") else None}
+
+    base_rows: list = []
+    gen_rows: list = []
+    for idx, case in enumerate(cases_cpu):
+        fw_model = None
+        impl_model = None
+        try:
+            _seed_npu()
+            impl_model = _build_target(kernel_mod.ModelNew, init_inputs, device)
+            if do_base:
+                fw_model = _build_target(ref_mod.Model, init_inputs, device)
+            inputs_dev = [x.to(device) if hasattr(x, "to") else x for x in case]
+            # skill insists on a non-None framework arg even when skipping;
+            # impl_model is a safe placeholder (its forward isn't invoked
+            # from the fw path under skip_framework=True).
+            fw_perf, impl_perf, _ = skill_benchmark.run_single_benchmark(
+                fw_model or impl_model, impl_model, inputs_dev,
+                config, device, idx + 1, len(cases_cpu),
+            )
+            desc = _describe_case(case, impl_model)
+            gen_rows.append(_row(idx, desc, impl_perf.avg_latency_ms))
+            if do_base:
+                base_rows.append(_row(idx, desc, fw_perf.avg_latency_ms))
+        except Exception as e:
+            print(f"[profile] case {idx}: {e}", file=sys.stderr)
+            traceback.print_exc()
+            desc = _describe_case(case, fw_model or impl_model)
+            gen_rows.append(_row(idx, desc, None))
+            if do_base:
+                base_rows.append(_row(idx, desc, None))
+        finally:
+            del fw_model, impl_model
+            skill_benchmark.cleanup_npu_memory()
+
+    return {
+        "base": _aggregate_per_shape(base_rows, warmup, repeats) if do_base else None,
+        "gen": _aggregate_per_shape(gen_rows, warmup, repeats),
     }
 
 
@@ -577,24 +602,34 @@ def main():
                 "failed_indices": [],
             }
 
-    # ---- profile_gen (uses warm JIT cache from verify above) ----
-    if "profile_gen" in requested:
+    # ---- profile ----
+    # autoresearch isolates ref into its own subprocess so kernel UB
+    # faults can't take ref timing down — handle that "base only" path
+    # via `run_profile_ref_only`. With kernel_mod present, paired through
+    # skill.run_single_benchmark; warm JIT cache from verify carries over.
+    do_gen = "profile_gen" in requested
+    do_base = "profile_base" in requested
+    if do_gen:
         try:
-            result["profile_gen"] = run_profile(
-                kernel_mod.ModelNew, ref_mod, cases_cpu, init_inputs, device,
-                warmup=args.warmup, repeats=args.repeats, mode="gen",
-                skill_benchmark=skill_benchmark)
+            prof = run_profile_paired(
+                ref_mod, kernel_mod, cases_cpu, init_inputs, device,
+                warmup=args.warmup, repeats=args.repeats,
+                do_base=do_base, skill_benchmark=skill_benchmark,
+            )
+            result["profile_gen"] = prof["gen"]
+            if do_base:
+                result["profile_base"] = prof["base"]
         except Exception as e:
             result["ok"] = False
-            result["errors"].append(_wrap_phase_error("profile_gen", e))
-
-    # ---- profile_base (PyTorch reference timing) ----
-    if "profile_base" in requested:
+            phase = "profile_gen+base" if do_base else "profile_gen"
+            result["errors"].append(_wrap_phase_error(phase, e))
+    elif do_base:
         try:
-            result["profile_base"] = run_profile(
-                ref_mod.Model, ref_mod, cases_cpu, init_inputs, device,
-                warmup=args.warmup, repeats=args.repeats, mode="base",
-                skill_benchmark=skill_benchmark)
+            result["profile_base"] = run_profile_ref_only(
+                ref_mod, cases_cpu, init_inputs, device,
+                warmup=args.warmup, repeats=args.repeats,
+                skill_benchmark=skill_benchmark,
+            )
         except Exception as e:
             result["ok"] = False
             result["errors"].append(_wrap_phase_error("profile_base", e))
