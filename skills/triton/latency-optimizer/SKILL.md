@@ -420,9 +420,42 @@ kernel[grid](..., BLOCK_M=128, BLOCK_N=128)
 
 ---
 
+### 优化点 13：消除冗余的边界运算
+
+**适用条件**：代码中存在 `tl.load(..., mask=m, other=d)` 加载数据后，后续纯算术运算链上又出现 `tl.where(m, ..., d)`、`* mask`、`+ 0`、`* 1` 等冗余边界保护运算
+
+**典型代码特征**：
+```python
+# 特征 1：tl.where 二次归零
+x = tl.load(ptr + idx, mask=m, other=0.0)
+x_sq = x * x
+x_sq = tl.where(m, x_sq, 0.0)  # 冗余：load 已保证边界为 0
+
+# 特征 2：乘法模拟 mask
+a = tl.load(ptr_a + idx, mask=m, other=0.0)
+b = tl.load(ptr_b + idx, mask=m, other=0.0)
+x = (a + b) * m.to(tl.float32)  # 冗余：边界处 a+b 已是 0
+```
+
+**判断逻辑**：
+- 检查是否存在 `tl.load(..., mask=m, other=d)` 或 `tl.full(d)` 作为数据源
+- 检查后续运算链是否为纯算术运算（`+ - * ** .to() exp abs max min sum` 等），不包括 `/ //`、store、控制流
+- 检查是否存在以下冗余运算：
+  - `tl.where(m, expr, d)`，且 `expr` 在 `m=False` 处的 KVR（已知值区域）可推导为 `d`
+  - `expr + 0.0`、`expr - 0.0`、`expr * 1.0`、`expr ** 1`、`-(-expr)` 等代数恒等式
+  - `tl.maximum(expr, d)` / `tl.minimum(expr, d)` / `tl.abs(expr)`，且 `expr` 已满足相应边界条件
+- 如果存在以上任一情况 → 涉及
+- 如果所有边界保护都是必要的（如运算链含除法、不同 mask、未受保护的 load） → 不涉及，跳过
+
+**命中条件**：代码中存在由 KVR（Known-Value Region）数据流分析可证的冗余边界保护运算
+
+**参考文档**：`references/redundant_boundary_operation.md`
+
+---
+
 ## 优化流程
 ```
-1. 按顺序检查优化点 1 → 2 → 3 → ... → 12
+1. 按顺序检查优化点 1 → 2 → 3 → ... → 13
 2. 对于当前优化点，先判断是否命中（代码特征满足 + 适用条件成立）：
    - 未命中 → 跳过，检查下一优化点
    - 命中 → 参考对应文档，应用优化策略
@@ -471,4 +504,5 @@ kernel[grid](..., BLOCK_M=128, BLOCK_N=128)
 | 循环不变量外提 | `references/loop-invariant-hoisting.md` |
 | Load 指令重排序 | `references/load-order.md` |
 | Autotune 自动调优 | `references/autotune.md` |
+| 消除冗余的边界运算 | `references/redundant_boundary_operation.md` |
 | 代码规范检查 | `references/checklist.md` |
