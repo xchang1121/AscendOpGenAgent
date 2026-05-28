@@ -17,10 +17,17 @@ follow the latest `[AR Phase: ...]` message and never stop between phases.
   --devices <N[,M,...]>
   [--max-rounds <N>] [--eval-timeout <sec>]
   [--no-code-checker]
+  [--worker-url host:port[,host:port,...]]
   ```
   Both `--ref` and `--kernel` are required. `--devices` selects the local
   Ascend NPU id(s) for eval; arch is auto-derived from the picked card
   via `npu-smi`.
+
+  `--worker-url` routes eval to a remote HTTP worker instead of running
+  it locally (orchestrator on dev box, NPU on the worker side). Start
+  the worker via `python scripts/ar_cli.py worker --remote-host <alias>
+  --start ...` first; that command also opens the local `ssh -L` tunnel
+  so `127.0.0.1:<port>` transparently reaches the remote daemon.
 
   Convention: source files live in `workspace/<op_name>_ref.py` and
   `workspace/<op_name>_kernel.py`.

@@ -21,6 +21,23 @@ python scripts/dashboard.py <task_dir> --watch
 
 Full operational details in [.claude/commands/autoresearch.md](.claude/commands/autoresearch.md).
 
+### Remote eval (optional)
+
+If the local machine has no NPU, eval can run on a remote Ascend box:
+
+```bash
+# Start a worker daemon on the remote (SSH-launched + auto ssh -L tunnel).
+# `my-npu` is an entry under remote_worker.hosts in config.yaml.
+python scripts/ar_cli.py worker --remote-host my-npu --start \
+    --backend ascend --arch ascend910b3 --devices 0 --port 9111
+
+# Point /autoresearch (or baseline.py / pipeline.py) at the tunneled port.
+/autoresearch --ref ... --kernel ... --devices 0 --worker-url 127.0.0.1:9111
+```
+
+`ar_cli worker --remote-host my-npu --stop --port 9111` tears down both
+the remote daemon and the local tunnel.
+
 ## Skills Library
 
 Single source: `../skills/triton/latency-optimizer/references/*.md` —
@@ -65,9 +82,8 @@ filename in plan rationales.
 9. **AR scripts run as direct top-level Bash invocations only.**
    To *invoke* a blessed CLI the command must be a single foreground
    call: `python scripts/engine/<name>.py <task_dir>
-   [args...]` (pipeline, baseline, create_plan, eval_wrapper,
-   quick_check, settle, parse_args). The top-level lifecycle scripts
-   use the flat path:
+   [args...]` (pipeline, baseline, create_plan, quick_check, settle,
+   parse_args). The top-level lifecycle scripts use the flat path:
    `python scripts/<name>.py` (scaffold, resume,
    dashboard). Env-var prefixes, Python flags, and FD redirection
    (`> log 2>&1`) are fine. Wrappers (`nohup`, `bash -lc`, `sh -c`,
@@ -76,8 +92,8 @@ filename in plan rationales.
    `hooks/guard_bash.py`. Run multiple AR scripts as separate Bash
    tool calls.
 
-   *Reading* AR scripts (e.g. `cat autoresearch/scripts/engine/pipeline.py`,
-   `git diff -- autoresearch/scripts/engine/settle.py`) is allowed
+   *Reading* AR scripts (e.g. `cat scripts/engine/pipeline.py`,
+   `git diff -- scripts/engine/settle.py`) is allowed
    because the classifier sees those heads as read-only and the args
    don't execute. The Read tool is still preferred — it's the idiomatic
    way to inspect file contents in Claude Code.

@@ -231,7 +231,19 @@ claude
   --op-name <op> --devices 5 --max-rounds 30
 ```
 
-完整入门、批量跑、断点续跑、阶段机不变量等见 **[docs/AUTORESEARCH.md](docs/AUTORESEARCH.md)**。
+如果本机没 NPU，可以把 orchestrator 留在本机、eval 转发到远端 Ascend 机器。在
+`autoresearch/config.yaml` 的 `remote_worker.hosts` 加一个 host alias 后：
+
+```bash
+# 启远端 worker daemon + 自动 ssh -L tunnel（一条命令搞定，cleanup 同理）
+python scripts/ar_cli.py worker --remote-host my-npu --start \
+    --backend ascend --arch ascend910b3 --devices 0 --port 9111
+
+# /autoresearch 加 --worker-url 即透明走远端
+/autoresearch --ref ... --kernel ... --devices 0 --worker-url 127.0.0.1:9111
+```
+
+完整入门、批量跑、断点续跑、阶段机不变量、远程 worker 细节等见 **[docs/AUTORESEARCH.md](docs/AUTORESEARCH.md)**。
 
 ---
 
