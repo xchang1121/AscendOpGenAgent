@@ -218,22 +218,14 @@ arch是 ascend910b2，ASCEND_RT_VISIBLE_DEVICES=1
 
 **操作步骤**：
 
-1. 在 AscendOpGenAgent 目录下配置 AutoResearch 框架：
+1. 进入 `autoresearch/` 自包含子目录并启动 claude — 不再需要任何 mv：
 ```bash
-mkdir -p .claude
-mv setups/autoresearch/CLAUDE.md ./CLAUDE.md
-mv setups/autoresearch/settings.json .claude/settings.json
-mv setups/autoresearch/agents .claude/agents
-mv setups/autoresearch/commands .claude/commands
-```
-> **⚠️ 配置激活后如果 `git pull` 拉到 `setups/autoresearch/` 的更新（例如 hook 脚本路径改了），需要重新执行上面的 mv 操作（先把 `.claude/` 下的旧文件删掉/移走，再 mv 一次）。**
-
-2. 进入 AscendOpGenAgent 目录，启动 claude：
-```bash
+cd autoresearch
 claude
 ```
+`autoresearch/` 内已经带好 `.claude/{settings.json,agents,commands}` 和顶层 `CLAUDE.md`，git pull 拉到更新也直接生效。其他模式（triton-coder / ascendc）仍按各自章节的步骤配置 `.claude/`。
 
-3. 输入算子优化命令（已有 ref + 种子 kernel，把 `<op>` 换成你的算子名）：
+2. 输入算子优化命令（已有 ref + 种子 kernel，把 `<op>` 换成你的算子名）：
 ```text
 /autoresearch --ref workspace/<op>_ref.py --kernel workspace/<op>_kernel.py \
   --op-name <op> --devices 5 --max-rounds 30
@@ -371,13 +363,23 @@ AscendOpGenAgent/
 │   ├── op-task-extractor/      # 任务提取 Skill
 │   ├── op_desc_generation/
 │   └── reference_generation/
-├── setups/                     # 场景-specific Claude Code 配置（按需 mv 启用）
-│   └── autoresearch/           # AutoResearch 场景：CLAUDE.md + hooks + 子 agent + slash 命令
-│       ├── CLAUDE.md
-│       ├── settings.json
-│       ├── agents/ar-diagnosis.md
-│       └── commands/autoresearch.md
-└── .autoresearch/              # AutoResearch 框架运行时（脚本 / phase_machine / hooks）
+└── autoresearch/               # AutoResearch 自包含子目录（`cd autoresearch && claude` 直接激活）
+    ├── CLAUDE.md               # 主 agent prompt
+    ├── config.yaml             # 运行时配置（profiler / autotune / 精度 / remote_worker）
+    ├── .claude/                # Claude Code 配置（提交进仓库, 无需 mv）
+    │   ├── settings.json       #   hooks + 权限
+    │   ├── agents/ar-diagnosis.md
+    │   └── commands/autoresearch.md
+    └── scripts/                # 框架运行时
+        ├── ar_cli.py           #   worker 子命令 + remote-host SSH 调度
+        ├── engine/             #   baseline / pipeline / eval_kernel / scaffold
+        ├── workflow/           #   record_round / run_baseline_init
+        ├── hooks/              #   guard_* + post_* (Claude Code hooks)
+        ├── phase_machine/      #   BASELINE / PLAN / EDIT / DIAGNOSE / REPLAN / FINISH
+        ├── task_config/        #   task.yaml loader + eval_client (本地+远程 transport)
+        ├── worker/             #   FastAPI HTTP worker daemon (/api/v1/run + /status)
+        ├── batch/              #   batch prepare / run / monitor / summarize
+        └── utils/              #   correctness / eval_runner / settings / ...
 
 ```
 

@@ -1,0 +1,44 @@
+# Framework reference tables. Loaded once per process by settings.py.
+
+# Common hallucinated script names → the real script Claude should use.
+# hook_guard_bash flags these early with a targeted error rather than a
+# generic "unknown script" rejection.
+hallucinated_scripts:
+  eval.py: baseline.py
+  run_eval.py: baseline.py
+  verify.py: baseline.py
+  check.py: quick_check.py
+  run.py: baseline.py
+  test.py: quick_check.py
+  profile.py: baseline.py
+
+
+# Remote worker SSH dispatch — used by
+#   `python scripts/ar_cli.py worker --remote-host <alias> ...`
+#
+# Each alias under `hosts:` describes a machine ar_cli can SSH into and
+# launch a worker daemon on. The alias name is also the ssh hostname
+# unless `ssh_alias:` overrides it. `repo_path` is required and must
+# point at the remote `autoresearch/` directory (NOT the outer
+# AscendOpGenAgent checkout) — the SSH command does
+# `cd <repo_path> && python scripts/ar_cli.py worker --start ...`.
+# `env_script` is sourced before invoking the remote ar_cli. `python`
+# defaults to "python".
+#
+# The CLI handles tunnel setup itself: on --start it opens
+# `ssh -L <port>:127.0.0.1:<port> <alias> -N -f` and stashes the pid in
+# ~/.autoresearch_state/tunnels/<port>.pid, so subsequent --status /
+# --stop / orchestrator --worker-url 127.0.0.1:<port> transparently
+# hit the remote daemon.
+#
+# Example (uncomment + edit before use):
+#
+# remote_worker:
+#   hosts:
+#     my-npu:
+#       repo_path: /home/<user>/AscendOpGenAgent/autoresearch
+#       env_script: /home/<user>/env.sh
+#       python: python
+#       ssh_alias: my-npu              # optional; defaults to the key
+remote_worker:
+  hosts: {}
