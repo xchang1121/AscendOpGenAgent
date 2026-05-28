@@ -415,13 +415,15 @@ def _tunnel_start(host: str, port: int) -> int:
     pid_path = _tunnel_pid_path(port)
 
     # If a stale tunnel exists, tear it down first so the new one binds.
-    _tunnel_stop_silent(port)
+    _tunnel_stop_silent(port, host)
 
-    # `-f` forks; `-N` no remote command; `-T` no pty; `ExitOnForwardFailure=yes`
-    # so we fail fast if the LocalForward bind clashes.
+    # `-f` forks; `-N` no remote command; `-T` no pty. We deliberately do
+    # NOT pass `ExitOnForwardFailure=yes` here: the user's `~/.ssh/config`
+    # may declare unrelated forwards (RemoteForward for IDE relays, etc.)
+    # whose failure would take down the -L we actually need. Readiness is
+    # confirmed via a curl probe to /api/v1/status after the fork.
     cmd = [
         "ssh", "-f", "-N", "-T",
-        "-o", "ExitOnForwardFailure=yes",
         "-o", "ServerAliveInterval=60",
         "-L", f"{port}:127.0.0.1:{port}",
         host,
@@ -431,46 +433,96 @@ def _tunnel_start(host: str, port: int) -> int:
     except Exception as e:
         print(f"[ar_cli] ssh tunnel launch failed: {e}", file=sys.stderr)
         return 0
+    # Don't bail on rc — unrelated forwards may have failed but our -L
+    # could still be live. The status probe below is the real readiness
+    # check. (If `-L` itself failed, the probe fails and the caller
+    # surfaces that.)
     if rc != 0:
-        print(f"[ar_cli] ssh tunnel exited rc={rc} (could not establish "
-              f"LocalForward {port}:127.0.0.1:{port}).", file=sys.stderr)
+        print(f"[ar_cli] ssh exited rc={rc} (unrelated forward may have "
+              f"failed; checking -L {port} via status probe).",
+              file=sys.stderr)
+
+    # ssh -f forks itself; find the child by cmdline pattern.
+    pid = _find_tunnel_pid(port, host)
+    if pid:
+        pid_path.write_text(str(pid))
+        return pid
+
+    print(f"[ar_cli] tunnel established but pid not captured; manual "
+          f"cleanup needed if --stop misses it.", file=sys.stderr)
+    return 0
+
+
+def _find_tunnel_pid(port: int, host: str) -> int:
+    """Find the ssh process holding the `-L <port>:127.0.0.1:<port> <host>`
+    tunnel by scanning ssh.exe / ssh process command lines. Cross-platform:
+    pgrep on POSIX, PowerShell Win32_Process on Windows. Returns 0 when
+    not found (caller treats as a soft failure)."""
+    if os.name == "posix":
+        try:
+            out = subprocess.run(
+                ["pgrep", "-f", f"ssh.*-L {port}:.*{host}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for ln in out.stdout.splitlines():
+                ln = ln.strip()
+                if ln.isdigit():
+                    return int(ln)
+        except Exception:
+            pass
         return 0
 
-    # ssh -f forks itself; find the child by `pgrep -f "ssh.*-L <port>:.*<host>"`.
-    # POSIX only; on Windows the ssh client doesn't fork — there `-f` is a no-op
-    # and the call above would have blocked.
+    # Windows: Get-CimInstance Win32_Process filtered by Name + cmdline.
     try:
+        ps_cmd = (
+            f"Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | "
+            f"Where-Object {{ $_.CommandLine -like '*-L {port}:*{host}*' }} | "
+            f"Select-Object -ExpandProperty ProcessId"
+        )
         out = subprocess.run(
-            ["pgrep", "-f", f"ssh.*-L {port}:.*{host}"],
-            capture_output=True, text=True, timeout=5,
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=10,
         )
         for ln in out.stdout.splitlines():
             ln = ln.strip()
             if ln.isdigit():
-                pid = int(ln)
-                pid_path.write_text(str(pid))
-                return pid
+                return int(ln)
     except Exception:
         pass
-
-    # Couldn't find the pid but the forward did establish — print a hint.
-    print(f"[ar_cli] tunnel established but pid not captured; manual "
-          f"cleanup with `pkill -f 'ssh.*-L {port}:.*{host}'` if needed.",
-          file=sys.stderr)
     return 0
 
 
-def _tunnel_stop_silent(port: int) -> None:
+def _tunnel_stop_silent(port: int, host: str = "") -> None:
+    """Best-effort tunnel teardown. Prefer the pid stashed at start time;
+    fall back to a fresh cmdline scan (handles the case where --start
+    couldn't capture the pid, e.g. first time setting up on Windows)."""
     pid_path = _tunnel_pid_path(port)
-    if not pid_path.is_file():
-        return
-    try:
-        pid = int(pid_path.read_text().strip())
-        os.kill(pid, signal.SIGTERM)
-    except (ProcessLookupError, ValueError, FileNotFoundError):
-        pass
-    except Exception as e:
-        print(f"[ar_cli] tunnel stop failed: {e}", file=sys.stderr)
+    pid = 0
+    if pid_path.is_file():
+        try:
+            pid = int(pid_path.read_text().strip())
+        except (ValueError, FileNotFoundError):
+            pid = 0
+
+    if pid == 0 and host:
+        pid = _find_tunnel_pid(port, host)
+
+    if pid:
+        try:
+            if os.name == "posix":
+                os.kill(pid, signal.SIGTERM)
+            else:
+                # SIGTERM works on Windows for non-elevated procs since
+                # 3.2; fall back to taskkill for stragglers.
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (PermissionError, OSError):
+                    subprocess.call(["taskkill", "/PID", str(pid), "/F"])
+        except (ProcessLookupError, ValueError, FileNotFoundError):
+            pass
+        except Exception as e:
+            print(f"[ar_cli] tunnel stop failed: {e}", file=sys.stderr)
+
     try:
         pid_path.unlink()
     except FileNotFoundError:
@@ -493,7 +545,13 @@ def _dispatch_remote_worker(args) -> int:
     ssh_alias = host_cfg.get("ssh_alias") or args.remote_host
 
     print(f"[ar_cli] remote ({ssh_alias}): {remote_cmd}", file=sys.stderr)
-    rc = subprocess.call(["ssh", ssh_alias, "bash", "-lc", remote_cmd])
+    # Pass the bash command as a SINGLE ssh arg so OpenSSH ships it
+    # verbatim to the remote shell. Splitting `bash`, `-lc`, remote_cmd
+    # into separate args makes ssh join them with spaces, and the
+    # remote shell parses `bash -lc source ...` — `source` becomes the
+    # -c body and the rest are $0, $1, ..., which silently drops the
+    # env_script path.
+    rc = subprocess.call(["ssh", ssh_alias, f"bash -lc {shlex.quote(remote_cmd)}"])
     if rc != 0:
         print(f"[ar_cli] remote ar_cli exited rc={rc}", file=sys.stderr)
         return rc
@@ -514,7 +572,7 @@ def _dispatch_remote_worker(args) -> int:
         return 0
 
     if args.stop:
-        _tunnel_stop_silent(args.port)
+        _tunnel_stop_silent(args.port, ssh_alias)
         print(f"[ar_cli] tore down local tunnel for :{args.port}")
         return 0
 

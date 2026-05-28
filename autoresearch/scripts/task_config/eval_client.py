@@ -146,8 +146,9 @@ def run_eval(task_dir: str, config: TaskConfig,
             )
 
         request = build_eval_request(task_dir, config)
+        task_id = f"{config.name}_{uuid.uuid4().hex[:8]}"
         _log_request("remote_eval", request)
-        print(f"[remote_eval] worker={worker_url} task={request.task_id}",
+        print(f"[remote_eval] worker={worker_url} task={task_id}",
               file=sys.stderr)
 
         try:
@@ -158,7 +159,7 @@ def run_eval(task_dir: str, config: TaskConfig,
                               error=f"failed to build package: {e}")
 
         fields = {
-            "task_id": request.task_id,
+            "task_id": task_id,
             "op_name": request.config.name,
             "timeout": str(int(request.timeout)),
         }
