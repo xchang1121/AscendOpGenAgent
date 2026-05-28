@@ -446,6 +446,11 @@ def print_summary(batch_dir: Path, total_elapsed: float,
 def main() -> int:
     ap = argparse.ArgumentParser(description="Batch driver for /autoresearch.")
     ap.add_argument("batch_dir", help="dir containing manifest.yaml/json")
+    ap.add_argument("--worker-url", default="",
+                    help="Comma-separated worker URLs (host:port). "
+                         "When set, eval routes to remote HTTP worker(s) "
+                         "and --devices is not required (the orchestrator "
+                         "machine can be GPU/NPU-free).")
     ap.add_argument("--devices", default="",
                     help="NPU device ids, e.g. 0 or 0,1 (required)")
     ap.add_argument("--max-rounds", type=int, default=30)
@@ -487,9 +492,19 @@ def main() -> int:
     # values for backward compatibility instead of erroring out.
     mode = "ref-kernel"
 
-    if not args.devices:
-        sys.exit("--devices is required (local-only eval)")
-    hw_arg = f"--devices {args.devices}"
+    if not args.devices and not args.worker_url:
+        sys.exit("--devices (local eval) or --worker-url (remote worker) is required")
+    if args.worker_url:
+        # Remote-eval path: still forward --devices to /autoresearch if the
+        # caller supplied one (it's a required slash-command arg and gets
+        # written into task.yaml for arch derivation), but bake a placeholder
+        # `0` when only --worker-url was given. The actual NPU id the eval
+        # runs on is decided by the worker daemon's device pool, not by this
+        # CLI.
+        dev_part = args.devices or "0"
+        hw_arg = f"--devices {dev_part} --worker-url {args.worker_url}"
+    else:
+        hw_arg = f"--devices {args.devices}"
 
     try:
         cases = mf.resolve_cases(batch_dir, manifest_data, mode)
