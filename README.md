@@ -243,7 +243,7 @@ python scripts/ar_cli.py worker --remote-host my-npu --start \
 /autoresearch --ref ... --kernel ... --devices 0 --worker-url 127.0.0.1:9111
 ```
 
-完整入门、批量跑、断点续跑、阶段机不变量、远程 worker 细节等见 **[docs/AUTORESEARCH.md](docs/AUTORESEARCH.md)**。
+完整入门教程、批量跑、断点续跑、阶段机不变量、远程 worker 细节等见 **[autoresearch/AUTORESEARCH.md](autoresearch/AUTORESEARCH.md)**。
 
 ---
 
