@@ -93,11 +93,19 @@ def scaffold_task_dir(
         try:
             import shutil as _shutil
             ref_dir_src = os.path.dirname(os.path.abspath(ref_source_path))
+            ref_stem = os.path.splitext(os.path.basename(ref_source_path))[0]
+            # Match only the current ref's siblings — NPUKernelBench's
+            # level0/ has dozens of ops, each with its own `<name>.json`
+            # + `<name>_all_case.json`. Without this filter, scaffold
+            # would copy every neighbouring op's case file.
             for fname in sorted(os.listdir(ref_dir_src)):
                 if fname.startswith("."):
                     continue
                 ext = os.path.splitext(fname)[1].lower()
                 if ext not in (".json", ".pt", ".npz"):
+                    continue
+                stem = os.path.splitext(fname)[0]
+                if stem != ref_stem and not stem.startswith(ref_stem + "_"):
                     continue
                 src = os.path.join(ref_dir_src, fname)
                 if not os.path.isfile(src):
