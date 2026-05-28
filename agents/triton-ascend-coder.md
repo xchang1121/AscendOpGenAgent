@@ -482,13 +482,30 @@ while True:
 
 - Phase 4 优化成功（improvement_made == true）→ 以 `optimized_code.py` 为最终结果
 - Phase 4 优化失败（improvement_made == false，做完所有尝试后没有效果）→ 以 Phase 3 的 `generated_code.py` 为最终结果
-- 两种情况都进入 Phase 4.5
+
+**⚠️ 强制检查（进入 Phase 5 前必须执行）**：
+1. 读取 Phase 4 最终性能文件（优先 `optimized_perf_result.json`，备选 `perf_result.json`）
+2. 提取 `speedup_vs_torch` 和 `total_cases`
+3. 打印检查结果：`[Phase 4.5 Check] total_cases={x}, speedup_vs_torch={y}`
+4. 判定：
+   - 若 `total_cases > 1` 且 `speedup_vs_torch < 0.8` → **必须执行 Phase 4.5**
+   - 否则 → 输出 `[Phase 4.5] Skipped (total_cases={x} or speedup_vs_torch={y} >= 0.8)`，直接进入 Phase 5
 
 ---
 
-## Phase 4.5: Kernel 分裂优化（仅多 case 场景触发）
+## Phase 4.5: Kernel 分裂优化（强制触发检查）
 
-**触发条件**：同时满足 `total_cases > 1` 且 Phase 4 最终 `speedup_vs_torch < 0.8`，否则跳过。
+**⚠️ 触发条件**（必须同时满足，禁止跳过检查）：
+1. `total_cases > 1`（多 case 场景）
+2. Phase 4 最终 `speedup_vs_torch < 0.8`（性能未达标）
+
+**检查步骤**：
+1. 读取 `{工作目录}/output/optimized_perf_result.json`（若不存在则读 `perf_result.json`）
+2. 提取 `total_cases` 和 `speedup_vs_torch` 字段
+3. 打印检查结果：`[Phase 4.5 Check] total_cases={x}, speedup_vs_torch={y}`
+4. 判定：
+   - 满足条件 → 进入 Phase 4.5 执行流程
+   - 不满足 → 输出 `[Phase 4.5] Skipped`，进入 Phase 5
 
 ### 执行流程
 
