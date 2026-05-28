@@ -80,23 +80,32 @@ def scaffold_task_dir(
     _write(task_dir, editable_filename, kernel_code)
 
     # NPUKernelBench-style refs read shape lists from a sibling JSON via
-    # `os.path.join(os.path.dirname(__file__), "<basename>.json")`. Copy
-    # any *.json file in the source ref's directory into task_dir,
-    # preserving names — the .py expects the JSON at task_dir at runtime
-    # (dirname(__file__) becomes task_dir after the rename).
+    # `os.path.join(os.path.dirname(__file__), "<basename>.json")`;
+    # sglang-style refs torch.load() a sibling `.pt` cache the same way.
+    # Copy these next to ref.py inside task_dir (preserving names so
+    # `dirname(__file__)` resolution still hits them) and remember the
+    # basenames — they're written into task.yaml `data_files:` below so
+    # the remote package builder ships them too. Without this, local
+    # eval works (the file is on disk next to ref.py) but remote eval
+    # FileNotFoundErrors on the worker.
+    discovered_data_files: list[str] = []
     if ref_source_path:
         try:
             import shutil as _shutil
             ref_dir_src = os.path.dirname(os.path.abspath(ref_source_path))
-            for fname in os.listdir(ref_dir_src):
-                if not fname.endswith(".json"):
+            for fname in sorted(os.listdir(ref_dir_src)):
+                if fname.startswith("."):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in (".json", ".pt", ".npz"):
                     continue
                 src = os.path.join(ref_dir_src, fname)
                 if not os.path.isfile(src):
                     continue
                 _shutil.copy(src, os.path.join(task_dir, fname))
+                discovered_data_files.append(fname)
         except Exception as _e:
-            print(f"[scaffold] WARNING: sidecar JSON copy failed: {_e}",
+            print(f"[scaffold] WARNING: sidecar data file copy failed: {_e}",
                   file=sys.stderr)
 
     # Generate task.yaml — only fields that vary per-task. dsl /
@@ -121,6 +130,8 @@ def scaffold_task_dir(
     }
     if devices:
         task_yaml["devices"] = list(devices)
+    if discovered_data_files:
+        task_yaml["data_files"] = discovered_data_files
 
     # Only emit the code_checker block when disabled — default-true tasks
     # stay clean. quick_check.py and phase_machine.validate_kernel honor
