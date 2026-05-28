@@ -17,17 +17,15 @@ Output: human-readable status to stdout. Claude Code sees it and acts accordingl
 """
 import json
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, SCRIPTS_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
-from task_config import load_task_config
-from utils.failure_extractor import format_for_stdout
+from task_config import load_task_config, run_eval
+from utils.failure_extractor import extract_failure_signals, format_for_stdout
 from utils.json_io import parse_last_json_line
 from workflow import PhaseController, record_round
 from phase_machine import (
@@ -224,47 +222,31 @@ def main():
     print("[PIPELINE] Quick check PASS", flush=True)
 
     # === Step 2: Eval ===
-    # Outer cap mirrors eval_client's per-shape semantics so multi-shape
-    # benches don't get killed at 600s before the inner verify even
-    # finishes its first JIT pass. eval_client is authoritative; this is
-    # just a safety net for hangs in eval_wrapper itself, hence the +300s
-    # buffer over what eval_client will use internally.
+    # Direct in-process call (was a subprocess to eval_wrapper.py + last-line-JSON
+    # parse). eval_client owns its own per-shape timeout via task.yaml's
+    # `eval_timeout`; no outer wall-clock cap is needed here because the
+    # subprocess crash isolation lives inside utils.eval_runner.local_eval
+    # (the two `eval_kernel.py` subprocesses it spawns).
     print("[PIPELINE] Running eval...", flush=True)
-    config_for_timeout = load_task_config(task_dir)
-    progress_for_count = load_progress(task_dir) or {}
-    num_cases = progress_for_count.get("num_cases")
-    if not isinstance(num_cases, int) or num_cases < 1:
-        # Round 0 has no progress yet; probe the ref directly via the
-        # same helper eval_client uses so the cap matches.
-        try:
-            from task_config.eval_client import _count_ref_cases  # type: ignore
-            num_cases = _count_ref_cases(task_dir, config_for_timeout)
-        except Exception:
-            num_cases = 1
-    per_shape_budget = int(getattr(config_for_timeout, "eval_timeout", 600) or 600)
-    pipeline_eval_cap = per_shape_budget * max(num_cases, 1) + 300
-
-    eval_cmd = [sys.executable, os.path.join(SCRIPT_DIR, "eval_wrapper.py"), task_dir]
-    # Run in a throwaway tmpdir so CANN's unsolicited PROF_* dumps don't
-    # accumulate in the repo.
-    _eval_tmpdir = tempfile.mkdtemp(prefix="ar_eval_")
     try:
-        ev = subprocess.run(eval_cmd, capture_output=True, text=True,
-                            timeout=pipeline_eval_cap, cwd=_eval_tmpdir)
-    except subprocess.TimeoutExpired:
+        result = run_eval(task_dir, config)
+    except Exception as e:
         auto_rollback(task_dir)
-        print(f"[PIPELINE] EVAL TIMEOUT after {pipeline_eval_cap}s "
-              f"({per_shape_budget}s/shape x {num_cases} cases + 300s). "
-              f"Rolled back.")
-        sys.exit(0)
-    finally:
-        shutil.rmtree(_eval_tmpdir, ignore_errors=True)
-
-    eval_json = parse_last_json_line(ev.stdout)
-    if eval_json is None:
-        auto_rollback(task_dir)
-        print(f"[PIPELINE] EVAL ERROR: no JSON output. stderr: {ev.stderr[:200]}")
+        print(f"[PIPELINE] EVAL ERROR: run_eval raised "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)
+
+    eval_json = {
+        "outcome": result.outcome.value,
+        "correctness": result.correctness,
+        "metrics": result.metrics or {},
+        "error": result.error,
+        "error_source": result.error_source,
+    }
+    if not result.correctness or result.error:
+        eval_json["failure_signals"] = extract_failure_signals(
+            result.raw_output).to_dict()
+        eval_json["raw_output_tail"] = (result.raw_output or "")[-4000:]
 
     correctness = eval_json.get("correctness", False)
     metrics = eval_json.get("metrics", {})

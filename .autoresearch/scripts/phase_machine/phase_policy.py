@@ -106,7 +106,6 @@ _CANONICAL_LOCATION = {
     "baseline.py":     "engine",
     "create_plan.py":  "engine",
     "eval_kernel.py":  "engine",
-    "eval_wrapper.py": "engine",
     "parse_args.py":   "engine",
     "pipeline.py":     "engine",
     "quick_check.py":  "engine",
@@ -404,7 +403,6 @@ def is_single_foreground_ar_invocation(command: str, *, script: str) -> tuple:
 # or `git diff -- .autoresearch/scripts/engine/settle.py` (READONLY shapes
 # that mention the name in args, not invocations).
 _SUBPROCESS_ONLY_AR_SCRIPTS = {
-    "eval_wrapper.py": "subprocess-only (invoked by pipeline.py / baseline.py)",
     "quick_check.py":  "subprocess-only (invoked by pipeline.py)",
     "settle.py":       "subprocess-only (invoked by pipeline.py)",
 }
@@ -436,7 +434,7 @@ _EDIT_RULES = {
 _CANONICAL_FORM_REJECTION = (
     "AR scripts must be invoked directly: "
     "`python .autoresearch/scripts/engine/<name>.py <task_dir> [args...]` "
-    "for blessed CLIs (pipeline, baseline, create_plan, eval_wrapper, "
+    "for blessed CLIs (pipeline, baseline, create_plan, "
     "quick_check, settle, parse_args), or "
     "`python .autoresearch/scripts/<name>.py` for top-level scripts "
     "(scaffold, resume, dashboard). "

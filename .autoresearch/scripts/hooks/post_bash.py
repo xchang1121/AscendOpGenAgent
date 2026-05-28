@@ -14,7 +14,7 @@ directly via the Bash tool:
   - `create_plan.py`          → EDIT on plan validation pass
                                 (called from PLAN / DIAGNOSE / REPLAN)
 
-The inner pipeline steps (quick_check / eval_wrapper subprocess +
+The inner pipeline steps (quick_check subprocess + in-process run_eval +
 in-process record_round + settle subprocess) run beneath pipeline.py and
 never re-enter this hook, so they don't need their own phase constants
 or branches here.

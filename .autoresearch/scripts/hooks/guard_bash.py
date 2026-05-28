@@ -36,7 +36,7 @@ from utils.settings import hallucinated_scripts
 # treated as an unknown script and rejected with a sorted list of
 # valid names.
 _BLESSED_SCRIPTS = {
-    "quick_check.py", "eval_wrapper.py",
+    "quick_check.py",
     "scaffold.py", "baseline.py", "dashboard.py",
     "create_plan.py", "settle.py", "pipeline.py", "resume.py",
     "parse_args.py",
@@ -62,13 +62,13 @@ _LIBRARY_NOT_CLI = {
         "(also runnable directly as the skill `kernel-verifier`'s Step 0)."
     ),
     "eval_kernel.py": (
-        "eval_kernel.py is a subprocess child of eval_wrapper.py "
-        "(invoked via utils.eval_runner.local_eval), not a CLI. Run "
-        "`python .autoresearch/scripts/engine/eval_wrapper.py <task_dir>` "
-        "instead — it invokes eval_kernel.py for you."
+        "eval_kernel.py is a subprocess child of utils.eval_runner.local_eval, "
+        "not a CLI. Run `python .autoresearch/scripts/engine/baseline.py "
+        "<task_dir>` instead — it drives eval_kernel.py for you via "
+        "task_config.run_eval."
     ),
     "eval_runner.py": ("eval_runner.py is a library used by "
-                       "task_config.eval_client + eval_wrapper, not a CLI."),
+                       "task_config.eval_client, not a CLI."),
 }
 
 # Alias → real script mapping lives in .autoresearch/config.yaml under
