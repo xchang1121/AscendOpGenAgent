@@ -27,6 +27,14 @@ import os
 import sys
 from typing import Optional, Union
 
+# state_store is imported by hook code that may run before scripts/ is
+# on sys.path (no editable install). Make the import work either way.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SCRIPTS_DIR = os.path.dirname(_HERE)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from utils.json_io import sanitize_floats  # noqa: E402
+
 from .models import Progress
 
 
@@ -359,7 +367,7 @@ def save_progress(task_dir: str, progress: Union[Progress, dict],
             payload["last_updated"] = datetime.now(timezone.utc).isoformat()
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(sanitize_floats(payload), f, indent=2)
     os.replace(tmp_path, path)
 
 
@@ -369,7 +377,7 @@ def append_history(task_dir: str, record: dict):
     path = history_path(task_dir)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.write(json.dumps(sanitize_floats(record), ensure_ascii=False) + "\n")
 
 
 def update_progress(task_dir: str, **fields) -> Optional[Progress]:

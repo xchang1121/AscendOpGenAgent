@@ -24,14 +24,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import sys
 import tempfile
 import tarfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -43,6 +42,7 @@ if _SCRIPTS_DIR not in sys.path:
 
 from task_config import load_task_config  # noqa: E402
 from utils.eval_runner import local_eval  # noqa: E402
+from utils.json_io import sanitize_floats as _sanitize_floats  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -59,26 +59,6 @@ def _parse_devices(s: str) -> list[int]:
     except ValueError:
         logger.warning("WORKER_DEVICES=%r unparseable; defaulting to [0]", s)
         return [0]
-
-
-def _sanitize_floats(obj: Any) -> Any:
-    """Recursively replace inf / -inf / nan with None.
-
-    FastAPI's default JSON encoder calls json.dumps(allow_nan=False) and
-    rejects non-finite floats with `Out of range float values are not
-    JSON compliant`, surfacing as HTTP 500 on the endpoint. Several
-    paths can produce them — a 0-us latency makes speedup=inf, a crashed
-    profile parse can land NaN, etc.
-    """
-    if isinstance(obj, float):
-        return None if not math.isfinite(obj) else obj
-    if isinstance(obj, dict):
-        return {k: _sanitize_floats(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize_floats(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_sanitize_floats(v) for v in obj)
-    return obj
 
 
 def _safe_extract_tar(tar_bytes: bytes, dest_dir: str) -> None:

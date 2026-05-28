@@ -1,11 +1,30 @@
-"""JSON helpers shared by subprocess result reading and history.jsonl
-loading. Single source for both — duplicates in phase_machine and
-task_config were collapsed here."""
+"""JSON helpers shared by every disk / HTTP JSON boundary.
+
+`sanitize_floats` strips `inf` / `-inf` / `nan` to `None`. Python's
+default `json.dump` writes those as `Infinity` / `-Infinity` / `NaN`,
+which is NOT valid strict JSON: FastAPI's encoder rejects them with
+HTTP 500, and consumers that load with the default `parse_constant`
+get back `float('inf')` / `float('nan')` (then break on arithmetic
+or comparison). Run every metrics-bearing dict through this before
+serialising — `eval_assemble` filters most non-finite values, but
+per-shape arrays / pass-through scalars / artifact JSON blobs still
+slip through, so the sanitiser is the canonical safety net.
+
+Every JSON write boundary that can carry profiler output goes
+through here:
+
+  - phase_machine.state_store: progress.json / history.jsonl
+  - engine.pipeline: settle CLI arg + .pending_settle.json
+  - engine.eval_kernel: .eval_result*.json sidecar
+  - utils.eval_runner: profile-block artifact JSONs
+  - worker.server: /api/v1/run response (FastAPI 500 path)
+"""
 from __future__ import annotations
 
 import json
+import math
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 
 
 def _read_whole_file(path: str) -> str:
@@ -39,6 +58,24 @@ def load_jsonl(path: str) -> List[dict]:
         except json.JSONDecodeError:
             continue
     return out
+
+
+def sanitize_floats(obj: Any) -> Any:
+    """Recursively replace inf / -inf / nan with None.
+
+    Returns a new object — does not mutate the input. Scalars, dicts,
+    lists, and tuples are walked. Other types (str, int, bool, None,
+    custom objects) pass through unchanged.
+    """
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: sanitize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_floats(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(sanitize_floats(v) for v in obj)
+    return obj
 
 
 def parse_last_json_line(text: str) -> Optional[dict]:

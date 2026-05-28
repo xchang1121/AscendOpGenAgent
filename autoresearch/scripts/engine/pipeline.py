@@ -26,7 +26,7 @@ sys.path.insert(0, SCRIPTS_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
 from task_config import load_task_config, run_eval
 from utils.failure_extractor import extract_failure_signals, format_for_stdout
-from utils.json_io import parse_last_json_line
+from utils.json_io import parse_last_json_line, sanitize_floats
 from workflow import PhaseController, record_round
 from phase_machine import (
     get_active_item,
@@ -51,7 +51,7 @@ def _run_settle(task_dir: str, kd_json: dict) -> tuple:
     """
     settle = subprocess.run(
         [sys.executable, os.path.join(SCRIPT_DIR, "settle.py"),
-         task_dir, json.dumps(kd_json)],
+         task_dir, json.dumps(sanitize_floats(kd_json))],
         capture_output=True, text=True, timeout=10,
     )
     settle_json = parse_last_json_line(settle.stdout) if settle.returncode == 0 else None
@@ -67,7 +67,7 @@ def _persist_pending_settle(task_dir: str, kd_json: dict) -> None:
     path = pending_settle_path(task_dir)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(kd_json, f)
+        json.dump(sanitize_floats(kd_json), f)
 
 
 def _clear_pending_settle(task_dir: str) -> None:

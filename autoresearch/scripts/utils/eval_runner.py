@@ -286,6 +286,8 @@ def local_eval(task_dir: str, op_name: str,
         "verify_block": verify_block if isinstance(verify_block, dict) else {},
     }
 
+    from .json_io import sanitize_floats
+
     artifacts: dict[str, str] = {}
     if skip_base and isinstance(override_base_per_shape_us, list) and override_base_per_shape_us:
         # Materialise a base profile artifact from the sticky per-shape
@@ -295,15 +297,17 @@ def local_eval(task_dir: str, op_name: str,
         synth_per_shape = [{"avg_time_us": float(v)}
                            for v in override_base_per_shape_us]
         synth_avg = sum(s["avg_time_us"] for s in synth_per_shape) / len(synth_per_shape)
-        artifacts["base_profile_result.json"] = json.dumps({
+        artifacts["base_profile_result.json"] = json.dumps(sanitize_floats({
             "avg_time_us": synth_avg,
             "per_shape": synth_per_shape,
             "sticky": True,
-        })
+        }))
     elif isinstance(base_block, dict):
-        artifacts["base_profile_result.json"] = json.dumps(base_block)
+        artifacts["base_profile_result.json"] = json.dumps(
+            sanitize_floats(base_block))
     if isinstance(gen_block, dict):
-        artifacts["generation_profile_result.json"] = json.dumps(gen_block)
+        artifacts["generation_profile_result.json"] = json.dumps(
+            sanitize_floats(gen_block))
 
     base_time = (float(override_base_time_us) if skip_base
                  else _avg_us(base_block))

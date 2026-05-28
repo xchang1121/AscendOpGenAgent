@@ -509,9 +509,11 @@ def main():
     }
     out_path = args.output or os.path.join(task_dir, ".eval_result.json")
 
+    from utils.json_io import sanitize_floats
+
     def _write_and_exit(rc: int) -> None:
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, default=str)
+            json.dump(sanitize_floats(result), f, default=str)
         print(f"[eval_kernel] result -> {out_path}", file=sys.stderr)
         sys.exit(rc)
 
