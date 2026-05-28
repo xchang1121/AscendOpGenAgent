@@ -39,6 +39,13 @@ class TaskConfig:
     editable_files: list = field(default_factory=list)
     ref_file: str = "reference.py"
 
+    # Sibling files the ref module reads at runtime (NPUKernelBench-style
+    # `<op>.json` shape lists, sglang-style `ref.pt` output caches,
+    # auxiliary `.py` imports, etc.). Listed by basename relative to
+    # task_dir. The remote-eval package builder ships them alongside
+    # task.yaml + ref + editable; local eval doesn't use the field.
+    data_files: list = field(default_factory=list)
+
     # Eval params
     # Per-SHAPE budget for verify/profile in seconds. eval_client scales it
     # by num_cases (probed from the ref module) before invoking the eval
@@ -139,12 +146,21 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
     else:
         worker_urls = []
 
+    data_files_raw = raw.get("data_files", [])
+    if isinstance(data_files_raw, str):
+        data_files = [data_files_raw] if data_files_raw else []
+    elif isinstance(data_files_raw, list):
+        data_files = [str(f) for f in data_files_raw if f]
+    else:
+        data_files = []
+
     return TaskConfig(
         name=name,
         description=raw.get("description", ""),
         arch=raw.get("arch"),
         editable_files=raw.get("editable_files", []),
         ref_file=agent_block.get("ref_file") or "reference.py",
+        data_files=data_files,
         eval_timeout=eval_block.get("timeout", 600),
         primary_metric=metric_block.get("primary", "score"),
         lower_is_better=metric_block.get("lower_is_better", True),
