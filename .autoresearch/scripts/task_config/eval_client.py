@@ -1,24 +1,35 @@
-"""Eval dispatcher — one local-subprocess transport, one assembler.
+"""Eval dispatcher — one entry point, two transports.
 
-Public entry point: `run_eval(task_dir, config, device_id=None) ->
-EvalResult`. Probes the Ascend runtime and dispatches to
-`run_local_eval`, which builds an EvalRequest, calls
-`utils.eval_runner.local_eval`, and assembles the response into an
-EvalResult via `eval_assemble`.
+`run_eval(task_dir, config, device_id=None, worker_urls=None) ->
+EvalResult` routes:
+
+  - `worker_urls` (CLI arg or task.yaml `worker.urls`) non-empty → ship
+    a tar.gz package via HTTP POST to the first reachable worker.
+  - Else probe the Ascend runtime; on success drive `eval_kernel.py` in
+    two passes locally (`utils.eval_runner.local_eval`).
+  - Else → EvalResult(INFRA_FAIL) explaining the missing transport.
 
 Request-time logic (case-count probe, timeout scaling, sticky lookup)
 lives in `eval_request`; response interpretation lives in
-`eval_assemble`. This file is a thin orchestrator.
+`eval_assemble`. Everything else here is helpers — transport detail,
+not control flow.
 """
+import json
 import os
 import sys
+import uuid
 from typing import Optional
+from urllib.request import Request, urlopen
 
 from .eval_assemble import assemble_eval_result as _assemble_eval_result
 from .eval_request import build_eval_request
 from .loader import TaskConfig
 from .metric_policy import EvalOutcome, EvalResult
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _log_request(prefix: str, request) -> None:
     if request.num_cases > 1:
@@ -31,36 +42,169 @@ def _log_request(prefix: str, request) -> None:
         print(f"[{prefix}] Skipping ref profile; {note}", file=sys.stderr)
 
 
-def run_local_eval(task_dir: str, config: TaskConfig,
-                   device_id: Optional[int] = None) -> EvalResult:
-    """Drive a single `eval_kernel.py` subprocess (via two passes — ref
-    first, kernel second) and assemble an EvalResult."""
+def _normalize_worker_url(url: str) -> str:
+    url = url.strip()
+    if not url.startswith("http"):
+        url = f"http://{url}"
+    return url.rstrip("/")
+
+
+def _worker_status(worker_url: str, timeout: float = 5.0) -> Optional[dict]:
+    try:
+        req = Request(f"{worker_url}/api/v1/status", method="GET")
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def _select_worker(urls: list) -> Optional[str]:
+    """Prefer the reachable worker with the most free device slots; ties
+    broken by input order. Returns None when no URL is reachable."""
+    best = None  # (-free, idx, url)
+    for idx, u in enumerate(urls):
+        st = _worker_status(u)
+        if st is None:
+            continue
+        free = st.get("free", 0)
+        if not isinstance(free, int):
+            free = 0
+        cand = (-free, idx, u)
+        if best is None or cand < best:
+            best = cand
+    return best[2] if best is not None else None
+
+
+def _multipart_post(url: str, fields: dict, files: dict,
+                    timeout: float) -> dict:
+    """POST multipart/form-data using only stdlib. Returns parsed JSON."""
+    boundary = f"----AutoResearch{uuid.uuid4().hex}"
+    body = b""
+    for name, value in fields.items():
+        body += (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                 f"{value}\r\n").encode("utf-8")
+    for name, (filename, data, content_type) in files.items():
+        body += (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="{name}"; '
+                 f'filename="{filename}"\r\n'
+                 f"Content-Type: {content_type}\r\n\r\n").encode("utf-8")
+        body += data if isinstance(data, bytes) else data.encode("utf-8")
+        body += b"\r\n"
+    body += f"--{boundary}--\r\n".encode("utf-8")
+
+    req = Request(url, data=body, method="POST")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _pick_device(config: TaskConfig, device_id: Optional[int]) -> int:
+    if device_id is not None:
+        return int(device_id)
+    if config.devices:
+        return int(config.devices[0])
+    # No explicit device on the call AND task.yaml has no `devices`
+    # field. Fall back to NPU 0 with a loud warning — legitimate
+    # callers (notebooks, ad-hoc reruns) do hit this path, but a
+    # SILENT fallback to 0 is what once let `--devices 6` get
+    # rewritten to 0 and OOM on a busy NPU.
+    print(
+        "[local_eval] WARNING: no device specified (no device_id arg, "
+        "no `devices` field in task.yaml). Defaulting to NPU 0. If "
+        "another card is intended, pass --device-id N or set "
+        "`devices: [N]` in task.yaml.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def run_eval(task_dir: str, config: TaskConfig,
+             device_id: Optional[int] = None,
+             worker_urls: Optional[list] = None) -> EvalResult:
+    """Pick a transport, run eval, assemble EvalResult.
+
+    Routing:
+      1. CLI `worker_urls` or `config.worker_urls` non-empty → remote.
+      2. Else if Ascend runtime probe succeeds → local subprocess.
+      3. Else → INFRA_FAIL.
+    """
+    urls = [_normalize_worker_url(u)
+            for u in (worker_urls or config.worker_urls or []) if u]
+
+    # ----- Remote transport ----------------------------------------------
+    if urls:
+        worker_url = _select_worker(urls)
+        if worker_url is None:
+            return EvalResult(
+                outcome=EvalOutcome.INFRA_FAIL,
+                error=f"no reachable worker from: {urls}",
+            )
+
+        request = build_eval_request(task_dir, config)
+        _log_request("remote_eval", request)
+        print(f"[remote_eval] worker={worker_url} task={request.task_id}",
+              file=sys.stderr)
+
+        try:
+            from .package_builder import build_package
+            package = build_package(task_dir, config)
+        except Exception as e:
+            return EvalResult(outcome=EvalOutcome.INFRA_FAIL,
+                              error=f"failed to build package: {e}")
+
+        fields = {
+            "task_id": request.task_id,
+            "op_name": request.config.name,
+            "timeout": str(int(request.timeout)),
+        }
+        if request.override_base_us is not None and request.override_base_us > 0:
+            fields["override_base_us"] = f"{request.override_base_us:.6f}"
+        if request.override_base_per_shape_us:
+            fields["override_base_per_shape_us"] = json.dumps(
+                [float(v) for v in request.override_base_per_shape_us])
+
+        try:
+            resp = _multipart_post(
+                f"{worker_url}/api/v1/run",
+                fields=fields,
+                files={"package": ("package.tar.gz", package,
+                                   "application/gzip")},
+                timeout=request.timeout + 60,
+            )
+        except Exception as e:
+            return EvalResult(outcome=EvalOutcome.INFRA_FAIL,
+                              error=f"worker /run failed: {e}")
+
+        return _assemble_eval_result(
+            resp.get("verify_resp") or {},
+            resp.get("profile_resp") or {},
+        )
+
+    # ----- Local transport -----------------------------------------------
     _scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _scripts_dir not in sys.path:
         sys.path.insert(0, _scripts_dir)
-    from utils.eval_runner import local_eval
-
-    if device_id is not None:
-        dev = int(device_id)
-    elif config.devices:
-        dev = int(config.devices[0])
-    else:
-        # No explicit device on the call AND task.yaml has no `devices`
-        # field. Fall back to NPU 0 with a loud warning — legitimate
-        # callers (notebooks, ad-hoc reruns) do hit this path, but a
-        # SILENT fallback to 0 is what once let `--devices 6` get
-        # rewritten to 0 and OOM on a busy NPU.
-        dev = 0
-        print(
-            "[local_eval] WARNING: no device specified (no device_id arg, "
-            "no `devices` field in task.yaml). Defaulting to NPU 0. If "
-            "another card is intended, pass --device-id N or set "
-            "`devices: [N]` in task.yaml.",
-            file=sys.stderr,
+    from utils.eval_runner import detect_local_backend, local_eval
+    ok, why = detect_local_backend()
+    if not ok:
+        return EvalResult(
+            outcome=EvalOutcome.INFRA_FAIL,
+            error=(
+                f"ascend runtime unavailable: {why}. Install torch + "
+                f"torch_npu + CANN locally, or pass --worker-url to "
+                f"ship eval to a remote NPU host."
+            ),
         )
 
+    dev = _pick_device(config, device_id)
     request = build_eval_request(task_dir, config)
     _log_request("local_eval", request)
+
     kernel_basename = config.editable_files[0].replace(".py", "")
     ref_basename = config.ref_file.replace(".py", "")
     print(f"[local_eval] device={dev}; eval_kernel.py "
@@ -79,27 +223,3 @@ def run_local_eval(task_dir: str, config: TaskConfig,
         override_base_per_shape_us=request.override_base_per_shape_us,
     )
     return _assemble_eval_result(verify_resp, profile_resp)
-
-
-def run_eval(task_dir: str, config: TaskConfig,
-             device_id: Optional[int] = None) -> EvalResult:
-    """Probe the Ascend runtime; on success run `run_local_eval`,
-    otherwise return an EvalResult carrying a clear "no execution
-    backend" error so the user can fix the local install.
-    """
-    _scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if _scripts_dir not in sys.path:
-        sys.path.insert(0, _scripts_dir)
-    from utils.eval_runner import detect_local_backend
-    ok, why = detect_local_backend()
-    if ok:
-        print(f"[eval] ascend runtime ok: {why}", file=sys.stderr)
-        return run_local_eval(task_dir, config, device_id=device_id)
-
-    return EvalResult(
-        outcome=EvalOutcome.INFRA_FAIL,
-        error=(
-            f"ascend runtime unavailable: {why}. Install torch + "
-            f"torch_npu + CANN locally."
-        ),
-    )

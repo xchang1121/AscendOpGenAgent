@@ -45,6 +45,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("task_dir")
     parser.add_argument("--device-id", type=int, default=None)
+    parser.add_argument("--worker-url", default=None,
+                        help="Worker URL(s), comma-separated. Overrides "
+                             "task.yaml worker.urls.")
     args = parser.parse_args()
 
     task_dir = os.path.abspath(args.task_dir)
@@ -56,9 +59,15 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
+    worker_urls = None
+    if args.worker_url:
+        worker_urls = [u.strip() for u in args.worker_url.split(",") if u.strip()]
+
     print("[baseline] Running baseline eval...", flush=True)
     try:
-        result = run_eval(task_dir, config, device_id=args.device_id)
+        result = run_eval(task_dir, config,
+                          device_id=args.device_id,
+                          worker_urls=worker_urls)
     except Exception as e:
         # run_eval is expected to convert its own internal failures to
         # EvalResult(INFRA_FAIL, ...); reaching this branch means it

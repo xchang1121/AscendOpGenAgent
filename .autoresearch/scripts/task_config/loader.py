@@ -72,7 +72,15 @@ class TaskConfig:
     # Local devices
     devices: list = field(default_factory=list)
     """Device IDs for local eval (written by scaffold from --devices). When
-    non-empty, run_local_eval uses devices[0] as default device_id."""
+    non-empty and no worker_urls, run_eval uses devices[0] as default
+    device_id."""
+
+    # Remote workers
+    worker_urls: list = field(default_factory=list)
+    """HTTP worker URLs (e.g. ["http://127.0.0.1:9111"]) for remote eval.
+    When non-empty (or `--worker-url` passed on the CLI), run_eval ships
+    the task package via HTTP POST to the first reachable worker. Local
+    devices are the fallback."""
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +128,17 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
     else:
         devices = []
 
+    # Parse worker_urls. Accepts "host:port" / "http://host:port" /
+    # comma-separated string / list. Empty by default — devices is the
+    # default transport unless --worker-url overrides.
+    worker_urls_raw = raw.get("worker", {}).get("urls", [])
+    if isinstance(worker_urls_raw, str):
+        worker_urls = [u.strip() for u in worker_urls_raw.split(",") if u.strip()]
+    elif isinstance(worker_urls_raw, list):
+        worker_urls = [str(u).strip() for u in worker_urls_raw if str(u).strip()]
+    else:
+        worker_urls = []
+
     return TaskConfig(
         name=name,
         description=raw.get("description", ""),
@@ -136,4 +155,5 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
         code_checker_enabled=bool(code_checker_block.get("enabled", True)),
         max_rounds=agent_block.get("max_rounds", 30),
         devices=devices,
+        worker_urls=worker_urls,
     )
