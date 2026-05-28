@@ -10,203 +10,103 @@ Claude Code 帮你自动优化算子：写 plan → 改 kernel → 测时延 →
 
 ---
 
-## ⚠️ 命名契约（必须遵守）
+## 命名契约（强约束，违反就跑不起来）
 
-这些是 scaffold / batch / package_builder 硬编码的规则，违反一条整个流程就
-跑不起来。不是建议、不是惯例 — **是契约**。
-
-### 文件名
-
-| 角色 | 必须叫什么 | 谁强制 |
-|------|----------|--------|
-| ref Python 文件 | 单跑：任意名，路径通过 `--ref` 传；**批跑：严格 `<op>_ref.py`** | batch/prepare.py 按 stem 配对 |
-| kernel Python 文件 | 单跑：任意，路径通过 `--kernel` 传；**批跑：严格 `<op>_kernel.py`** | batch/prepare.py 按 stem 配对 |
-| ref/kernel 的 sibling shape/cache 文件 | 文件 stem 必须以 ref stem 为前缀，比如 ref 是 `10_Relu.py` → 配 `10_Relu.json` / `10_Relu_all_case.json` / `10_Relu.pt` 都行；**`2_FloorDivide.json` 不会被认作 sibling** | scaffold.py 按 ref stem 过滤 |
-| sibling 后缀 | 只认 `.json` / `.pt` / `.npz`，且文件名不以 `.` 开头 | scaffold.py |
-
-scaffold 把这些 sibling 文件**自动写进** `task.yaml: data_files:`，远端
-worker 收 tar 包时按这个列表打包；本地 eval 时 ref 里 `os.path.join(
-os.path.dirname(__file__), "<name>.json")` 也能找到。**两条路径都依赖这个
-列表**。
-
-### Python 接口
-
-| 角色 | 必须暴露什么 | 谁要 |
-|------|----------|------|
-| `<op>_ref.py` | 类 `Model` 继承 `nn.Module`；函数 `get_inputs()` **或** `get_input_groups()`（二选一）；函数 `get_init_inputs()` | eval_kernel.py + batch/verify.py Tier-1 |
-| `<op>_kernel.py` | 类 `ModelNew` 继承 `nn.Module` | eval_kernel.py + batch/verify.py Tier-1 |
-
-`get_inputs` 单 shape 用，返回 `[t1, t2, ...]`；`get_input_groups` 多
-shape 用，返回 `[[t1, t2, ...], [t1', t2', ...], ...]`。**不能同时给** —
-`get_input_groups` 优先。
-
-`Model.__init__(*init_inputs)` 和 `Model.forward(*inputs)` 的 arity 必须
-跟 `get_init_inputs()` / `get_inputs()[0]` 长度对得上 — eval_kernel 会
-直接 `Model(*init_inputs)` 和 `model(*inputs)`，对不上就 INFRA_FAIL。
-
-### task.yaml 字段名
-
-scaffold 自动写，但如果你手改要注意这些字段名是 fixed schema：
-
-```yaml
-name:            <str>          # 必填; 决定 task_dir 命名
-arch:            <str>          # ascend910b3 等; npu-smi info 推
-editable_files:  [kernel.py]    # batch/eval 都按这个找 kernel 文件
-ref_file:        reference.py   # scaffold 拷贝时改名成这个
-eval:
-  timeout:       <int sec>      # per-shape
-metric:
-  primary:       latency_us     # 字面字符串, eval_assemble 按这个键取
-  lower_is_better: true
-agent:
-  ref_file:      reference.py
-  max_rounds:    <int>
-devices:         [<int>, ...]
-data_files:      [<basename>, ...]   # scaffold 自动写, 你可以手加
-worker:                                # 可选; 走远端 eval
-  urls:          [<host:port>, ...]
-code_checker:
-  enabled:       true | false
-```
-
-字段名拼错（比如把 `editable_files` 写成 `editable_file`）就被 yaml
-loader 默认值兜住，结果你以为生效了其实没生效 — **谨慎手改**。
-
-### task_dir 命名
-
-scaffold 写 `ar_tasks/<op_name>_<int(time.time())>_<uuid.hex[:6]>/`。
-`<op_name>` 来自 `--op-name`。这个三段命名是 batch/manifest 识别 task_dir
-的依据，**不要手动改 task_dir 的名字**。
+| 项 | 约定 |
+|----|-----|
+| ref 文件名 | 单跑任意；**批跑严格 `<op>_ref.py`**（batch/prepare 按 stem 配对） |
+| kernel 文件名 | 单跑任意；**批跑严格 `<op>_kernel.py`** |
+| ref 暴露 | `class Model(nn.Module)` + `get_init_inputs()` + 二选一：`get_inputs()` 单 shape / `get_input_groups()` 多 shape |
+| kernel 暴露 | `class ModelNew(nn.Module)`；**必须含 `@triton.jit` kernel 并真的 launch**（不然 quick_check 拒掉，见 [validate_triton_impl.py](scripts/utils/validate_triton_impl.py)）|
+| sibling shape/cache | 文件 stem 必须以 ref stem 为前缀（ref 是 `10_Relu.py` → 配 `10_Relu*.json/.pt/.npz`）；scaffold 自动拷进 task_dir **并写入 `task.yaml: data_files:`** |
+| task.yaml 字段 | fixed schema（[loader.py](scripts/task_config/loader.py)）；拼错（如 `editable_file`）被 yaml 默认值兜住没人警告 — 谨慎手改 |
+| task_dir 命名 | `ar_tasks/<op_name>_<int(time.time())>_<uuid.hex[:6]>/` — batch/manifest 按这三段识别，**不要手改** |
 
 ---
 
-## 5 分钟教程：跑通你的第一个优化任务
+## 5 分钟教程
 
-目标：让 Claude 帮你把一个 ReLU 算子从 baseline 的速度做出几倍加速，全程
-不用手动改代码。
+跑一个 ReLU 算子。前提：`cd autoresearch` 能跑 `claude`，`npu-smi` 看得到
+NPU，`torch_npu` / `triton-ascend` / CANN 装好。
 
-### 0. 一次性环境检查
+### 1. ref + kernel
 
-| 你需要 | 说明 |
-|------|------|
-| `cd autoresearch` 后能跑 `claude` | 仓库根的 `autoresearch/` 子目录自包含 `.claude/` 配置，不用 mv |
-| `npu-smi info` 能看到至少一张 910B3/910B4 | 用 `npu-smi info` 看 HBM-Usage 找一张空卡，记住编号 |
-| 安装好 `torch_npu`、`triton-ascend`、`CANN`、PyYAML | 用 `python -c "import torch_npu"` 验证 |
+放到 `autoresearch/workspace/`：
 
-### 1. 准备 ref（PyTorch 黄金答案）和 kernel（你的种子实现）
-
-> 这里命名其实自由，因为单跑通过 `--ref` / `--kernel` 显式传路径。但
-> **如果以后要进批跑，必须严格 `<op>_ref.py` / `<op>_kernel.py`** —
-> 详见上面的「命名契约」节。
-
-最小例子放到 `autoresearch/workspace/`（手动创建）：
-
-**`workspace/relu_ref.py`** — 这是 PyTorch 写的标准答案，autoresearch 用它
-当 correctness oracle 和 perf baseline：
+**`workspace/relu_ref.py`** — PyTorch 标准答案：
 
 ```python
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch, torch.nn as nn, torch.nn.functional as F
 
 class Model(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.relu(x)
+    def forward(self, x): return F.relu(x)
 
-def get_inputs():
-    return [torch.randn(1024, 1024, dtype=torch.float16)]
-
-def get_init_inputs():
-    return []
+def get_inputs():      return [torch.randn(1024, 1024, dtype=torch.float16)]
+def get_init_inputs(): return []
 ```
 
-**`workspace/relu_kernel.py`** — 你的 triton-ascend 种子实现。先随便写个
-最朴素的版本（甚至 wrap PyTorch 也行，只要 Claude 能在它基础上迭代）：
+**`workspace/relu_kernel.py`** — 种子 kernel。必须含 `@triton.jit` 并真 launch，
+不然 quick_check 拒（命名契约里的硬规则）：
 
 ```python
-import torch
-import torch.nn as nn
+import torch, torch.nn as nn, triton, triton.language as tl
+
+@triton.jit
+def _relu_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, tl.maximum(x, 0.0), mask=mask)
 
 class ModelNew(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_npu:
-            x = x.npu()
-        return torch.relu(x)
+    def forward(self, x):
+        if not x.is_npu: x = x.npu()
+        x = x.contiguous()
+        out = torch.empty_like(x)
+        n, BLOCK = x.numel(), 1024
+        _relu_kernel[(triton.cdiv(n, BLOCK),)](x, out, n, BLOCK=BLOCK)
+        return out
 ```
 
-> 必须：ref 暴露 `Model` / `get_inputs` / `get_init_inputs`，kernel 暴露
-> `ModelNew`。文件命名约定：`<op>_ref.py` / `<op>_kernel.py`。
-
-### 2. 进 Claude，跑 /autoresearch
+### 2. 跑
 
 ```bash
-cd autoresearch
-claude
+cd autoresearch && claude
 ```
 
-Claude 启动后**在 prompt 里**输入：
+Claude 里：
 
 ```text
 /autoresearch --ref workspace/relu_ref.py --kernel workspace/relu_kernel.py \
-  --op-name relu --devices 0 --max-rounds 5 --no-code-checker
+  --op-name relu --devices 0 --max-rounds 5
 ```
 
-参数解释（够你跑通就够了）：
+`--devices` 必填，`--max-rounds` 第一次推荐 5 看效果。其它 flag 见后面的
+「`/autoresearch` 完整参数」节。
 
-| flag | 必填 | 含义 |
-|------|------|------|
-| `--ref` / `--kernel` | ✓ | 上面准备好的两个文件 |
-| `--op-name` | ✓ | 起一个标识名，决定 task_dir 命名 |
-| `--devices` | ✓ | 用哪张 NPU。`0` / `0,1,2`（逗号分隔） |
-| `--max-rounds` | ✗ | 跑几轮就停，第一次推荐 5 轮快速看效果 |
-| `--no-code-checker` | ✗ | 关掉 triton 静态退化检查（如果你写的 kernel 不是纯 triton） |
+### 3. 自动跑起来
 
-### 3. 你会看到什么
+Claude 自动走 scaffold → BASELINE → PLAN → EDIT → eval → KEEP/DISCARD →
+settle → 下一轮，**不需要手动指挥**，跟着每条 `[AR Phase: ...]` 提示往下
+就行。跑满 `--max-rounds` 自动 FINISH，写 `<task_dir>/.ar_state/report.md`。
 
-Claude 会按顺序自动执行：
-
-1. **scaffold**：创建 `ar_tasks/relu_<时间戳>_<6 位 hex>/`，把 ref 和
-   kernel 拷进去，生成 `task.yaml`，git init 一个隔离的 commit 历史。
-2. **BASELINE**：跑 seed kernel 测时延和正确性。stdout 出现一行：
-   ```
-   [baseline] Initialized: task=relu, seed_latency_us=3.0, baseline(ref)=3.0, commit=...
-   ```
-3. **PLAN**：Claude 读 ref/kernel，写出 N 条优化思路到 `plan.md`，每条
-   一个 `pN` id。
-4. **EDIT**：Claude 拿当前 (ACTIVE) 的 plan item，改 `kernel.py`，触发
-   `pipeline.py`（hook 自动跑），里面会做：
-   - **quick_check**：静态过一下，不让明显错的代码下去测
-   - **eval**：双 subprocess 测 ref 时延和 kernel 时延，算 speedup
-   - **判 KEEP/DISCARD/FAIL**：变快 → KEEP（git commit 进 task 的隔离仓
-     库）；变慢 → DISCARD（revert）；出错 → FAIL（也 revert）
-   - **settle**：把 plan item 标 [x]，advance 到下一个
-5. **重复 PLAN/EDIT**，连续 3 次 FAIL 自动 DIAGNOSE（subagent 写诊断
-   报告，重写 plan），所有 plan 跑完进 REPLAN。
-6. **FINISH**：跑满 `max_rounds` 或没改进空间，写
-   `.ar_state/report.md`（含一张内嵌 SVG 速度曲线），Claude 收尾停止。
-
-### 4. 另开一个终端实时看进度
+另开终端看进度：
 
 ```bash
-cd autoresearch
-python scripts/dashboard.py ar_tasks/relu_<timestamp>_<hex>/ --watch
+python scripts/dashboard.py ar_tasks/relu_<ts>_<hex>/ --watch
 ```
 
-看到 best_metric 一路降、speedup 一路升就是正常优化。
+最佳 kernel = `<task_dir>/kernel.py`（git log 看每个 KEEP 都是一个 commit）。
 
-### 5. 跑完之后
-
-报告在 `<task_dir>/.ar_state/report.md`。最佳 kernel 是 `<task_dir>/kernel.py`
-（git log 能看到每个 KEEP 的 round 都是一个 commit）。
-
-### 想中途看 / 续跑 / 重来？
+### 4. 续跑 / 重来
 
 | 你想 | 做法 |
 |------|------|
-| 关 Claude 后续跑 | 重启 Claude 再 `/autoresearch --resume` |
-| 续跑指定任务 | `/autoresearch --resume <task_dir>` |
-| 不想跑这一轮、想从头再来 | 删掉 `ar_tasks/<task_dir>/`，重新 `/autoresearch --ref ... --kernel ...` |
-| 中间想看具体哪轮做了什么 | `<task_dir>/.ar_state/history.jsonl` 一行一轮 |
+| 续跑最近的 task | `/autoresearch --resume` |
+| 续跑指定 task | `/autoresearch --resume <task_dir>` |
+| 重新开始 | 删 `ar_tasks/<task_dir>/`，再 `/autoresearch --ref ... --kernel ...` |
+| 看每轮做了什么 | `<task_dir>/.ar_state/history.jsonl` 一行一轮 |
 
 ---
 
