@@ -38,6 +38,8 @@ import sys
 # importable so the lazy `from scaffold import _make_arg_parser` resolves.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from utils.settings import default_max_rounds  # noqa: E402
+
 
 def _emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False))
@@ -87,7 +89,7 @@ def main():
                 "--kernel <file>",
                 "--op-name <name>",
                 "--devices <N>",
-                "--max-rounds (optional, default 20)",
+                f"--max-rounds (optional, default {default_max_rounds()})",
             ],
             "note": ("no arguments — ask the user for the missing fields, "
                      "then re-invoke /autoresearch with the full flag set."),
