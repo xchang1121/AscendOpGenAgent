@@ -65,6 +65,8 @@ def _build_scaffold_command(args) -> str:
     parts.append("--run-baseline")
     if args.no_code_checker:
         parts.append("--no-code-checker")
+    if getattr(args, "worker_url", ""):
+        parts += ["--worker-url", shlex.quote(args.worker_url)]
     return " ".join(parts)
 
 
@@ -165,7 +167,8 @@ def main():
         "eval_timeout": args.eval_timeout,
         "output_dir": args.output_dir or "ar_tasks",
         "run_baseline": True,
-        "no_code_checker": args.no_code_checker,
+        "no_code_checker": getattr(args, "no_code_checker", False),
+        "worker_url": getattr(args, "worker_url", ""),
     }
 
     if missing:

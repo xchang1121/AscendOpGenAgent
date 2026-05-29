@@ -63,6 +63,7 @@ def scaffold_task_dir(
     editable_filename: str = "kernel.py",
     code_checker_enabled: bool = True,
     ref_source_path: str | None = None,
+    worker_url: str = "",
 ) -> str:
     """Create task directory with all files. Returns absolute path."""
     # Determine base directory
@@ -138,6 +139,9 @@ def scaffold_task_dir(
     }
     if devices:
         task_yaml["devices"] = list(devices)
+    if worker_url:
+        worker_urls = [u.strip() for u in worker_url.split(",") if u.strip()]
+        task_yaml["worker"] = {"urls": worker_urls}
     if discovered_data_files:
         task_yaml["data_files"] = discovered_data_files
 
@@ -221,6 +225,10 @@ def _make_arg_parser() -> argparse.ArgumentParser:
                               "strict for the chosen kernel style. Writes "
                               "`code_checker: {enabled: false}` into "
                               "task.yaml; flip the field to re-enable later."))
+    parser.add_argument("--worker-url", default="",
+                        help="Remote worker URL(s) (host:port, comma-separated). "
+                             "Routes eval through the remote HTTP worker "
+                             "instead of local npu-smi.")
     return parser
 
 
@@ -231,31 +239,36 @@ def main():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from utils.hw_detect import derive_arch
 
-    # Hardware resolution: --devices is required (local-only). The repo
-    # is locked to triton_ascend / torch / ascend by construction —
-    # those constants live in TaskConfig defaults / generated templates,
-    # not on `args`.
+    # Hardware resolution: --devices is required unless --worker-url routes
+    # eval to a remote machine. The repo is locked to triton_ascend / torch
+    # / ascend by construction — those constants live in TaskConfig defaults
+    # / generated templates, not on `args`.
     devices_list: list = []
     args.arch = None
 
-    if not args.devices:
+    has_remote = bool(args.worker_url and args.worker_url.strip())
+
+    if not args.devices and not has_remote:
         print(json.dumps({"status": "error",
-                          "error": "--devices is required (local eval)."}))
+                          "error": "--devices (local eval) or "
+                                   "--worker-url (remote worker) is required."}))
         sys.exit(1)
 
-    devices_list = [int(d.strip()) for d in args.devices.split(",")
-                    if d.strip()]
+    if args.devices:
+        devices_list = [int(d.strip()) for d in args.devices.split(",")
+                        if d.strip()]
     if not devices_list:
-        print(json.dumps({"status": "error",
-                          "error": "--devices parsed to an empty list"}))
-        sys.exit(1)
-    args.arch = derive_arch(devices_list[0])
-    if not args.arch:
-        print(json.dumps({"status": "error",
-                          "error": (f"could not derive arch from "
-                                    f"device {devices_list[0]} "
-                                    f"(is npu-smi on PATH?)")}))
-        sys.exit(1)
+        # Remote-only: default to device 0 (the worker owns the real NPU).
+        devices_list = [0]
+
+    if not has_remote:
+        args.arch = derive_arch(devices_list[0])
+        if not args.arch:
+            print(json.dumps({"status": "error",
+                              "error": (f"could not derive arch from "
+                                        f"device {devices_list[0]} "
+                                        f"(is npu-smi on PATH?)")}))
+            sys.exit(1)
 
     if not args.op_name:
         print(json.dumps({"status": "error",
@@ -295,6 +308,7 @@ def main():
         output_dir=args.output_dir,
         code_checker_enabled=not args.no_code_checker,
         ref_source_path=args.ref,
+        worker_url=args.worker_url,
     )
 
     print(f"[scaffold] Task directory created: {task_dir}", file=sys.stderr)

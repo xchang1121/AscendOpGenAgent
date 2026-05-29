@@ -81,7 +81,7 @@ _CANONICAL_AR_RE = re.compile(
     # `-3`/`-3.10` with "Unknown option"). Only the common flags.
     r'python(?:\d+(?:\.\d+)?)?(?:\s+(?:' + _COMMON_PY_FLAGS + r'))*'
     r')'
-    r'\s+(?:\S*?/)?\autoresearch/scripts/'      # script (with optional path prefix)
+    r'\s+(?:\S*?/)?autoresearch/scripts/'      # script (with optional path prefix)
     r'(engine/)?'                                # group 1: engine/ presence
     r'([A-Za-z_]\w*\.py)\b'                      # group 2 = basename
     r'(?:\s+(?:'                                 # script args
@@ -346,7 +346,7 @@ def parse_invoked_ar_script(command: str) -> Optional[str]:
 
 
 _SCRIPT_SHAPE_RE = re.compile(
-    r'\autoresearch/scripts/((?:engine/)?[A-Za-z_]\w*\.py)\b'
+    r'autoresearch/scripts/((?:engine/)?[A-Za-z_]\w*\.py)\b'
 )
 # Match the python launcher as a whole word so unrelated tokens like
 # `python_helper` don't trigger the unknown-script hint on read-only
