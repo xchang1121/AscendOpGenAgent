@@ -52,7 +52,7 @@ def _build_scaffold_command(args) -> str:
     the canonical form is what scaffold sees, regardless of any quoting
     or whitespace quirks in the user's typed string.
     """
-    parts = ["python", "autoresearch/scripts/scaffold.py"]
+    parts = ["python", "scripts/scaffold.py"]
     parts += ["--ref", shlex.quote(args.ref)]
     parts += ["--kernel", shlex.quote(args.kernel)]
     if args.op_name:
@@ -93,7 +93,7 @@ def main():
     # --- resume forms ---
     if tokens[0] == "--resume":
         task_dir = tokens[1] if len(tokens) > 1 else ""
-        cmd_parts = ["python", "autoresearch/scripts/resume.py"]
+        cmd_parts = ["python", "scripts/resume.py"]
         if task_dir:
             cmd_parts.append(shlex.quote(task_dir))
         _emit({
