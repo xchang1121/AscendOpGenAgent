@@ -51,8 +51,16 @@ remote_worker:
 # ---------------------------------------------------------------------------
 
 # Task defaults applied when a task.yaml (or scaffold CLI) omits the field.
+# Precedence for these: task.yaml > this config > (no in-code default).
 defaults:
-  max_rounds: 30    # optimization-round budget for a new/under-specified task
+  max_rounds: 30          # optimization-round budget for a new/under-specified task
+  eval_timeout: 600       # per-shape verify/profile budget (seconds); scaled by num_cases
+  smoke_test_timeout: 10  # quick_check smoke-test budget (seconds)
+  code_checker_enabled: true   # run the triton-impl AST regression check by default
+  metric:                 # primary optimization metric (scaffold writes it; loader falls back here)
+    primary: latency_us
+    lower_is_better: true
+    improvement_threshold: 0.0
 
 # Eval timing measurement. Read where the timing runs: on remote eval the
 # WORKER's config.yaml applies.
@@ -61,9 +69,15 @@ eval:
   repeats: 100      # measured iterations averaged per shape
 
 # Remote worker daemon. Single source for both the ar_cli tunnel/status
-# side and the worker bind side — the two must agree.
+# side and the worker bind side — the two must agree. The *_timeout knobs
+# tune how the dev-side ar_cli waits on the (possibly remote, possibly
+# slow) worker over the ssh -L tunnel.
 worker:
   port: 9111
+  ready_timeout: 20.0       # total seconds to wait for a freshly started daemon to answer /status
+  ready_poll_interval: 0.5  # seconds between readiness polls during startup
+  ready_probe_timeout: 1.5  # per-poll /status probe timeout during the readiness loop (short, kept responsive)
+  status_timeout: 5.0       # seconds for a standalone /status probe (reachability check)
 
 # Batch pre-flight verification (scripts/batch/verify.py), in seconds.
 # tier2 cold JIT across ~50 cases on triton-ascend can take minutes for

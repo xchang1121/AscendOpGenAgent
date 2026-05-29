@@ -104,7 +104,11 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
     """Load TaskConfig from task_dir/task.yaml. Returns None if not found."""
     # Lazy import: callers reach loader via `from task_config import ...`,
     # which guarantees scripts/ is on sys.path by the time this runs.
-    from utils.settings import default_max_rounds
+    from utils.settings import (
+        default_max_rounds, default_eval_timeout, default_smoke_test_timeout,
+        default_code_checker_enabled, default_metric,
+    )
+    _metric = default_metric()
     yaml_path = os.path.join(task_dir, "task.yaml")
     if not os.path.exists(yaml_path):
         return None
@@ -170,15 +174,19 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
         editable_files=raw.get("editable_files", []),
         ref_file=agent_block.get("ref_file") or "reference.py",
         data_files=data_files,
-        eval_timeout=eval_block.get("timeout", 600),
+        eval_timeout=eval_block.get("timeout", default_eval_timeout()),
         num_cases=int(eval_block.get("num_cases", 0) or 0),
-        primary_metric=metric_block.get("primary", "score"),
-        lower_is_better=metric_block.get("lower_is_better", True),
-        improvement_threshold=metric_block.get("improvement_threshold", 0.0),
+        primary_metric=metric_block.get("primary", _metric["primary"]),
+        lower_is_better=metric_block.get(
+            "lower_is_better", _metric["lower_is_better"]),
+        improvement_threshold=metric_block.get(
+            "improvement_threshold", _metric["improvement_threshold"]),
         constraints=constraints,
         smoke_test_script=smoke_block.get("script"),
-        smoke_test_timeout=smoke_block.get("timeout", 10),
-        code_checker_enabled=bool(code_checker_block.get("enabled", True)),
+        smoke_test_timeout=smoke_block.get(
+            "timeout", default_smoke_test_timeout()),
+        code_checker_enabled=bool(code_checker_block.get(
+            "enabled", default_code_checker_enabled())),
         max_rounds=agent_block.get("max_rounds", default_max_rounds()),
         devices=devices,
         worker_urls=worker_urls,

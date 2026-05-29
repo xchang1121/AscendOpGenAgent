@@ -43,7 +43,9 @@ import yaml
 # `scaffold.validate_ref` working.
 # ---------------------------------------------------------------------------
 from utils.ref_ast import validate_ref  # noqa: E402, F401  (re-export)
-from utils.settings import default_max_rounds  # noqa: E402
+from utils.settings import (  # noqa: E402
+    default_max_rounds, default_eval_timeout, default_metric,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +61,7 @@ def scaffold_task_dir(
     arch: str = "",
     devices: list | None = None,
     max_rounds: int | None = None,
-    eval_timeout: int = 600,
+    eval_timeout: int | None = None,
     output_dir: str | None = None,
     editable_filename: str = "kernel.py",
     code_checker_enabled: bool = True,
@@ -69,6 +71,8 @@ def scaffold_task_dir(
     """Create task directory with all files. Returns absolute path."""
     if max_rounds is None:
         max_rounds = default_max_rounds()
+    if eval_timeout is None:
+        eval_timeout = default_eval_timeout()
     # Determine base directory
     if output_dir:
         base_dir = output_dir
@@ -142,8 +146,8 @@ def scaffold_task_dir(
         "editable_files": [editable_filename],
         "eval": eval_block,
         "metric": {
-            "primary": "latency_us",
-            "lower_is_better": True,
+            "primary": default_metric()["primary"],
+            "lower_is_better": default_metric()["lower_is_better"],
         },
         "agent": {
             "ref_file": "reference.py",
@@ -241,7 +245,7 @@ def _make_arg_parser() -> argparse.ArgumentParser:
                         help="Comma-separated device IDs for local eval "
                              "(e.g. '5' or '0,1,2,3'). Required.")
     parser.add_argument("--max-rounds", type=int, default=default_max_rounds())
-    parser.add_argument("--eval-timeout", type=int, default=600)
+    parser.add_argument("--eval-timeout", type=int, default=default_eval_timeout())
     parser.add_argument("--output-dir", default=None,
                         help="Parent directory for the task (default: ./ar_tasks/)")
     parser.add_argument("--run-baseline", action="store_true",

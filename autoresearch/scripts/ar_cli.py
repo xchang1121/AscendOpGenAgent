@@ -41,7 +41,10 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 # Run as `python scripts/ar_cli.py`, so scripts/ is on sys.path[0].
-from utils.settings import worker_port  # noqa: E402
+from utils.settings import (  # noqa: E402
+    worker_port, worker_ready_timeout, worker_ready_poll_interval,
+    worker_ready_probe_timeout, worker_status_timeout,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 # Autoresearch project root: scripts/ → autoresearch/
@@ -67,7 +70,10 @@ def _worker_log_path(port: int) -> str:
     return f"/tmp/ar_worker_{port}.log"
 
 
-def _curl_status(host: str, port: int, timeout: float = 5.0) -> Optional[dict]:
+def _curl_status(host: str, port: int,
+                 timeout: float = None) -> Optional[dict]:
+    if timeout is None:
+        timeout = worker_status_timeout()
     url = f"http://{host}:{port}/api/v1/status"
     try:
         with urlopen(Request(url, method="GET"), timeout=timeout) as resp:
@@ -157,15 +163,17 @@ def cmd_worker_start(args) -> int:
 
         # Poll /status until ready or timeout — gives a clear failure
         # message instead of "fork succeeded, daemon crashed silently".
-        deadline = time.time() + 20.0
+        ready_timeout = worker_ready_timeout()
+        deadline = time.time() + ready_timeout
         ready = False
         while time.time() < deadline:
             if proc.poll() is not None:
                 break  # process died during boot
-            if _curl_status("127.0.0.1", args.port, timeout=1.5):
+            if _curl_status("127.0.0.1", args.port,
+                            timeout=worker_ready_probe_timeout()):
                 ready = True
                 break
-            time.sleep(0.5)
+            time.sleep(worker_ready_poll_interval())
 
         if not ready:
             rc = proc.poll()
@@ -176,7 +184,8 @@ def cmd_worker_start(args) -> int:
             except Exception:
                 pass
             print(f"[ar_cli] worker on :{args.port} did not become ready "
-                  f"within 20s (process rc={rc}). Log tail:\n{tail}",
+                  f"within {ready_timeout:g}s (process rc={rc}). "
+                  f"Log tail:\n{tail}",
                   file=sys.stderr)
             return 1
 

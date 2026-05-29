@@ -55,6 +55,31 @@ def default_max_rounds() -> int:
     return _get("defaults", "max_rounds")
 
 
+def default_eval_timeout() -> int:
+    """Per-shape verify/profile budget (seconds) when a task omits it."""
+    return _get("defaults", "eval_timeout")
+
+
+def default_smoke_test_timeout() -> int:
+    """quick_check smoke-test budget (seconds) when a task omits it."""
+    return _get("defaults", "smoke_test_timeout")
+
+
+def default_code_checker_enabled() -> bool:
+    """Whether the triton-impl AST regression check runs by default."""
+    return bool(_get("defaults", "code_checker_enabled"))
+
+
+def default_metric() -> dict:
+    """Primary-metric defaults (primary / lower_is_better /
+    improvement_threshold). scaffold writes these into a new task.yaml;
+    loader falls back to them when the task.yaml omits the metric block."""
+    m = _get("defaults", "metric")
+    if not isinstance(m, dict):
+        raise ValueError(f"{_CONFIG_PATH}: 'defaults.metric' must be a mapping")
+    return m
+
+
 # --- eval timing measurement (read where the timing runs: on remote eval
 #     that is the WORKER's config.yaml) ----------------------------------
 def eval_warmup() -> int:
@@ -70,6 +95,26 @@ def worker_port() -> int:
     """Worker TCP port. Single source for ar_cli (tunnel/status) and
     worker.server (bind) so the two cannot drift."""
     return _get("worker", "port")
+
+
+def worker_ready_timeout() -> float:
+    """Seconds ar_cli waits for a freshly started daemon to answer /status."""
+    return float(_get("worker", "ready_timeout"))
+
+
+def worker_ready_poll_interval() -> float:
+    """Seconds between readiness polls while waiting for daemon startup."""
+    return float(_get("worker", "ready_poll_interval"))
+
+
+def worker_ready_probe_timeout() -> float:
+    """Per-poll /status probe timeout during the readiness loop (short)."""
+    return float(_get("worker", "ready_probe_timeout"))
+
+
+def worker_status_timeout() -> float:
+    """Seconds for a single /status reachability probe."""
+    return float(_get("worker", "status_timeout"))
 
 
 # --- batch pre-flight verification timeouts (seconds) ------------------
