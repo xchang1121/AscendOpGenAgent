@@ -83,8 +83,8 @@ def _find_pid_on_port(port: int) -> Optional[int]:
     if os.name != "posix":
         return None
 
-    # `ss -ltnp` output line example:
-    #   LISTEN 0  2048  0.0.0.0:9111  0.0.0.0:*  users:(("python",pid=12345,fd=7))
+    # `ss -ltnp` output line example (worker binds loopback):
+    #   LISTEN 0  2048  127.0.0.1:9111  127.0.0.1:*  users:(("python",pid=12345,fd=7))
     try:
         out = subprocess.run(
             ["ss", "-ltnp", f"sport = :{port}"],
@@ -283,8 +283,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(required for --start).")
 
     w.add_argument("--host", default=None,
-                   help="Bind / probe address. Default 0.0.0.0 for --start, "
-                        "127.0.0.1 for --status / --stop.")
+                   help="Bind / probe address. Default 127.0.0.1 (SSH-only; "
+                        "the worker is reached via an ssh -L tunnel, never "
+                        "bound to a public interface).")
     w.add_argument("--port", type=int, default=9111,
                    help="TCP port (default: 9111).")
     w.add_argument("--bg", action="store_true",
@@ -308,7 +309,9 @@ def _validate_worker_args(args) -> Optional[str]:
         return ("--start requires --backend, --arch, --devices "
                 "(no auto-detect mode).")
     if args.host is None:
-        args.host = "0.0.0.0" if args.start else "127.0.0.1"
+        # SSH-only: always loopback. The worker is reached through an
+        # ssh -L tunnel, never by binding a public interface.
+        args.host = "127.0.0.1"
     return None
 
 
@@ -393,11 +396,12 @@ def _strip_remote_flags(args) -> list[str]:
         out += ["--arch", args.arch]
     if args.devices:
         out += ["--devices", args.devices]
-    # Always bind 0.0.0.0 on remote so the ssh -L on the loopback works
-    # regardless of args.host (which on the dev side defaults to
-    # 127.0.0.1 for status/stop — we don't want to push that to remote).
+    # SSH-only: bind the remote worker to loopback. The dev-side ssh -L
+    # tunnel forwards to the remote's 127.0.0.1:<port>, so loopback is
+    # both sufficient and the only exposure we want — never a public
+    # interface.
     if args.start:
-        out += ["--host", "0.0.0.0", "--bg"]
+        out += ["--host", "127.0.0.1", "--bg"]
     out += ["--port", str(args.port)]
     if args.force:
         out.append("--force")

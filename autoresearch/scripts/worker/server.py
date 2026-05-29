@@ -175,7 +175,16 @@ async def run(
             watch_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await watch_task
-            return _sanitize_floats(eval_task.result())
+            try:
+                return _sanitize_floats(eval_task.result())
+            except Exception as e:
+                # Internal eval failure (malformed task.yaml, loader
+                # ValueError, response-assembly error). Package it as a
+                # structured error response instead of letting it bubble to
+                # FastAPI as an opaque HTTP 500 the client can't interpret.
+                logger.exception("[%s] eval task raised", task_id)
+                return _sanitize_floats(
+                    _error_response(device_id, f"worker eval crashed: {e}"))
         # Disconnect (or eval crashed early without a result).
         logger.info("[%s] client gone before eval finished; cancelling, "
                     "releasing device %d", task_id, device_id)
@@ -254,11 +263,15 @@ async def _run_eval_async(package_bytes: bytes, task_id: str, op_name: str,
 
 
 def _error_response(device_id: int, msg: str) -> dict:
+    # error_source="infra": every caller here is a worker-side
+    # infrastructure failure (tar extract, missing task.yaml, internal
+    # eval crash) — NOT a kernel defect. assemble_eval_result maps this to
+    # INFRA_FAIL so the round isn't charged to the kernel as KERNEL_FAIL.
     return {
         "device_id": device_id,
         "verify_resp": {
             "success": False, "log": msg, "returncode": 1,
-            "error_source": None, "verify_block": {}, "artifacts": {},
+            "error_source": "infra", "verify_block": {}, "artifacts": {},
         },
         "profile_resp": {
             "success": False, "log": "", "artifacts": {},
@@ -272,7 +285,11 @@ def _error_response(device_id: int, msg: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def start_server(host: Optional[str] = None, port: Optional[int] = None):
-    host = host or os.environ.get("WORKER_HOST", "0.0.0.0")
+    # SSH-only by design: bind loopback so the worker is reachable ONLY via
+    # an ssh -L tunnel (which forwards to the remote's 127.0.0.1). Never
+    # bind a public interface — that would expose the eval endpoint on
+    # every network.
+    host = host or os.environ.get("WORKER_HOST", "127.0.0.1")
     port = int(port or os.environ.get("WORKER_PORT", "9001"))
     logger.info("starting worker on %s:%d", host, port)
     uvicorn.run(app, host=host, port=port)

@@ -120,14 +120,24 @@ def scaffold_task_dir(
     # Generate task.yaml — only fields that vary per-task. dsl /
     # framework / backend are constants (triton_ascend / torch / ascend)
     # baked into TaskConfig; not written here.
+    # Probe the ref's case count once, here at scaffold time (cwd has the
+    # ref + data_files already written above). Pin it into task.yaml
+    # `eval.num_cases` so later rounds — including a first remote baseline
+    # on a dev host that can't import the ref — scale the eval timeout and
+    # sticky fingerprint correctly instead of falling back to 1. Probe
+    # failure (no torch/CANN here) just omits the field; eval_request then
+    # falls back to its own probe / fingerprint reuse as before.
+    eval_block = {"timeout": eval_timeout}
+    num_cases = _probe_num_cases(task_dir, "reference.py")
+    if num_cases and num_cases > 1:
+        eval_block["num_cases"] = num_cases
+
     task_yaml = {
         "name": op_name,
         "description": desc or f"Optimize {op_name}",
         "arch": arch or None,
         "editable_files": [editable_filename],
-        "eval": {
-            "timeout": eval_timeout,
-        },
+        "eval": eval_block,
         "metric": {
             "primary": "latency_us",
             "lower_is_better": True,
@@ -161,6 +171,21 @@ def scaffold_task_dir(
     _git_init(task_dir)
 
     return os.path.abspath(task_dir)
+
+
+def _probe_num_cases(task_dir: str, ref_file: str):
+    """Best-effort case count for task.yaml `eval.num_cases`, using the
+    exact runtime resolver (task_config.eval_request.count_ref_cases) so
+    scaffold and eval agree. Returns the count, or None if the ref can't
+    be imported here (e.g. no torch on the dev host) — the caller then
+    simply omits the field and lets eval_request probe at run time."""
+    try:
+        from task_config.loader import TaskConfig
+        from task_config.eval_request import count_ref_cases
+        probe_cfg = TaskConfig(name="_probe", ref_file=ref_file)
+        return count_ref_cases(task_dir, probe_cfg)
+    except Exception:
+        return None
 
 
 def _write(task_dir: str, rel_path: str, content: str):

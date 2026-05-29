@@ -108,14 +108,22 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
         if per_gen is not None else []
     )
 
-    # Outcome — only two non-OK paths:
-    #   error_source == "ref"  → broken --ref source file. INFRA_FAIL.
-    #   anything else failing  → kernel responsibility. KERNEL_FAIL.
+    # Outcome — non-OK paths:
+    #   error_source == "ref"    → broken --ref source file. INFRA_FAIL.
+    #   error_source == "infra"  → worker-side infra failure (tar extract,
+    #                              missing task.yaml, internal eval crash;
+    #                              set by worker._error_response). INFRA_FAIL.
+    #   anything else failing    → kernel responsibility. KERNEL_FAIL.
     # Pure-infra failures (no backend / no NPU) set INFRA_FAIL before
     # we ever reach this assembler.
-    if error_source == "ref":
+    if error_source in ("ref", "infra"):
         outcome = EvalOutcome.INFRA_FAIL
-    elif verify_ok and not crashed_shapes:
+    elif verify_ok and gen_ok and not crashed_shapes:
+        # gen_ok gates out the metric-less "OK": when the whole profile_gen
+        # block is missing (per_gen is None) crashed_shapes is empty, so
+        # without this check a kernel with no timing at all would report OK
+        # and force downstream readers into the "OK but no metric" path.
+        # Requiring a finite gen timing lands that case as KERNEL_FAIL.
         outcome = EvalOutcome.OK
     else:
         outcome = EvalOutcome.KERNEL_FAIL
@@ -225,6 +233,13 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
 
     if outcome == EvalOutcome.OK:
         error = None
+    elif error_source == "infra":
+        # Worker-side infra failure (tar extract, missing task.yaml,
+        # internal eval crash). The detail lives in verify_log (set by
+        # worker._error_response), NOT verify_block — don't blame
+        # reference.py and don't drop the message to "(no detail)".
+        error = (f"worker infra failure: "
+                 f"{verify_log.strip() or '(no detail)'}")
     elif outcome == EvalOutcome.INFRA_FAIL:
         error = (f"reference.py failed: "
                  f"{verify_json.get('error') or '(no detail)'}")
@@ -258,8 +273,12 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
             error = ("kernel verify failed before per-case loop "
                      "(see failure_signals / raw_output_tail)")
     else:
-        error = (f"kernel crashed during profile on {len(crashed_shapes)} "
-                 f"of {len(per_gen)} shapes")
+        if per_gen is None:
+            error = ("kernel profile missing or invalid "
+                     "(profile_gen produced no timing data)")
+        else:
+            error = (f"kernel crashed during profile on "
+                     f"{len(crashed_shapes)} of {len(per_gen)} shapes")
 
     profile_log = profile_resp.get("log", "")
     return EvalResult(

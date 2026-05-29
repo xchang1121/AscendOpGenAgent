@@ -48,18 +48,42 @@ class EvalRequest:
         return f"sticky baseline override={self.override_base_us:.2f} us{extra}"
 
 
-def count_ref_cases(task_dir: str, config: TaskConfig) -> int:
-    """Probe the ref module locally and count input cases.
+def _last_known_cases(task_dir: str) -> Optional[int]:
+    """Reuse the case count recorded in a prior round's baseline
+    fingerprint. A dev-side probe failure (host without torch/CANN) must
+    not silently collapse num_cases to 1: that both under-scales the eval
+    timeout and invalidates the sticky baseline fingerprint, forcing a
+    needless ref re-measure on every remote round."""
+    try:
+        from phase_machine import load_progress  # type: ignore
+        progress = load_progress(task_dir) or {}
+        fp = progress.get("baseline_fingerprint") or {}
+        n = int(fp.get("num_cases", 0))
+        return n if n > 0 else None
+    except Exception:
+        return None
 
-    Mirrors what the generated verify script does: import ref + run
-    input_groups.resolve, which duck-types between get_input_groups
-    (multi-shape, NPUKernelBench) and get_inputs (single-shape collapsed
-    to N=1). Used purely to scale eval_timeout — any failure falls back
-    to 1 (single-shape semantics, no scaling).
+
+def count_ref_cases(task_dir: str, config: TaskConfig) -> int:
+    """Resolve the number of input cases — used to scale eval_timeout and
+    the sticky baseline fingerprint.
+
+    Resolution order:
+      1. `config.num_cases` (task.yaml `eval.num_cases`) when set — lets
+         dev hosts without torch/CANN scale correctly with no ref import.
+      2. Probe the ref module: import + input_groups.resolve, duck-typing
+         between get_input_groups (multi-shape, NPUKernelBench) and
+         get_inputs (single-shape collapsed to N=1).
+      3. On probe failure, reuse the last-known count from the stored
+         baseline fingerprint rather than collapsing to 1.
+      4. Only when nothing is known: fall back to 1 (single-shape).
     """
+    if getattr(config, "num_cases", 0):
+        return max(int(config.num_cases), 1)
+
     ref_path = os.path.join(task_dir, config.ref_file)
     if not os.path.isfile(ref_path):
-        return 1
+        return _last_known_cases(task_dir) or 1
     ref_dir = os.path.dirname(ref_path) or "."
     sys_path_added = ref_dir not in sys.path
     if sys_path_added:
@@ -70,14 +94,19 @@ def count_ref_cases(task_dir: str, config: TaskConfig) -> int:
         spec = importlib.util.spec_from_file_location(
             f"_count_ref_{config.name}", ref_path)
         if spec is None or spec.loader is None:
-            return 1
+            return _last_known_cases(task_dir) or 1
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return max(len(_resolve(mod)), 1)
     except Exception as e:
+        fallback = _last_known_cases(task_dir)
+        recovered = (f"reusing last-known num_cases={fallback}" if fallback
+                     else "falling back to num_cases=1")
         print(f"[eval_request] WARN: case-count probe failed "
-              f"({type(e).__name__}: {e})", file=sys.stderr)
-        return 1
+              f"({type(e).__name__}: {e}); {recovered}. Set "
+              f"`eval.num_cases` in task.yaml to avoid importing the ref "
+              f"on hosts without torch/CANN.", file=sys.stderr)
+        return fallback or 1
     finally:
         if sys_path_added:
             try:

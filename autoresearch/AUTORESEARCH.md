@@ -601,6 +601,8 @@ hook_post_bash (任意 bash 之后)
 hook_guard_bash (bash 之前)
   不依赖 .active_task
   直接读取 .ar_state/.phase 判定允许或禁止
+  仅认裸 `scripts/...`（或 `./scripts/`）为 AR 调用；cwd 即 autoresearch/，
+  带前缀的 `autoresearch/scripts/...` 既被判为非规范形式拒绝、在磁盘上也不存在
 ```
 
 `guard_bash` 与 `post_edit` 对 `.active_task` 的依赖不对称：前者不依赖，后者依赖。此为「忘记 export AR_TASK_DIR」症状的成因。

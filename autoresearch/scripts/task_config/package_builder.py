@@ -31,13 +31,20 @@ from .loader import TaskConfig
 
 def _add_file(tar: tarfile.TarFile, task_dir: str, name: str,
               seen: set) -> None:
-    """Add task_dir/name into the archive at top-level name; silently
-    skip if the file is missing or already added."""
+    """Add task_dir/name into the archive at top-level `name`.
+
+    Fails fast (ValueError) instead of silently skipping: every file we
+    pack is declared in task.yaml (task.yaml / ref / editable / data_files)
+    and must exist, else the client would ship an incomplete package that
+    surfaces as a confusing ref/kernel failure on the worker.
+    """
     if name in seen:
         return
     src = os.path.join(task_dir, name)
     if not os.path.isfile(src):
-        return
+        raise ValueError(
+            f"package file {name!r} not found in task_dir "
+            f"({src!r}) — check task.yaml paths.")
     tar.add(src, arcname=name)
     seen.add(name)
 

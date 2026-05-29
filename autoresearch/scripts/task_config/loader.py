@@ -53,6 +53,12 @@ class TaskConfig:
     # Single-shape refs (num_cases=1) keep the original semantics.
     eval_timeout: int = 600
 
+    # Explicit case-count override (task.yaml `eval.num_cases`). When > 0,
+    # eval_request uses it directly instead of importing the ref module to
+    # probe get_inputs/get_input_groups — lets dev hosts without torch/CANN
+    # scale the eval timeout and sticky fingerprint correctly. 0 = auto.
+    num_cases: int = 0
+
     # Metric
     primary_metric: str = "score"
     lower_is_better: bool = True
@@ -154,7 +160,7 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
     else:
         data_files = []
 
-    return TaskConfig(
+    config = TaskConfig(
         name=name,
         description=raw.get("description", ""),
         arch=raw.get("arch"),
@@ -162,6 +168,7 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
         ref_file=agent_block.get("ref_file") or "reference.py",
         data_files=data_files,
         eval_timeout=eval_block.get("timeout", 600),
+        num_cases=int(eval_block.get("num_cases", 0) or 0),
         primary_metric=metric_block.get("primary", "score"),
         lower_is_better=metric_block.get("lower_is_better", True),
         improvement_threshold=metric_block.get("improvement_threshold", 0.0),
@@ -173,3 +180,12 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
         devices=devices,
         worker_urls=worker_urls,
     )
+    # editable_files drives kernel-file resolution in eval (local + remote).
+    # An empty list (e.g. a 'editable_file' typo in task.yaml) used to crash
+    # local eval with an opaque IndexError; fail fast with a clear message.
+    if not config.editable_files:
+        raise ValueError(
+            f"{yaml_path}: 'editable_files' must list at least one kernel "
+            f"file (got {raw.get('editable_files')!r}) — check for a typo "
+            f"such as 'editable_file'.")
+    return config

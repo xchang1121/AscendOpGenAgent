@@ -175,7 +175,12 @@ def run_eval(task_dir: str, config: TaskConfig,
                 fields=fields,
                 files={"package": ("package.tar.gz", package,
                                    "application/gzip")},
-                timeout=request.timeout + 60,
+                # Worker runs ref(profile_base) + kernel(verify,profile_gen)
+                # sequentially, each bounded by request.timeout; only the
+                # kernel pass runs when sticky lets it skip base profiling.
+                # Wait for the worst-case wall time, else the client
+                # disconnects mid-eval and the worker aborts with HTTP 499.
+                timeout=request.timeout * (1 if request.sticky else 2) + 60,
             )
         except Exception as e:
             return EvalResult(outcome=EvalOutcome.INFRA_FAIL,
@@ -206,7 +211,8 @@ def run_eval(task_dir: str, config: TaskConfig,
     request = build_eval_request(task_dir, config)
     _log_request("local_eval", request)
 
-    kernel_basename = config.editable_files[0].replace(".py", "")
+    kernel_basename = (config.editable_files[0].replace(".py", "")
+                       if config.editable_files else "kernel")
     ref_basename = config.ref_file.replace(".py", "")
     print(f"[local_eval] device={dev}; eval_kernel.py "
           f"(verify + profile_gen"
