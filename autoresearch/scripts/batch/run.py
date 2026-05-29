@@ -7,7 +7,7 @@ batch.log, updates batch_progress.json after every op.
 
 Usage:
     python scripts/batch/run.py <batch_dir> --devices N \\
-        [--max-rounds 30] [--eval-timeout 600] [--timeout-min 180] \\
+        [--max-rounds N] [--eval-timeout S] [--timeout-min 180] \\
         [--only op1,op2] [--limit N] [--retry-errored] [--cooldown-sec 5]
 """
 from __future__ import annotations

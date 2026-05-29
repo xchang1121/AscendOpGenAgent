@@ -169,11 +169,13 @@ def scaffold_task_dir(
     if discovered_data_files:
         task_yaml["data_files"] = discovered_data_files
 
-    # Only emit the code_checker block when disabled — default-true tasks
-    # stay clean. quick_check.py and phase_machine.validate_kernel honor
-    # this field.
-    if not code_checker_enabled:
-        task_yaml["code_checker"] = {"enabled": False}
+    # Always pin the task-level value (code_checker_enabled is already
+    # resolved to a concrete bool above). loader falls back to the live
+    # global config when this field is absent, so an unpinned task would
+    # silently flip behaviour if the global default is retuned — same
+    # pinning rationale as eval.timeout / metric.improvement_threshold.
+    # quick_check.py and phase_machine.validate_kernel honor this field.
+    task_yaml["code_checker"] = {"enabled": bool(code_checker_enabled)}
 
     yaml_content = yaml.dump(task_yaml, default_flow_style=False, allow_unicode=True)
     _write(task_dir, "task.yaml", yaml_content)
