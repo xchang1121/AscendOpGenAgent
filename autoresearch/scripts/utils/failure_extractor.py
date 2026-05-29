@@ -216,9 +216,13 @@ PATTERNS: list[tuple[str, re.Pattern, Callable[[re.Match], dict], str]] = [
     ),
 ]
 
-# Grab the last Python traceback line (the actual exception), not the full stack.
+# Grab the last Python traceback line (the actual exception), not the full
+# stack. Accepts both bare class names (`ValueError: ...`) and qualified ones
+# (`triton.compiler.errors.CompilationError: ...`); without the dotted prefix
+# Triton's wrapped errors fell through and r4-style FAILs surfaced no
+# python_error at all.
 _PYTHON_EXCEPTION_RE = re.compile(
-    r"^(?:[A-Z]\w+(?:Error|Exception|Warning)):\s+.+$",
+    r"^(?:\w+\.)*[A-Z]\w*(?:Error|Exception|Warning):\s+.+$",
     re.MULTILINE,
 )
 

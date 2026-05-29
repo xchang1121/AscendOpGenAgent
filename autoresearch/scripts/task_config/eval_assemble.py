@@ -229,7 +229,34 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
         error = (f"reference.py failed: "
                  f"{verify_json.get('error') or '(no detail)'}")
     elif not verify_ok:
-        error = "kernel output != reference"
+        # eval_kernel's verify loop tags each failed case as
+        # "kernel-side: <Exception>: ..." (forward / instantiation crash)
+        # or "compare: ..." (compare phase crash) or the literal
+        # "kernel output != reference" (clean allclose miss). Looking at
+        # per_case lets us tell a compile/runtime crash from a real
+        # correctness mismatch -- previously every FAIL surfaced as
+        # "kernel output != reference" even for MLIR ub_overflow crashes,
+        # which misled both the dashboard and downstream guidance.
+        crash_err = None
+        clean_miss = False
+        for entry in (verify_json.get("per_case") or []):
+            if not isinstance(entry, dict):
+                continue
+            e = entry.get("error") or ""
+            if e.startswith(("kernel-side:", "compare:")) and crash_err is None:
+                crash_err = e
+            elif e == "kernel output != reference":
+                clean_miss = True
+        if crash_err:
+            error = f"kernel crashed during verify: {crash_err[:200]}"
+        elif clean_miss:
+            error = "kernel output != reference"
+        else:
+            # verify subprocess died before populating per_case (import
+            # error, top-level MLIR blowup, etc.). failure_extractor on
+            # raw_output_tail will surface the cause.
+            error = ("kernel verify failed before per-case loop "
+                     "(see failure_signals / raw_output_tail)")
     else:
         error = (f"kernel crashed during profile on {len(crashed_shapes)} "
                  f"of {len(per_gen)} shapes")
