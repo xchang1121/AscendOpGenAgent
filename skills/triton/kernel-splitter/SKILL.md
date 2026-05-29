@@ -35,7 +35,7 @@ argument-hint: >
 ```
 输入：base_kernel.py + task_desc.py + baseline_perf.json
     ↓
-[1. Case 特征分析] → 按 shape/dtype/计算模式分组
+[1. Case 特征分析] → 按经验以及特征计算模式分组
     ↓
 [2. 专用 Kernel 生成] → 为每组生成特化实现
     ↓
@@ -72,12 +72,12 @@ argument-hint: >
 **Reduce 类命中条件**：
 - 任务包含归约操作，且存在多个 Case
 - 按 `inner_size`（reduce 轴位置）分组：`==1` → reduce-last，`>1` → reduce-non-last
-- 若命中，直接使用文档中的分组建议和 BLOCK 配置
+- 若命中，必须使用文档中的分组建议和 BLOCK 配置
 
 **广播逐元素命中条件**：
 - 任务为逐元素操作，且 Case 间存在 shape 不等（需要广播）
 - 按 `(out_ndim, broadcast_dims)` 分组：无广播 / 2D dim0/dim1 / 3D/4D
-- 若命中，直接使用文档中的分组建议和 BLOCK 配置
+- 若命中，必须使用文档中的分组建议和 BLOCK 配置
 
 ### 1.3 未命中时的性能瓶颈分析与分组
 
