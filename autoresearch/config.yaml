@@ -50,6 +50,10 @@ remote_worker:
 # hard error. Retune by editing the values here.
 # ---------------------------------------------------------------------------
 
+# Task defaults applied when a task.yaml (or scaffold CLI) omits the field.
+defaults:
+  max_rounds: 30    # optimization-round budget for a new/under-specified task
+
 # Eval timing measurement. Read where the timing runs: on remote eval the
 # WORKER's config.yaml applies.
 eval:

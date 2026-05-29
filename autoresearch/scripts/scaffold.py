@@ -43,6 +43,7 @@ import yaml
 # `scaffold.validate_ref` working.
 # ---------------------------------------------------------------------------
 from utils.ref_ast import validate_ref  # noqa: E402, F401  (re-export)
+from utils.settings import default_max_rounds  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +58,7 @@ def scaffold_task_dir(
     desc: str = "",
     arch: str = "",
     devices: list | None = None,
-    max_rounds: int = 20,
+    max_rounds: int | None = None,
     eval_timeout: int = 600,
     output_dir: str | None = None,
     editable_filename: str = "kernel.py",
@@ -66,6 +67,8 @@ def scaffold_task_dir(
     worker_url: str = "",
 ) -> str:
     """Create task directory with all files. Returns absolute path."""
+    if max_rounds is None:
+        max_rounds = default_max_rounds()
     # Determine base directory
     if output_dir:
         base_dir = output_dir
@@ -237,7 +240,7 @@ def _make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--devices", default=None,
                         help="Comma-separated device IDs for local eval "
                              "(e.g. '5' or '0,1,2,3'). Required.")
-    parser.add_argument("--max-rounds", type=int, default=20)
+    parser.add_argument("--max-rounds", type=int, default=default_max_rounds())
     parser.add_argument("--eval-timeout", type=int, default=600)
     parser.add_argument("--output-dir", default=None,
                         help="Parent directory for the task (default: ./ar_tasks/)")

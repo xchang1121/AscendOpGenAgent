@@ -47,6 +47,14 @@ def hallucinated_scripts() -> Dict[str, str]:
     return dict(_raw().get("hallucinated_scripts", {}))
 
 
+# --- task defaults -----------------------------------------------------
+def default_max_rounds() -> int:
+    """Default optimization-round budget when a task doesn't specify one.
+    Single source for scaffold (new task.yaml) and loader (TaskConfig
+    fallback) so the two cannot drift."""
+    return _get("defaults", "max_rounds")
+
+
 # --- eval timing measurement (read where the timing runs: on remote eval
 #     that is the WORKER's config.yaml) ----------------------------------
 def eval_warmup() -> int:

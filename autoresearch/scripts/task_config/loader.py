@@ -102,6 +102,9 @@ class TaskConfig:
 
 def load_task_config(task_dir: str) -> Optional[TaskConfig]:
     """Load TaskConfig from task_dir/task.yaml. Returns None if not found."""
+    # Lazy import: callers reach loader via `from task_config import ...`,
+    # which guarantees scripts/ is on sys.path by the time this runs.
+    from utils.settings import default_max_rounds
     yaml_path = os.path.join(task_dir, "task.yaml")
     if not os.path.exists(yaml_path):
         return None
@@ -176,7 +179,7 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
         smoke_test_script=smoke_block.get("script"),
         smoke_test_timeout=smoke_block.get("timeout", 10),
         code_checker_enabled=bool(code_checker_block.get("enabled", True)),
-        max_rounds=agent_block.get("max_rounds", 30),
+        max_rounds=agent_block.get("max_rounds", default_max_rounds()),
         devices=devices,
         worker_urls=worker_urls,
     )
