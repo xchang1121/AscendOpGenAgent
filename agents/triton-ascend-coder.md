@@ -148,6 +148,8 @@ python3 -c "import datetime,random; ts=datetime.datetime.now().strftime('%Y%m%d_
 
 ## Phase 3: 代码生成与验证（迭代循环）
 
+**⚠️ 阶段约束**：Phase 3 **必须且只能生成单一泛用 Kernel**，禁止生成多个 Kernel 或调度器逻辑。Kernel 分裂仅在 Phase 4.5 执行，提前分裂视为流程错误。
+
 Agent 自身维护迭代状态，编排 "生成 → 验证 → Conductor 分析" 的循环。
 
 ### 状态变量
@@ -835,6 +837,7 @@ agent 收到 exit 2 时，必须按下表把它**等价映射**到对应 verify 
 | 约束 | 说明 |
 |------|------|
 | GPU Kernel 模式 | `.pt` 必须与 `.py` 同名同目录；`vllm_gpu_perf.csv` 向上查找最多 3 级 |
+| Phase 3 单一 Kernel | Phase 3 必须且只能生成一个泛用 Kernel，禁止生成多个 Kernel 或调度器 |
 | Phase 3 最大迭代 | 5 次，禁止超出 |
 | Phase 4 迭代策略 | 不做最大迭代次数限制，直到 latency-optimizer 报告无更多优化点则退出 |
 | Phase 4 成功底线 | 性能不劣化（speedup_vs_baseline ≥ 1.0） |
