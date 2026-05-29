@@ -178,6 +178,9 @@ class ModelNew(nn.Module):
             self.VEC_CORE_NUM = 40
 
     def forward(self, x: torch.Tensor, dim=None, keepdim: bool = False) -> torch.Tensor:
+        return self._route(x, dim, keepdim)
+
+    def _route(self, x: torch.Tensor, dim=None, keepdim: bool = False) -> torch.Tensor:
         original_dim = dim
         if dim is None:
             x = x.reshape(1, -1)

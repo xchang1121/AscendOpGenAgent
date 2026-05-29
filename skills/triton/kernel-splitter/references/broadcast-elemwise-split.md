@@ -221,6 +221,9 @@ class ModelNew(nn.Module):
         # ... 同上 ...
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+        return self._route(x, y, alpha)
+
+    def _route(self, x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
         out_ndim, broadcast_dims, is_broadcast = self._get_broadcast_info(x.shape, y.shape)
 
         if not is_broadcast:

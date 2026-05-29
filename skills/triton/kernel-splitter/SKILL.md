@@ -213,7 +213,7 @@ python3 <kernel-verifier-path>/scripts/benchmark.py \
 
 ## Step 5: 调度器构建
 
-构建统一的 `ModelNew` 类，内部实现路由逻辑：
+构建统一的 `ModelNew` 类，**必须**将路由逻辑封装在独立的 `_route` 方法中，`forward()` 仅负责调用该方法：
 
 ```python
 class ModelNew(nn.Module):
@@ -225,23 +225,28 @@ class ModelNew(nn.Module):
             group_id: SpecializedKernel(group_id, ...)
             for group_id, adopted in adopted_groups.items()
         }
-        self.group_mapping = self._build_group_mapping()
-
-    def _route(self, *args):
-        """根据输入特征路由到最优 Kernel"""
-        # 1. 提取输入 shape/dtype 特征
-        # 2. 匹配分组规则
-        # 3. 返回对应 kernel 函数，若无匹配则返回 base_kernel
 
     def forward(self, *args):
-        kernel_fn = self._route(*args)
-        return kernel_fn(*args)
+        # forward 保持极简，仅调用一次路由函数
+        return self._route(*args)
+
+    def _route(self, *args):
+        # 路由逻辑全部在此
+        # 1. 提取输入 shape/dtype 特征
+        # 2. 匹配分组规则
+        # 3. 返回对应 kernel 启动结果，若无匹配则返回 base_kernel 结果
+        if condition_1:
+            return kernel_1[grid](...)
+        elif condition_2:
+            return kernel_2[grid](...)
+        else:
+            return self.base_kernel[grid](...)
 ```
 
-**路由策略**：
-- 优先匹配专用 Kernel 分组
-- 无匹配时自动回退到泛用 Kernel
-- 路由开销必须 < 0.1ms（使用简单的 shape 比较，禁止复杂计算）
+**关键约束**：
+- **禁止**在 `forward()` 中直接编写 `if-elif-else` 路由分支。
+- **必须**使用 `_route` 方法封装路由逻辑。
+- 路由开销必须 < 0.1ms（使用简单的 shape 比较，禁止复杂计算）。
 
 ## Step 6: 集成验证
 
@@ -259,9 +264,9 @@ class ModelNew(nn.Module):
 | 约束 | 说明 |
 |------|------|
 | **触发条件** | 仅 `total_cases > 1` 且 `speedup_vs_torch < 0.8` 时执行，否则跳过 |
-| **精度回退** | 任何专用 Kernel 精度不通过，立即回退到泛用 Kernel |
-| **性能回退** | 专用 Kernel 必须 ≥ 泛用 Kernel 性能，否则不采用 |
-| **路由透明** | 对外接口、输入输出格式完全不变 |
+| **精度零妥协** | 任何专用 Kernel 精度不通过，立即回退到泛用 Kernel |
+| **性能底线** | 专用 Kernel 必须 ≥ 泛用 Kernel 性能，否则不采用 |
+| **路由封装** | 路由逻辑必须封装在 `_route` 方法中，`forward` 仅调用该方法 |
 | **代码自包含** | 所有 Kernel 和调度逻辑必须在同一文件内 |
 | **禁止过度分裂** | 相似 Case 必须合并分组，禁止 1-to-1 无意义分裂 |
 | **回退安全** | 路由逻辑必须包含兜底机制，确保 100% 覆盖所有 Case |
