@@ -36,13 +36,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils.correctness import compare_outputs_per_case  # noqa: E402
 from utils.input_groups import resolve as _resolve_groups  # noqa: E402
 from utils.validate_triton_impl import validate as _validate_kernel_code  # noqa: E402
+from utils.settings import batch_tier1_timeout, batch_tier2_timeout  # noqa: E402
 
 VERIFY_RESULTS = "verify_results.json"
-TIER1_TIMEOUT = 30
-# Cold JIT compile across ~50 cases on triton-ascend can take several
-# minutes for kernels with many constexpr-driven specializations
-# (maxpool3d, avgpool3d, ...). Warm runs land in tens of seconds.
-TIER2_TIMEOUT = 600
+# Timeouts (seconds) from config.yaml `batch:`. tier2 cold JIT across ~50
+# cases on triton-ascend can take minutes for kernels with many constexpr
+# specializations (maxpool3d, ...); warm runs land in tens of seconds.
+TIER1_TIMEOUT = batch_tier1_timeout()
+TIER2_TIMEOUT = batch_tier2_timeout()
 
 # Reference must export Model + get_init_inputs + one of (get_inputs,
 # get_input_groups). The "input provider" is checked separately (per

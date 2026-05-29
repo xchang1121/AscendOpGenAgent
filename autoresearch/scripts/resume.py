@@ -17,6 +17,8 @@ from phase_machine import (
     plan_path, state_path, edit_marker_path,
     has_pending_items, find_active_task_dir,
 )
+from utils.settings import heartbeat_fresh_seconds  # noqa: E402
+from utils.settings import heartbeat_fresh_seconds
 
 
 def _validate(task_dir: str) -> tuple[bool, str]:
@@ -69,7 +71,7 @@ def _check_active_lock(task_dir: str, force: bool) -> None:
 
     import time
     age = time.time() - os.path.getmtime(heartbeat)
-    if age < 180:  # 3 minutes
+    if age < heartbeat_fresh_seconds():  # config.yaml resume.heartbeat_fresh_seconds
         if force:
             print(f"[resume] WARNING: Task was active {age:.0f}s ago. Forcing takeover (--force).",
                   file=sys.stderr)

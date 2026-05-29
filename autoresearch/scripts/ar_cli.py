@@ -40,6 +40,8 @@ from typing import Optional
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+# Run as `python scripts/ar_cli.py`, so scripts/ is on sys.path[0].
+from utils.settings import worker_port  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 # Autoresearch project root: scripts/ → autoresearch/
@@ -286,8 +288,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Bind / probe address. Default 127.0.0.1 (SSH-only; "
                         "the worker is reached via an ssh -L tunnel, never "
                         "bound to a public interface).")
-    w.add_argument("--port", type=int, default=9111,
-                   help="TCP port (default: 9111).")
+    w.add_argument("--port", type=int, default=worker_port(),
+                   help=f"TCP port (default: {worker_port()}, "
+                        f"from config.yaml worker.port).")
     w.add_argument("--bg", action="store_true",
                    help="Daemon mode for --start (detach, log to "
                         "/tmp/ar_worker_<port>.log). POSIX-only.")

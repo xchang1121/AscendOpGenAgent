@@ -44,6 +44,7 @@ if _SCRIPTS_DIR not in sys.path:
 from task_config import load_task_config  # noqa: E402
 from utils.eval_runner import local_eval_async  # noqa: E402
 from utils.json_io import sanitize_floats as _sanitize_floats  # noqa: E402
+from utils.settings import worker_port as _worker_port  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +291,7 @@ def start_server(host: Optional[str] = None, port: Optional[int] = None):
     # bind a public interface — that would expose the eval endpoint on
     # every network.
     host = host or os.environ.get("WORKER_HOST", "127.0.0.1")
-    port = int(port or os.environ.get("WORKER_PORT", "9001"))
+    port = int(port or os.environ.get("WORKER_PORT", str(_worker_port())))
     logger.info("starting worker on %s:%d", host, port)
     uvicorn.run(app, host=host, port=port)
 

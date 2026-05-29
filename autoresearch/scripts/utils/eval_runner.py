@@ -186,7 +186,7 @@ def _read_sidecar(path: str) -> dict:
 def local_eval(task_dir: str, op_name: str,
                kernel_file: str, ref_file: str,
                timeout: int, device_id: int = 0,
-               warmup: int = 10, repeats: int = 100,
+               warmup: Optional[int] = None, repeats: Optional[int] = None,
                override_base_time_us: Optional[float] = None,
                override_base_per_shape_us: Optional[list] = None,
                ) -> tuple[dict, dict]:
@@ -205,6 +205,14 @@ def local_eval(task_dir: str, op_name: str,
     per-shape ratios) consistent across sticky-baseline rounds and the
     initial round that actually measured ref.
     """
+    # config.yaml is the single source for measurement counts; settings.py
+    # is a sibling under utils/. None means "use config".
+    from .settings import eval_warmup, eval_repeats
+    if warmup is None:
+        warmup = eval_warmup()
+    if repeats is None:
+        repeats = eval_repeats()
+
     skip_base = (override_base_time_us is not None
                  and override_base_time_us > 0
                  and override_base_time_us < float("inf"))
@@ -425,7 +433,7 @@ async def _run_subprocess_async(cmd: list[str], cwd: str, env: dict,
 async def local_eval_async(task_dir: str, op_name: str,
                            kernel_file: str, ref_file: str,
                            timeout: int, device_id: int = 0,
-                           warmup: int = 10, repeats: int = 100,
+                           warmup: Optional[int] = None, repeats: Optional[int] = None,
                            override_base_time_us: Optional[float] = None,
                            override_base_per_shape_us: Optional[list] = None,
                            ) -> tuple[dict, dict]:
@@ -436,6 +444,12 @@ async def local_eval_async(task_dir: str, op_name: str,
     the eval down promptly rather than leaving a zombie that holds the
     device until the eval finishes.
     """
+    from settings import eval_warmup, eval_repeats
+    if warmup is None:
+        warmup = eval_warmup()
+    if repeats is None:
+        repeats = eval_repeats()
+
     skip_base = (override_base_time_us is not None
                  and override_base_time_us > 0
                  and override_base_time_us < float("inf"))

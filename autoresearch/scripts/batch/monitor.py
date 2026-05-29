@@ -28,6 +28,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import manifest as mf
+# Reach up one level (scripts/) for the shared settings accessors.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.settings import classify_speedup, speedup_improved_above, speedup_regress_below  # noqa: E402
+# Reach up one level for utils.settings (single source for speedup thresholds).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.settings import classify_speedup  # noqa: E402
 
 DASHBOARD_PY = mf.repo_root() / "scripts" / "dashboard.py"
 
@@ -208,9 +214,10 @@ def render(batch_dir: Path, progress: dict, active: dict | None,
             speedups.append((k, bm / best))
     if speedups:
         vals = [s for _, s in speedups]
-        improved = sum(1 for v in vals if v > 1.05)
-        onpar = sum(1 for v in vals if 0.95 <= v <= 1.05)
-        regr = sum(1 for v in vals if v < 0.95)
+        labels = [classify_speedup(v) for v in vals]
+        improved = labels.count("improved")
+        onpar = labels.count("on-par")
+        regr = labels.count("regress")
         out.append(f"done speedup  median={statistics.median(vals):.2f}x  "
                    f"best={max(vals):.2f}x  worst={min(vals):.2f}x  "
                    f"(n={len(vals)})")

@@ -42,3 +42,38 @@ hallucinated_scripts:
 #       ssh_alias: my-npu              # optional; defaults to the key
 remote_worker:
   hosts: {}
+
+
+# ---------------------------------------------------------------------------
+# Tunable knobs. config.yaml is the SINGLE SOURCE OF TRUTH — settings.py has
+# NO in-code defaults, so every key below is REQUIRED and a missing key is a
+# hard error. Retune by editing the values here.
+# ---------------------------------------------------------------------------
+
+# Eval timing measurement. Read where the timing runs: on remote eval the
+# WORKER's config.yaml applies.
+eval:
+  warmup: 10        # untimed warmup iterations before measurement
+  repeats: 100      # measured iterations averaged per shape
+
+# Remote worker daemon. Single source for both the ar_cli tunnel/status
+# side and the worker bind side — the two must agree.
+worker:
+  port: 9111
+
+# Batch pre-flight verification (scripts/batch/verify.py), in seconds.
+# tier2 cold JIT across ~50 cases on triton-ascend can take minutes for
+# kernels with many constexpr specializations (maxpool3d, ...).
+batch:
+  tier1_timeout: 30    # smoke: import + tiny shape
+  tier2_timeout: 600   # full correctness
+
+# Speedup classification for batch reports (x relative to the ref).
+metrics:
+  speedup_improved_above: 1.05   # v > this → "improved"
+  speedup_regress_below: 0.95    # v < this → "regress"; between → "on-par"
+
+# Resume heartbeat: a task whose .heartbeat mtime is fresher than this
+# (seconds) is assumed still driven by another session (scripts/resume.py).
+resume:
+  heartbeat_fresh_seconds: 180

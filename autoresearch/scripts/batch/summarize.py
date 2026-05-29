@@ -16,6 +16,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import manifest as mf
+# Reach up one level (scripts/) for the shared settings accessors.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.settings import classify_speedup, speedup_improved_above, speedup_regress_below  # noqa: E402
+# Reach up one level for utils.settings (single source for speedup thresholds).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.settings import (  # noqa: E402
+    classify_speedup, speedup_improved_above, speedup_regress_below,
+)
 
 
 def main() -> int:
@@ -65,17 +73,19 @@ def main() -> int:
 
     if speedups:
         vals = [s for _, s, _, _ in speedups]
-        improved = sum(1 for v in vals if v > 1.05)
-        onpar = sum(1 for v in vals if 0.95 <= v <= 1.05)
-        regr = sum(1 for v in vals if v < 0.95)
+        hi, lo = speedup_improved_above(), speedup_regress_below()
+        labels = [classify_speedup(v) for v in vals]
+        improved = labels.count("improved")
+        onpar = labels.count("on-par")
+        regr = labels.count("regress")
         print("speedup (baseline / best, higher better):")
         print(f"  ops with metric: {len(speedups)}")
         print(f"  median:          {statistics.median(vals):.2f}x")
         print(f"  best:            {max(vals):.2f}x")
         print(f"  worst:           {min(vals):.2f}x")
-        print(f"  improved:        {improved}  (>1.05x)")
-        print(f"  on-par:          {onpar}    (0.95-1.05x)")
-        print(f"  regress:         {regr}     (<0.95x)")
+        print(f"  improved:        {improved}  (>{hi}x)")
+        print(f"  on-par:          {onpar}    ({lo}-{hi}x)")
+        print(f"  regress:         {regr}     (<{lo}x)")
         print()
 
     regressions = [(k, sp, base, bm) for k, sp, base, bm in speedups if sp < 0.95]
