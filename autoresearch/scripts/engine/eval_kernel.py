@@ -81,12 +81,8 @@ def _load_skill_modules() -> tuple:
     generic basenames `verify` / `benchmark` can't shadow (or be shadowed
     by) other modules with the same names elsewhere on sys.path
     (e.g. autoresearch/scripts/batch/verify.py)."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    # engine/ -> scripts/ -> autoresearch/ -> repo root
-    repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
-    skill_scripts = os.path.join(
-        repo_root, "skills", "triton", "kernel-verifier", "scripts",
-    )
+    from utils.external_paths import kernel_verifier_dir
+    skill_scripts = kernel_verifier_dir()
     if not os.path.isdir(skill_scripts):
         raise RuntimeError(
             f"kernel-verifier skill not found at {skill_scripts!r} — "

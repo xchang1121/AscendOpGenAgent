@@ -19,12 +19,13 @@ from .state_store import (
     PLAN_ITEMS_FILE, DIAGNOSE_ATTEMPTS_CAP,
     diagnose_artifact_path, diagnose_marker,
     history_path, load_progress, read_phase, state_path,
-    _PROJECT_ROOT,
 )
 from .validators import (
     get_active_item, diagnose_state,
     DIAGNOSE_READY, DIAGNOSE_MANUAL_FALLBACK,
 )
+# state_store (imported above) puts scripts/ on sys.path, so utils resolves.
+from utils.external_paths import latency_refs_dir  # noqa: E402
 
 
 def _format_fail_record(rec: dict,
@@ -244,7 +245,7 @@ def _skills_hint() -> str:
     diagnosing failures, not opening a plan, and the prompt wording
     reflects that.
     """
-    if not os.path.isdir(os.path.join(os.path.dirname(_PROJECT_ROOT), "skills", _LATENCY_REFS_DIR)):
+    if not os.path.isdir(latency_refs_dir()):
         return ""
     return (
         f"\nSkills: Glob ../skills/{_LATENCY_REFS_DIR}/*.md (flat perf-tuning "
@@ -599,8 +600,7 @@ def get_guidance(task_dir: str) -> str:
         # Without the dir-existence check we'd hand the agent a Glob
         # pattern that returns zero matches, and they'd silently skip
         # the skill-reading step.
-        skills_present = os.path.isdir(
-            os.path.join(os.path.dirname(_PROJECT_ROOT), "skills", _LATENCY_REFS_DIR))
+        skills_present = os.path.isdir(latency_refs_dir())
         if skills_present:
             skills_block = (
                 f"Read curated perf-tuning references (use them to ground "

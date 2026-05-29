@@ -40,12 +40,8 @@ import sys
 # `autoresearch/scripts/batch/verify.py` if both end up on sys.path.
 # ---------------------------------------------------------------------------
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-# .../utils -> .../scripts -> .../autoresearch -> repo root
-_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
-_SKILL_VERIFY_PATH = os.path.join(
-    _REPO_ROOT, "skills", "triton", "kernel-verifier", "scripts", "verify.py",
-)
+from utils.external_paths import kernel_verifier_dir
+_SKILL_VERIFY_PATH = os.path.join(kernel_verifier_dir(), "verify.py")
 
 
 def _load_skill_verify():

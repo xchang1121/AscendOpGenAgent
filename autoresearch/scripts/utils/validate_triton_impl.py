@@ -19,12 +19,8 @@ moves, fix `_SKILL_SCRIPTS` below.
 import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-# .../utils -> .../scripts -> .../autoresearch -> repo root
-_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
-_SKILL_SCRIPTS = os.path.join(
-    _REPO_ROOT, "skills", "triton", "kernel-verifier", "scripts"
-)
+from utils.external_paths import kernel_verifier_dir
+_SKILL_SCRIPTS = kernel_verifier_dir()
 if _SKILL_SCRIPTS not in sys.path:
     sys.path.insert(0, _SKILL_SCRIPTS)
 
