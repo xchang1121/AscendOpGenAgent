@@ -25,6 +25,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import manifest as mf
+# Reach up one level (scripts/) for the shared config accessors so batch
+# defaults match single-task /autoresearch instead of drifting.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.settings import default_max_rounds, default_eval_timeout  # noqa: E402
 
 # Force line-buffered stdout so logs flush in real time when run via nohup.
 try:
@@ -453,8 +457,8 @@ def main() -> int:
                          "machine can be GPU/NPU-free).")
     ap.add_argument("--devices", default="",
                     help="NPU device ids, e.g. 0 or 0,1 (required)")
-    ap.add_argument("--max-rounds", type=int, default=30)
-    ap.add_argument("--eval-timeout", type=int, default=600,
+    ap.add_argument("--max-rounds", type=int, default=default_max_rounds())
+    ap.add_argument("--eval-timeout", type=int, default=default_eval_timeout(),
                     help="per-shape verify/profile budget in seconds. The "
                          "eval call is capped at eval_timeout * num_cases "
                          "(num_cases comes from get_input_groups() / get_inputs()). "

@@ -45,6 +45,7 @@ import yaml
 from utils.ref_ast import validate_ref  # noqa: E402, F401  (re-export)
 from utils.settings import (  # noqa: E402
     default_max_rounds, default_eval_timeout, default_metric,
+    default_code_checker_enabled,
 )
 
 
@@ -64,7 +65,7 @@ def scaffold_task_dir(
     eval_timeout: int | None = None,
     output_dir: str | None = None,
     editable_filename: str = "kernel.py",
-    code_checker_enabled: bool = True,
+    code_checker_enabled: bool | None = None,
     ref_source_path: str | None = None,
     worker_url: str = "",
 ) -> str:
@@ -73,6 +74,8 @@ def scaffold_task_dir(
         max_rounds = default_max_rounds()
     if eval_timeout is None:
         eval_timeout = default_eval_timeout()
+    if code_checker_enabled is None:
+        code_checker_enabled = default_code_checker_enabled()
     # Determine base directory
     if output_dir:
         base_dir = output_dir
@@ -148,6 +151,10 @@ def scaffold_task_dir(
         "metric": {
             "primary": default_metric()["primary"],
             "lower_is_better": default_metric()["lower_is_better"],
+            # Pin the threshold too: loader falls back to the live global
+            # config when it's absent, so an unpinned task would silently
+            # change KEEP/DISCARD behaviour if the global default is retuned.
+            "improvement_threshold": default_metric()["improvement_threshold"],
         },
         "agent": {
             "ref_file": "reference.py",
