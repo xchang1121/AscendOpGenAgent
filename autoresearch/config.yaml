@@ -85,6 +85,9 @@ worker:
 batch:
   tier1_timeout: 30    # smoke: import + tiny shape
   tier2_timeout: 600   # full correctness
+  # batch/run.py per-op driver knobs (overridable via --timeout-min / --cooldown-sec).
+  run_timeout_min: 180 # hard wall-clock cap per op in minutes
+  cooldown_sec: 5      # seconds to sleep between ops
 
 # Speedup classification for batch reports (x relative to the ref).
 metrics:

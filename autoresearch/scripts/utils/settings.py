@@ -126,6 +126,17 @@ def batch_tier2_timeout() -> int:
     return _get("batch", "tier2_timeout")
 
 
+# --- batch driver knobs (overridable via run.py CLI flags) -------------
+def batch_run_timeout_min() -> int:
+    """Hard wall-clock cap per op in minutes (batch/run.py --timeout-min)."""
+    return _get("batch", "run_timeout_min")
+
+
+def batch_cooldown_sec() -> int:
+    """Seconds to sleep between ops (batch/run.py --cooldown-sec)."""
+    return _get("batch", "cooldown_sec")
+
+
 # --- resume heartbeat freshness window (seconds) ----------------------
 def heartbeat_fresh_seconds() -> int:
     return _get("resume", "heartbeat_fresh_seconds")

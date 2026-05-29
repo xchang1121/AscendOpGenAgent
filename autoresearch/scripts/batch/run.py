@@ -7,8 +7,8 @@ batch.log, updates batch_progress.json after every op.
 
 Usage:
     python scripts/batch/run.py <batch_dir> --devices N \\
-        [--max-rounds N] [--eval-timeout S] [--timeout-min 180] \\
-        [--only op1,op2] [--limit N] [--retry-errored] [--cooldown-sec 5]
+        [--max-rounds N] [--eval-timeout S] [--timeout-min M] \\
+        [--only op1,op2] [--limit N] [--retry-errored] [--cooldown-sec S]
 """
 from __future__ import annotations
 
@@ -28,7 +28,10 @@ import manifest as mf
 # Reach up one level (scripts/) for the shared config accessors so batch
 # defaults match single-task /autoresearch instead of drifting.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from utils.settings import default_max_rounds, default_eval_timeout  # noqa: E402
+from utils.settings import (  # noqa: E402
+    default_max_rounds, default_eval_timeout,
+    batch_run_timeout_min, batch_cooldown_sec,
+)
 
 # Force line-buffered stdout so logs flush in real time when run via nohup.
 try:
@@ -463,14 +466,14 @@ def main() -> int:
                          "eval call is capped at eval_timeout * num_cases "
                          "(num_cases comes from get_input_groups() / get_inputs()). "
                          "Single-shape ops keep the original semantics.")
-    ap.add_argument("--timeout-min", type=int, default=180,
+    ap.add_argument("--timeout-min", type=int, default=batch_run_timeout_min(),
                     help="hard wall-clock cap per op in minutes")
     ap.add_argument("--only", default="", help="comma-separated op names")
     ap.add_argument("--limit", type=int, default=0,
                     help="stop after N ops (0 = no limit)")
     ap.add_argument("--retry-errored", action="store_true",
                     help="also queue ops with status=error")
-    ap.add_argument("--cooldown-sec", type=int, default=5,
+    ap.add_argument("--cooldown-sec", type=int, default=batch_cooldown_sec(),
                     help="seconds to sleep between ops")
     ap.add_argument("--claude-bin", default="claude")
     ap.add_argument("--model", default="")
