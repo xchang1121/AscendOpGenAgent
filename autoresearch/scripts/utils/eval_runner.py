@@ -261,6 +261,27 @@ def local_eval(task_dir: str, op_name: str,
     rc, kernel_log = _run_phases(["verify", "profile_gen"], kernel_path)
     kernel_payload = _read_sidecar(kernel_path)
 
+    return _assemble_response(
+        ref_payload, kernel_payload, rc, ref_log, kernel_log,
+        skip_base, override_base_time_us, override_base_per_shape_us,
+    )
+
+
+def _assemble_response(ref_payload: dict, kernel_payload: dict, rc: int,
+                       ref_log: str, kernel_log: str, skip_base: bool,
+                       override_base_time_us: Optional[float],
+                       override_base_per_shape_us: Optional[list]
+                       ) -> tuple[dict, dict]:
+    """Shared response builder for both `local_eval` (sync) and
+    `local_eval_async`. Pulled out so the two drivers only differ in the
+    subprocess spawn loop; everything downstream of the sidecar reads
+    is identical.
+
+    Returns (verify_resp, profile_resp) in the shape
+    `task_config.eval_assemble.assemble_eval_result` consumes.
+    """
+    from .json_io import sanitize_floats
+
     log_combined = "\n".join(s for s in (ref_log, kernel_log) if s).strip()
     verify_block = kernel_payload.get("verify")
     gen_block = kernel_payload.get("profile_gen")
@@ -285,8 +306,6 @@ def local_eval(task_dir: str, op_name: str,
         # structured result to .eval_result.json, not to stderr).
         "verify_block": verify_block if isinstance(verify_block, dict) else {},
     }
-
-    from .json_io import sanitize_floats
 
     artifacts: dict[str, str] = {}
     if skip_base and isinstance(override_base_per_shape_us, list) and override_base_per_shape_us:
@@ -330,3 +349,140 @@ def local_eval(task_dir: str, op_name: str,
         )
 
     return verify_resp, profile_resp
+
+
+# ---------------------------------------------------------------------------
+# Async sibling — cancellable subprocess spawn for the worker daemon
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+import signal  # noqa: E402
+
+
+def _killpg_quiet(proc) -> None:
+    """SIGTERM the subprocess group; swallow ProcessLookupError etc. POSIX
+    only — on Windows asyncio subprocess doesn't get a process group and
+    proc.terminate() suffices."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+
+
+async def _run_subprocess_async(cmd: list[str], cwd: str, env: dict,
+                                timeout: int) -> tuple[int, str, str]:
+    """Async sibling of `_run_subprocess`. Same contract — returns
+    `(rc, stdout, stderr)`, rc=124 on timeout — but the subprocess is
+    spawned via `asyncio.create_subprocess_exec` so the caller can
+    `task.cancel()` and have us SIGTERM the whole process tree (eval
+    has its own process group via `os.setsid`).
+    """
+    preexec = os.setsid if hasattr(os, "setsid") else None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd, env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            preexec_fn=preexec,
+        )
+    except Exception as e:
+        return 1, "", f"failed to launch eval: {e}"
+
+    try:
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout)
+            rc = proc.returncode or 0
+            return (rc,
+                    stdout_b.decode(errors="replace"),
+                    stderr_b.decode(errors="replace"))
+        except asyncio.TimeoutError:
+            _killpg_quiet(proc)
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=5)
+            except Exception:
+                stdout_b, stderr_b = b"", b""
+            return (124,
+                    stdout_b.decode(errors="replace"),
+                    stderr_b.decode(errors="replace")
+                    + f"\n[eval_runner] eval timed out after {timeout}s")
+    except asyncio.CancelledError:
+        # Outer task was cancelled (e.g. worker handler saw client
+        # disconnect). Tear the subprocess down and re-raise so the
+        # cancellation propagates up to the device-release `finally`.
+        _killpg_quiet(proc)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+        except Exception:
+            pass
+        raise
+
+
+async def local_eval_async(task_dir: str, op_name: str,
+                           kernel_file: str, ref_file: str,
+                           timeout: int, device_id: int = 0,
+                           warmup: int = 10, repeats: int = 100,
+                           override_base_time_us: Optional[float] = None,
+                           override_base_per_shape_us: Optional[list] = None,
+                           ) -> tuple[dict, dict]:
+    """Async sibling of `local_eval`. Same arguments, same return shape;
+    the only behavioural difference is that the eval subprocesses are
+    spawned via `_run_subprocess_async`, so cancellation of the outer
+    asyncio task (e.g. worker handler on HTTP client disconnect) tears
+    the eval down promptly rather than leaving a zombie that holds the
+    device until the eval finishes.
+    """
+    skip_base = (override_base_time_us is not None
+                 and override_base_time_us > 0
+                 and override_base_time_us < float("inf"))
+
+    scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    eval_script = os.path.join(scripts_dir, "engine", "eval_kernel.py")
+    abs_task = os.path.abspath(task_dir)
+    env = _build_env(device_id)
+
+    ref_path = os.path.join(abs_task, ".eval_result_ref.json")
+    kernel_path = os.path.join(abs_task, ".eval_result_kernel.json")
+    for p in (ref_path, kernel_path):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+    async def _run_phases(phases: list[str], out_path: str) -> tuple[int, str]:
+        cmd = [
+            sys.executable, eval_script,
+            "--task-dir", abs_task,
+            "--op-name", op_name,
+            "--kernel-file", kernel_file,
+            "--ref-file", ref_file,
+            "--device-id", str(device_id),
+            "--warmup", str(warmup),
+            "--repeats", str(repeats),
+            "--phases", ",".join(phases),
+            "--output", out_path,
+        ]
+        rc, stdout, stderr = await _run_subprocess_async(
+            cmd, cwd=task_dir, env=env, timeout=timeout)
+        log = (stdout + ("\n" + stderr if stderr else "")).strip()
+        return rc, log
+
+    if skip_base:
+        ref_log = ""
+        ref_payload: dict = {}
+    else:
+        _, ref_log = await _run_phases(["profile_base"], ref_path)
+        ref_payload = _read_sidecar(ref_path)
+
+    rc, kernel_log = await _run_phases(
+        ["verify", "profile_gen"], kernel_path)
+    kernel_payload = _read_sidecar(kernel_path)
+
+    return _assemble_response(
+        ref_payload, kernel_payload, rc, ref_log, kernel_log,
+        skip_base, override_base_time_us, override_base_per_shape_us,
+    )

@@ -22,6 +22,7 @@ otherwise.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 
 # worker/server.py → autoresearch/scripts/ is one parent up.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent.parent)
@@ -41,7 +42,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from task_config import load_task_config  # noqa: E402
-from utils.eval_runner import local_eval  # noqa: E402
+from utils.eval_runner import local_eval_async  # noqa: E402
 from utils.json_io import sanitize_floats as _sanitize_floats  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,7 @@ async def status():
 
 @app.post("/api/v1/run")
 async def run(
+    request: Request,
     package: UploadFile = File(...),
     task_id: str = Form(...),
     op_name: str = Form(...),
@@ -124,9 +126,23 @@ async def run(
     override_base_us: Optional[float] = Form(None),
     override_base_per_shape_us: Optional[str] = Form(None),
 ):
-    """Verify + profile in one call. Device is picked server-side from
-    the queue, used as the DEVICE_ID for the eval subprocess, and
-    released in the finally block — clients cannot leak a slot.
+    """Verify + profile in one call.
+
+    Device is picked server-side from the queue, used as the DEVICE_ID
+    for the eval subprocess, and released in the finally block — clients
+    cannot leak a slot.
+
+    The eval runs as an asyncio task; concurrently we watch
+    `request.is_disconnected()`. Whichever finishes first wins:
+
+      - eval done   → cancel the watcher, return result
+      - client gone → cancel the eval (cascades into a SIGTERM on the
+                      eval subprocess group via
+                      `utils.eval_runner._run_subprocess_async`), release
+                      the device, and return HTTP 499. This is what
+                      keeps a `claude --print` killed by its wall-clock
+                      cap from leaving an orphan eval pinning the device
+                      until the eval finishes naturally.
     """
     if "queue" not in _state:
         raise HTTPException(status_code=503, detail="worker not initialised")
@@ -147,77 +163,80 @@ async def run(
     device_id = await _state["queue"].get()
     try:
         logger.info("[%s] run %s on device %d", task_id, op_name, device_id)
-        # Run in a thread so the synchronous local_eval (which uses
-        # subprocess.run) doesn't block the event loop.
-        result = await asyncio.to_thread(
-            _run_eval_sync,
-            package_bytes, task_id, op_name, timeout, device_id,
-            override_base_us, per_shape,
+        eval_task = asyncio.create_task(
+            _run_eval_async(package_bytes, task_id, op_name, timeout,
+                            device_id, override_base_us, per_shape))
+        watch_task = asyncio.create_task(_watch_disconnect(request))
+        done, _pending = await asyncio.wait(
+            [eval_task, watch_task],
+            return_when=asyncio.FIRST_COMPLETED,
         )
-        return _sanitize_floats(result)
+        if eval_task in done and not eval_task.cancelled():
+            watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await watch_task
+            return _sanitize_floats(eval_task.result())
+        # Disconnect (or eval crashed early without a result).
+        logger.info("[%s] client gone before eval finished; cancelling, "
+                    "releasing device %d", task_id, device_id)
+        eval_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await eval_task
+        # 499 is the conventional non-RFC "client closed request" code
+        # nginx popularised; FastAPI happily relays it.
+        raise HTTPException(status_code=499, detail="client disconnected")
     finally:
         await _state["queue"].put(device_id)
+
+
+async def _watch_disconnect(request: Request) -> None:
+    """Block until starlette reports the HTTP client has disconnected.
+
+    `request.is_disconnected()` reads from the starlette receive queue —
+    no network traffic, no curl-style heartbeat. uvicorn puts a
+    `{"type": "http.disconnect"}` message in that queue the moment the
+    TCP socket closes; this coroutine just observes it.
+    """
+    while not await request.is_disconnected():
+        await asyncio.sleep(2)
 
 
 # ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
 
-def _run_eval_sync(package_bytes: bytes, task_id: str, op_name: str,
-                   timeout: int, device_id: int,
-                   override_base_us: Optional[float],
-                   override_base_per_shape_us: Optional[list]) -> dict:
+async def _run_eval_async(package_bytes: bytes, task_id: str, op_name: str,
+                          timeout: int, device_id: int,
+                          override_base_us: Optional[float],
+                          override_base_per_shape_us: Optional[list]
+                          ) -> dict:
     """Extract the package, look up kernel/ref filenames from task.yaml,
-    call local_eval. Returns the dict the client expects."""
+    dispatch to `local_eval_async`. Returns the dict the client expects.
+
+    Mirrors the sync `_run_eval_sync` this replaced; the difference is
+    the eval is `await`-ed (so cancellation propagates into the eval
+    subprocess group) instead of run via `asyncio.to_thread` (which
+    can't be cancelled — `asyncio.to_thread` runs in a real OS thread
+    that doesn't respond to task cancellation, so a SIGTERM'd `claude
+    --print` would close its socket and the worker would carry on
+    blocking on `subprocess.run` for the rest of the eval).
+    """
     with tempfile.TemporaryDirectory(prefix=f"ar_run_{task_id}_") as tmp:
         try:
             _safe_extract_tar(package_bytes, tmp)
         except Exception as e:
-            return {
-                "device_id": device_id,
-                "verify_resp": {
-                    "success": False,
-                    "log": f"extract failed: {e}",
-                    "returncode": 1,
-                    "error_source": None,
-                    "verify_block": {},
-                    "artifacts": {},
-                },
-                "profile_resp": {
-                    "success": False,
-                    "log": "",
-                    "artifacts": {},
-                    "gen_time": None,
-                    "base_time": None,
-                },
-            }
+            return _error_response(device_id, f"extract failed: {e}")
 
         config = load_task_config(tmp)
         if config is None:
-            return {
-                "device_id": device_id,
-                "verify_resp": {
-                    "success": False,
-                    "log": "task.yaml missing in package",
-                    "returncode": 1,
-                    "error_source": None,
-                    "verify_block": {},
-                    "artifacts": {},
-                },
-                "profile_resp": {
-                    "success": False,
-                    "log": "",
-                    "artifacts": {},
-                    "gen_time": None,
-                    "base_time": None,
-                },
-            }
+            return _error_response(device_id,
+                                   "task.yaml missing in package")
 
         kernel_file = (config.editable_files[0].replace(".py", "")
                        if config.editable_files else "kernel")
         ref_file = config.ref_file.replace(".py", "")
 
-        verify_resp, profile_resp = local_eval(
+        verify_resp, profile_resp = await local_eval_async(
             task_dir=tmp,
             op_name=op_name,
             kernel_file=kernel_file,
@@ -232,6 +251,20 @@ def _run_eval_sync(package_bytes: bytes, task_id: str, op_name: str,
             "verify_resp": verify_resp,
             "profile_resp": profile_resp,
         }
+
+
+def _error_response(device_id: int, msg: str) -> dict:
+    return {
+        "device_id": device_id,
+        "verify_resp": {
+            "success": False, "log": msg, "returncode": 1,
+            "error_source": None, "verify_block": {}, "artifacts": {},
+        },
+        "profile_resp": {
+            "success": False, "log": "", "artifacts": {},
+            "gen_time": None, "base_time": None,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
