@@ -88,7 +88,8 @@ def main() -> int:
         print(f"  regress:         {regr}     (<{lo}x)")
         print()
 
-    regressions = [(k, sp, base, bm) for k, sp, base, bm in speedups if sp < 0.95]
+    regressions = [(k, sp, base, bm) for k, sp, base, bm in speedups
+                   if sp < speedup_regress_below()]
     if regressions:
         print(f"regressions ({len(regressions)} ops slower than baseline):")
         for k, sp, base, bm in sorted(regressions, key=lambda r: r[1]):
