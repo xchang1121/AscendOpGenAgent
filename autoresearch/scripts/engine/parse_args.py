@@ -63,12 +63,10 @@ def _build_scaffold_command(args) -> str:
     parts += ["--eval-timeout", str(args.eval_timeout)]
     parts += ["--output-dir", args.output_dir or "ar_tasks"]
     parts.append("--run-baseline")
-    # Tri-state: None -> omit (scaffold resolves from config), True ->
-    # --code-checker, False -> --no-code-checker. scaffold's CLI also
-    # uses dest='code_checker'.
-    if args.code_checker is True:
-        parts.append("--code-checker")
-    elif args.code_checker is False:
+    # scaffold's CLI uses dest='code_checker' with store_const:
+    # None (no flag) -> omit, let scaffold resolve from config;
+    # False (--no-code-checker) -> forward the flag.
+    if args.code_checker is False:
         parts.append("--no-code-checker")
     if getattr(args, "worker_url", ""):
         parts += ["--worker-url", shlex.quote(args.worker_url)]

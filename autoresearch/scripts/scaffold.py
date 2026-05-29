@@ -259,22 +259,17 @@ def _make_arg_parser() -> argparse.ArgumentParser:
                         help="Parent directory for the task (default: ./ar_tasks/)")
     parser.add_argument("--run-baseline", action="store_true",
                         help="Also run baseline eval after scaffolding")
-    # Tri-state: --no-code-checker / --code-checker / (neither -> config).
-    # Both off lets defaults.code_checker_enabled in config.yaml decide,
-    # which is then pinned into task.yaml by scaffold_task_dir.
-    cc = parser.add_mutually_exclusive_group()
-    cc.add_argument("--no-code-checker", dest="code_checker",
-                    action="store_false", default=None,
-                    help=("Disable the static Triton regression check "
-                          "(validate_triton_impl) for this task. "
-                          "Useful when the regression rules are too "
-                          "strict for the chosen kernel style. Writes "
-                          "`code_checker: {enabled: false}` into "
-                          "task.yaml; flip the field to re-enable later."))
-    cc.add_argument("--code-checker", dest="code_checker",
-                    action="store_true", default=None,
-                    help=("Explicitly enable the regression check for "
-                          "this task regardless of config defaults."))
+    # Single flag, store_const so the absence of --no-code-checker yields
+    # None (lets defaults.code_checker_enabled in config.yaml decide) and
+    # presence yields False (pinned into task.yaml as enabled: false).
+    parser.add_argument("--no-code-checker", dest="code_checker",
+                        action="store_const", const=False, default=None,
+                        help=("Disable the static Triton regression check "
+                              "(validate_triton_impl) for this task. "
+                              "Useful when the regression rules are too "
+                              "strict for the chosen kernel style. Writes "
+                              "`code_checker: {enabled: false}` into "
+                              "task.yaml; flip the field to re-enable later."))
     parser.add_argument("--worker-url", default="",
                         help="Remote worker URL(s) (host:port, comma-separated). "
                              "Routes eval through the remote HTTP worker "
