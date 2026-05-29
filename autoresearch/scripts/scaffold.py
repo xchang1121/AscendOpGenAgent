@@ -259,13 +259,22 @@ def _make_arg_parser() -> argparse.ArgumentParser:
                         help="Parent directory for the task (default: ./ar_tasks/)")
     parser.add_argument("--run-baseline", action="store_true",
                         help="Also run baseline eval after scaffolding")
-    parser.add_argument("--no-code-checker", action="store_true",
-                        help=("Disable the static Triton regression check "
-                              "(validate_triton_impl) for this task. "
-                              "Useful when the regression rules are too "
-                              "strict for the chosen kernel style. Writes "
-                              "`code_checker: {enabled: false}` into "
-                              "task.yaml; flip the field to re-enable later."))
+    # Tri-state: --no-code-checker / --code-checker / (neither -> config).
+    # Both off lets defaults.code_checker_enabled in config.yaml decide,
+    # which is then pinned into task.yaml by scaffold_task_dir.
+    cc = parser.add_mutually_exclusive_group()
+    cc.add_argument("--no-code-checker", dest="code_checker",
+                    action="store_false", default=None,
+                    help=("Disable the static Triton regression check "
+                          "(validate_triton_impl) for this task. "
+                          "Useful when the regression rules are too "
+                          "strict for the chosen kernel style. Writes "
+                          "`code_checker: {enabled: false}` into "
+                          "task.yaml; flip the field to re-enable later."))
+    cc.add_argument("--code-checker", dest="code_checker",
+                    action="store_true", default=None,
+                    help=("Explicitly enable the regression check for "
+                          "this task regardless of config defaults."))
     parser.add_argument("--worker-url", default="",
                         help="Remote worker URL(s) (host:port, comma-separated). "
                              "Routes eval through the remote HTTP worker "
@@ -347,7 +356,7 @@ def main():
         max_rounds=args.max_rounds,
         eval_timeout=args.eval_timeout,
         output_dir=args.output_dir,
-        code_checker_enabled=not args.no_code_checker,
+        code_checker_enabled=args.code_checker,  # None -> config default
         ref_source_path=args.ref,
         worker_url=args.worker_url,
     )

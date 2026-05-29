@@ -49,7 +49,17 @@ def _normalize_worker_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def _worker_status(worker_url: str, timeout: float = 5.0) -> Optional[dict]:
+def _worker_status(worker_url: str,
+                   timeout: Optional[float] = None) -> Optional[dict]:
+    if timeout is None:
+        # Lazy import: _select_worker is the only caller and it runs after
+        # run_eval puts scripts/ on sys.path.
+        _scripts_dir = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        from utils.settings import worker_status_timeout
+        timeout = worker_status_timeout()
     try:
         req = Request(f"{worker_url}/api/v1/status", method="GET")
         with urlopen(req, timeout=timeout) as resp:

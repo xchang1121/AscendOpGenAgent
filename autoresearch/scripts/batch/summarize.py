@@ -18,9 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import manifest as mf
 # Reach up one level (scripts/) for the shared settings accessors.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from utils.settings import classify_speedup, speedup_improved_above, speedup_regress_below  # noqa: E402
-# Reach up one level for utils.settings (single source for speedup thresholds).
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils.settings import (  # noqa: E402
     classify_speedup, speedup_improved_above, speedup_regress_below,
 )

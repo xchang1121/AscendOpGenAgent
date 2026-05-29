@@ -18,7 +18,6 @@ from phase_machine import (
     has_pending_items, find_active_task_dir,
 )
 from utils.settings import heartbeat_fresh_seconds  # noqa: E402
-from utils.settings import heartbeat_fresh_seconds
 
 
 def _validate(task_dir: str) -> tuple[bool, str]:

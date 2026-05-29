@@ -44,7 +44,10 @@ if _SCRIPTS_DIR not in sys.path:
 from task_config import load_task_config  # noqa: E402
 from utils.eval_runner import local_eval_async  # noqa: E402
 from utils.json_io import sanitize_floats as _sanitize_floats  # noqa: E402
-from utils.settings import worker_port as _worker_port  # noqa: E402
+from utils.settings import (  # noqa: E402
+    worker_port as _worker_port,
+    default_eval_timeout as _default_eval_timeout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +126,7 @@ async def run(
     package: UploadFile = File(...),
     task_id: str = Form(...),
     op_name: str = Form(...),
-    timeout: int = Form(600),
+    timeout: int = Form(_default_eval_timeout()),
     override_base_us: Optional[float] = Form(None),
     override_base_per_shape_us: Optional[str] = Form(None),
 ):
