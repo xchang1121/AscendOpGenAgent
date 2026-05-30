@@ -144,6 +144,35 @@ _EXIT_FOR = {
 }
 
 
+def baseline_exit_code(task_dir: str) -> int:
+    """Map the COMMITTED baseline_outcome (in state.json's progress
+    bundle) back to engine/baseline.py's exit-code convention.
+
+    Used by the ALREADY_DONE retry path: precheck_baseline skipped
+    run_eval, so the exit code can't come from this round's outcome.
+    It has to come from the prior committed outcome — otherwise a
+    retry after a crashed INFRA_FAIL baseline would silently return
+    0, and scaffold.py / batch / supervisors that key off rc==4 to
+    refuse activation would treat the task as healthy.
+
+    Returns 0 when progress isn't readable or outcome is missing
+    (defensive — ALREADY_DONE shouldn't ever reach here without
+    progress_initialized, but the consequence of a None is "treat as
+    activatable" which matches the silent default that existed
+    before this helper)."""
+    progress = load_progress(task_dir)
+    if progress is None:
+        return 0
+    outcome_str = progress.get("baseline_outcome")
+    if not outcome_str:
+        return 0
+    try:
+        outcome = EvalOutcome(outcome_str)
+    except ValueError:
+        return 0
+    return _EXIT_FOR.get(outcome, 0)
+
+
 def run_baseline_init(task_dir: str, eval_data: dict) -> int:
     """Library entry point. engine/baseline.py calls this after
     run_eval finishes; the return value becomes that script's exit

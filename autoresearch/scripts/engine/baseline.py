@@ -23,7 +23,7 @@ from task_config import load_task_config, run_eval
 from utils.failure_extractor import extract_failure_signals, format_for_stdout
 from workflow import run_baseline_init
 from workflow.baseline import (
-    precheck_baseline, BaselinePrecheckOutcome,
+    precheck_baseline, BaselinePrecheckOutcome, baseline_exit_code,
 )
 from workflow.transition import PhaseController
 
@@ -80,8 +80,17 @@ def main():
         # PhaseController.on_baseline_settled would leave phase=BASELINE
         # forever. on_baseline_settled is idempotent.
         PhaseController(task_dir).on_baseline_settled()
-        print(f"[baseline] {pre.detail}", file=sys.stderr)
-        sys.exit(0)
+        # Exit code must mirror what run_baseline_init would have
+        # returned for the COMMITTED outcome, not a flat 0. A retried
+        # baseline on a prior INFRA_FAIL commit (state was written but
+        # the process was killed before the rc landed) must still
+        # signal rc=4 — scaffold and batch supervisors key off rc==4
+        # to refuse activation, and a silent 0 here would advance them
+        # past a broken ref/env with no human in the loop.
+        rc = baseline_exit_code(task_dir)
+        print(f"[baseline] {pre.detail} (committed outcome → exit={rc})",
+              file=sys.stderr)
+        sys.exit(rc)
     if pre.outcome == BaselinePrecheckOutcome.ORPHAN_SEED:
         print(f"[baseline] FATAL: {pre.detail}", file=sys.stderr)
         sys.exit(4)

@@ -29,11 +29,28 @@ def _validate(task_dir: str) -> tuple[bool, str]:
         if not os.path.exists(os.path.join(task_dir, rel)):
             return False, f"Missing required file: {rel}"
 
+    # Heal + check FIRST, before load_progress / plan validation.
+    # require_state_consistency runs replay_intent (auto_replay=True)
+    # at entry; this is the single recovery path through which a
+    # crash that left intent.json + bodies-without-state gets healed
+    # back into a readable state.json. If we read progress before
+    # this, a baseline crash window (SEED row written, progress_
+    # initialized still False) would fail us out at "No measured
+    # progress yet" — the user would be told to start fresh while the
+    # journal had everything needed to recover.
+    from phase_machine import (
+        require_state_consistency as _require,
+        format_state_inconsistency as _fmt_inconsistency,
+    )
+    rep = _require(task_dir, on_inconsistent="report")
+    if not rep["consistent"]:
+        return False, _fmt_inconsistency(rep)
+
     progress = load_progress(task_dir)
     if progress is None:
-        # Either state.json is missing entirely (task was never
-        # claimed) or baseline never landed (progress_initialized is
-        # False). Both mean "nothing to resume" — start fresh.
+        # State is consistent (replay either reconciled or had nothing
+        # to do) and baseline still hasn't committed → genuinely
+        # nothing to resume. Start fresh.
         return False, ("No measured progress yet (state.json missing or "
                        "baseline never committed). Run /autoresearch "
                        "without --resume to start a fresh task.")
@@ -51,18 +68,6 @@ def _validate(task_dir: str) -> tuple[bool, str]:
         ok, err = validate_plan(task_dir)
         if not ok:
             return False, f"plan.md invalid: {err}"
-
-    # Cross-file consistency: plan.md / history.jsonl vs state.json's
-    # expected_*. Refuse to attach if the previous writer landed body
-    # bytes but state.json wasn't committed — operator re-runs the
-    # original writer first.
-    from phase_machine import (
-        require_state_consistency as _require,
-        format_state_inconsistency as _fmt_inconsistency,
-    )
-    rep = _require(task_dir, on_inconsistent="report")
-    if not rep["consistent"]:
-        return False, _fmt_inconsistency(rep)
 
     return True, ""
 
