@@ -286,9 +286,48 @@ async def run(
                            task_id, e)
             per_shape = None
 
-    device_id = await _state["queue"].get()
+    # Stage 1: acquire a device — but race against disconnect so a
+    # client that abandons the request while queued doesn't get a
+    # device assigned to it the moment one frees up (the previous
+    # behaviour acquired silently, then the eval phase's watch_task
+    # immediately cancelled, releasing the device — correct but a
+    # wasted scheduling window, and the dead client stayed FIFO-
+    # blocking until the queue's turn came around).
+    queue_task = asyncio.create_task(_state["queue"].get())
+    watch_task = asyncio.create_task(_watch_disconnect(request))
+    done, _pending = await asyncio.wait(
+        [queue_task, watch_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    # Always tear down the queueing-phase watch_task; we either don't
+    # need it any more (acquired a device) or it already fired.
+    watch_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await watch_task
+
+    if queue_task in done and not queue_task.cancelled():
+        device_id = queue_task.result()
+    else:
+        # Client disconnected before a device freed up. Cancel the
+        # pending queue.get; if it raced us and managed to take a
+        # device on the very tick we cancelled, return it to the pool
+        # so the next caller isn't blocked.
+        queue_task.cancel()
+        try:
+            result = await queue_task
+            if isinstance(result, int):
+                _state["queue"].put_nowait(result)
+        except (asyncio.CancelledError, Exception):
+            pass
+        logger.info("[%s] client gone while queued; aborting before "
+                    "acquiring a device", task_id)
+        raise HTTPException(status_code=499,
+                            detail="client disconnected while queued")
+
     try:
         logger.info("[%s] run %s on device %d", task_id, op_name, device_id)
+        # Stage 2: run the eval; re-arm watch_task to cancel the eval
+        # if the client disconnects mid-flight.
         eval_task = asyncio.create_task(
             _run_eval_async(package_bytes, task_id, op_name, timeout,
                             device_id, override_base_us, per_shape))
