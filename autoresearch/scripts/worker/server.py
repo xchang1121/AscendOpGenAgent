@@ -180,11 +180,24 @@ def _check_source_drift() -> dict:
     removed = [p for p in snap_before if p not in snap_now]
     config_hash_before = _state.get("config_hash")
     config_hash_now = _config_yaml_hash()
-    config_drift = ("changed"
-                    if (config_hash_before is not None
-                        and config_hash_now is not None
-                        and config_hash_before != config_hash_now)
-                    else None)
+    # Three drift-worthy transitions; only None→None is clean.
+    #   1. hash != hash         — config edited in place
+    #   2. hash → None          — config.yaml was readable at boot,
+    #                             now isn't (deleted, perms broken).
+    #                             Previously a silent no-op: the
+    #                             before-and-not-None guard skipped
+    #                             this and the worker kept serving
+    #                             stale settings while the operator
+    #                             thought they were resetting config.
+    #   3. None → hash          — opposite: config didn't exist at
+    #                             boot, exists now. utils.settings._raw
+    #                             never reloaded the new file (lru_
+    #                             cache'd), so we'd silently keep the
+    #                             zero-config defaults forever.
+    if config_hash_before == config_hash_now:
+        config_drift = None
+    else:
+        config_drift = "changed"
     return {
         "changed": sorted(changed)[:10],
         "added":   sorted(added)[:10],

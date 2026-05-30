@@ -175,6 +175,23 @@ def render(task_dir, history_offset=0, history_window=None):
         lines.append(f"  Run /autoresearch --ref ... --op-name ... first.")
         return "\n".join(lines)
 
+    # progress_initialized=False means a session has claimed this task
+    # but baseline has not yet committed any measurement. Showing the
+    # default zero/None scaffold values here would look like genuine
+    # data ("Round 0/999, Baseline None"); render a fresh-task banner
+    # instead. Once baseline lands (sets progress_initialized=True),
+    # the normal layout below takes over.
+    if not progress.get("progress_initialized"):
+        owner = progress.get("owner") or {}
+        lines.append(f"\n  {BOLD}{CYAN}Task scaffolded; baseline not yet "
+                     f"run.{RESET}")
+        if owner.get("session_id"):
+            lines.append(f"  Owner session: {DIM}"
+                         f"{owner.get('session_id')}{RESET}")
+        lines.append(f"  {DIM}This dashboard will populate once "
+                     f"baseline.py commits the first measurement.{RESET}")
+        return "\n".join(lines)
+
     task = progress.get("task", "?")
     rounds = progress.get("eval_rounds", 0)
     # Was a hardcoded 20 that drifted from the rest of the framework

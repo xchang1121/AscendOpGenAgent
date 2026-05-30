@@ -13,11 +13,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from phase_machine import (
-    ALL_PHASES, load_progress,
-    plan_path, state_path, edit_marker_path,
+    load_progress, plan_path, edit_marker_path,
     has_pending_items, find_active_task_dir,
+    is_task_fresh, task_summary,
 )
-from utils.settings import heartbeat_fresh_seconds  # noqa: E402
 
 
 def _validate(task_dir: str) -> tuple[bool, str]:
@@ -32,31 +31,17 @@ def _validate(task_dir: str) -> tuple[bool, str]:
 
     progress = load_progress(task_dir)
     if progress is None:
-        return False, "Missing or corrupt .ar_state/progress.json — task was never initialized"
+        # Either state.json is missing entirely (task was never
+        # claimed) or baseline never landed (progress_initialized is
+        # False). Both mean "nothing to resume" — start fresh.
+        return False, ("No measured progress yet (state.json missing or "
+                       "baseline never committed). Run /autoresearch "
+                       "without --resume to start a fresh task.")
 
     required_fields = {"task", "eval_rounds", "max_rounds"}
     missing = required_fields - set(progress.keys())
     if missing:
-        return False, f"progress.json missing fields: {missing} (incompatible version)"
-
-    # Validate .phase if present. Go through phase_machine.read_phase
-    # — it owns the on-disk format (today `PHASE|<txn>`, formerly
-    # `PHASE`) and the corrupt-content handling. Reading raw here
-    # would re-parse the format incorrectly the next time the writer
-    # side evolves (which already happened once: the .txn refactor
-    # added the `|<txn>` suffix and this bypass would have rejected
-    # every fresh task as "Unknown phase 'EDIT|7'").
-    phase_file = state_path(task_dir, ".phase")
-    if os.path.exists(phase_file):
-        from phase_machine import read_phase, INIT
-        phase = read_phase(task_dir)
-        # read_phase falls back to INIT on corrupt content (with a
-        # stderr warning); INIT here means the file existed but was
-        # unparseable, which is the same incompatible-version signal
-        # the old check produced.
-        if phase == INIT:
-            return False, ("Unparseable .phase file (read_phase fell "
-                           "back to INIT — see stderr for details)")
+        return False, f"state.json progress fields missing: {missing}"
 
     # Validate plan.md if present. A fully-consumed plan (0 pending) is legal —
     # compute_resume_phase routes it to REPLAN. validate_plan would reject it
@@ -83,27 +68,31 @@ def _validate(task_dir: str) -> tuple[bool, str]:
 
 
 def _check_active_lock(task_dir: str, force: bool) -> None:
-    """Check if another Claude Code instance is actively running this task.
-
-    Uses .ar_state/.heartbeat file mtime — if updated in last 3 minutes, warn.
-    """
-    heartbeat = state_path(task_dir, ".heartbeat")
-    if not os.path.exists(heartbeat):
+    """Refuse to attach when another Claude Code session is actively
+    driving this task. "Active" = state.last_touched is within
+    `heartbeat_fresh_seconds`. The retired `.heartbeat` sidecar is
+    gone; heartbeats are bumped in-place on state.json by
+    touch_heartbeat, and `is_task_fresh` is the only thing callers
+    should ask about freshness."""
+    if not is_task_fresh(task_dir):
         return
-
-    import time
-    age = time.time() - os.path.getmtime(heartbeat)
-    if age < heartbeat_fresh_seconds():  # config.yaml resume.heartbeat_fresh_seconds
-        if force:
-            print(f"[resume] WARNING: Task was active {age:.0f}s ago. Forcing takeover (--force).",
-                  file=sys.stderr)
-            return
-        print(f"[resume] ERROR: Task is currently active (heartbeat updated {age:.0f}s ago).",
+    if force:
+        print(f"[resume] WARNING: Task is fresh (state.last_touched within "
+              f"the heartbeat window). Forcing takeover (--force).",
               file=sys.stderr)
-        print(f"[resume] Another Claude Code session may be running it.", file=sys.stderr)
-        print(f"[resume] If you're sure no other session is running, add --force:", file=sys.stderr)
-        print(f"[resume]   /autoresearch --resume --force", file=sys.stderr)
-        sys.exit(1)
+        return
+    summary = task_summary(task_dir) or {}
+    owner = summary.get("owner") or {}
+    print(f"[resume] ERROR: Task is currently active "
+          f"(state.last_touched={summary.get('last_touched')}, "
+          f"owner.session_id={owner.get('session_id') or '<none>'}).",
+          file=sys.stderr)
+    print(f"[resume] Another Claude Code session may be running it.",
+          file=sys.stderr)
+    print(f"[resume] If you're sure no other session is running, add --force:",
+          file=sys.stderr)
+    print(f"[resume]   /autoresearch --resume --force", file=sys.stderr)
+    sys.exit(1)
 
 
 def main():
@@ -140,17 +129,16 @@ def main():
             except OSError:
                 pass
 
-    progress = load_progress(task_dir) or {}
-    print(f"[resume] Task: {progress.get('task')}")
-    print(f"[resume] Round: {progress.get('eval_rounds')}/{progress.get('max_rounds')}")
-    print(f"[resume] Best: {progress.get('best_metric')} | Baseline: {progress.get('baseline_metric')}")
-    phase_file = state_path(task_dir, ".phase")
-    if os.path.exists(phase_file):
-        # Same reason as the validator above — go through read_phase
-        # so the displayed string is the phase NAME, not the raw
-        # `PHASE|<txn>` on-disk form.
-        from phase_machine import read_phase
-        print(f"[resume] Phase: {read_phase(task_dir)}")
+    # task_summary is the only thing this script needs from the state
+    # store — it's the single shape callers should agree on after the
+    # state.json unification. Reaching into individual fields used to
+    # be the source of resume vs dashboard skew on schema changes.
+    summary = task_summary(task_dir) or {}
+    print(f"[resume] Task: {summary.get('task')}")
+    print(f"[resume] Round: {summary.get('eval_rounds')}/{summary.get('max_rounds')}")
+    print(f"[resume] Best: {summary.get('best_metric')} | "
+          f"Baseline: {summary.get('baseline_metric')}")
+    print(f"[resume] Phase: {summary.get('phase')}")
 
     # Print task_dir on last line (for easy parsing)
     print(task_dir)

@@ -391,12 +391,15 @@ def main():
         #   4 = task NOT activatable (INFRA_FAIL — operator must intervene)
         # Anything else here is an unexpected baseline crash.
         if rc == 4:
-            try:
-                with open(os.path.join(task_dir, ".ar_state",
-                                       "progress.json")) as _f:
-                    err_source = json.load(_f).get("baseline_error_source")
-            except (OSError, ValueError):
-                err_source = None
+            # progress.json is gone; baseline_error_source lives in
+            # state.json via the task_summary facade. summary is None
+            # only when baseline never wrote state at all (older crashes
+            # before the first save_state), in which case err_source
+            # stays None and we fall through to the generic INFRA_FAIL
+            # hint below.
+            from phase_machine import task_summary  # noqa: E402
+            summary = task_summary(task_dir) or {}
+            err_source = summary.get("baseline_error_source")
             if err_source == "ref":
                 hint = ("The file passed via --ref is broken (import / "
                         "forward / device-only bug). Fix the SOURCE file "
@@ -432,16 +435,15 @@ def main():
 
     # Output
     # Surface baseline_outcome so callers can distinguish OK from
-    # KERNEL_FAIL without re-reading progress.json. Both are activatable
+    # KERNEL_FAIL without rereading state. Both are activatable
     # (status=ok, rc=0); the difference is whether the seed kernel
     # produced valid timings or the first PLAN cycle has to rewrite it.
-    outcome = None
-    try:
-        with open(os.path.join(task_dir, ".ar_state",
-                               "progress.json")) as _f:
-            outcome = json.load(_f).get("baseline_outcome")
-    except (OSError, ValueError):
-        pass
+    # When --run-baseline wasn't passed, summary is None (no state.json
+    # yet) → outcome stays None and the caller knows it's an
+    # un-baselined task.
+    from phase_machine import task_summary  # noqa: E402
+    summary = task_summary(task_dir) or {}
+    outcome = summary.get("baseline_outcome")
     print(json.dumps({"task_dir": task_dir, "status": "ok",
                       "baseline_outcome": outcome}))
 

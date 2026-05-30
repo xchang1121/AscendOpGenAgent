@@ -70,11 +70,16 @@ def run_baseline_init(task_dir: str, eval_data: dict) -> int:
 
     # Single atomic commit: merge progress fields + bump
     # expected_history_round so the consistency check matches the row
-    # we just appended.
+    # we just appended. progress_initialized flips on here — this is the
+    # discriminator load_progress() uses to distinguish "claimed by a
+    # session but never measured" from "has baseline data". Resume /
+    # dashboard rely on it to avoid offering a Round 0/0 view on a task
+    # that hasn't run baseline yet.
     state = load_state(task_dir) or {}
     for k, v in reduction.progress.to_dict().items():
         state[k] = v
     state["expected_history_round"] = 0
+    state["progress_initialized"] = True
     save_state(task_dir, state)
 
     # Phase transition (PLAN for kernel_fail, untouched for infra_fail)

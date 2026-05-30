@@ -32,6 +32,7 @@ from phase_machine import (
     get_active_item,
     get_guidance, auto_rollback, load_progress, load_state, save_state,
     edit_marker_path, FINISH,
+    require_state_consistency, format_state_inconsistency,
 )
 
 
@@ -182,6 +183,25 @@ def main():
 
     task_dir = os.path.abspath(sys.argv[1])
 
+    # === Cross-file consistency gate ===
+    # state.json is the commit barrier; plan.md + history.jsonl are
+    # durable bodies written ahead of it. A prior writer that landed
+    # body bytes but crashed before save_state leaves an artifact
+    # ahead of state.expected_*. Running record_round on top would
+    # double-count: the existing body becomes legit (mismatched
+    # expected_* is repaired by the next save), and our fresh body
+    # appends another row.
+    # Recovery is to re-run the original writer (create_plan.py for
+    # plan.md mismatches, pipeline.py replay path for history.jsonl
+    # mismatches — itself reached by setting state.pending_settle).
+    # We refuse loudly here so the operator notices instead of
+    # silently corrupting accounting.
+    report = require_state_consistency(task_dir, on_inconsistent="report")
+    if not report["consistent"]:
+        print(f"[PIPELINE] REFUSING TO RUN — "
+              f"{format_state_inconsistency(report)}", file=sys.stderr)
+        sys.exit(1)
+
     # === Replay-only settle ===
     # If a previous pipeline.py invocation got past record_round but
     # settle failed (or was killed before _post_settle / _clear_pending_
@@ -314,9 +334,6 @@ def main():
                   flush=True)
             print(eval_json["raw_output_tail"], flush=True)
 
-    # === Round transaction begins ===
-    # Allocate a single txn id; every body file written below
-    # (progress.json + history.jsonl + .pending_settle.json + plan.md
     # === Step 3: Keep or discard ===
     # record_round writes history.jsonl + state.json (incl. pending_
     # settle = kd_json) in one atomic save_state. Returns the kd_json

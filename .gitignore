@@ -23,6 +23,7 @@ ar_tasks/
 .ar_state/.edit_started
 autoresearch/.active_task
 autoresearch/.task_dir_pointers
+autoresearch/.session_tasks/
 autoresearch/.claude/settings.local.json
 autoresearch/.claude/scheduled_tasks.lock
 workspace/

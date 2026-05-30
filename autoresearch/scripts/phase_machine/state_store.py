@@ -86,6 +86,14 @@ def _find_project_root() -> str:
 _PROJECT_ROOT = _find_project_root()
 _TASK_DIR_POINTERS = os.path.join(_PROJECT_ROOT, ".task_dir_pointers")
 
+# Repo-level session→task_dir index. Each session has its own file at
+# <repo>/.session_tasks/<sha(session_id)>; its content is the absolute
+# path of the task that session is currently driving. Replaces the
+# old "scan ar_tasks/ for state.owner.session_id == us" lookup which
+# silently missed tasks created with scaffold --output-dir pointing
+# outside the repo root.
+_SESSION_TASKS_DIR = os.path.join(_PROJECT_ROOT, ".session_tasks")
+
 
 def task_dir_pointer_path(op_name: str) -> str:
     """Per-op pointer file path. scaffold writes the task_dir here
@@ -234,31 +242,23 @@ def update_state(task_dir: str, **fields) -> dict:
 
 
 def _fresh_state() -> dict:
-    """Default state record for a task that has none yet on disk."""
+    """Default state record for a task that has none yet on disk.
+    Two orthogonal semantics live in state.json:
+      - control fields (phase, owner, last_touched, expected_*) —
+        these are meaningful from the first set_task_dir; defaults here.
+      - progress fields (task, eval_rounds, max_rounds, best_metric,
+        baseline_*, ...) — meaningful ONLY after baseline.py has
+        committed the first real measurement. `progress_initialized`
+        is the discriminator. load_progress() returns None when it's
+        False, so resume / dashboard / scaffold can't mistake a
+        freshly-claimed-but-not-yet-evaluated task for a Round 0/0
+        task.
+    """
     return {
         "phase": INIT,
         "owner": None,
         "last_touched": _now_iso(),
-        "task": "",
-        "eval_rounds": 0,
-        "max_rounds": 0,
-        "consecutive_failures": 0,
-        "best_metric": None,
-        "best_commit": None,
-        "baseline_metric": None,
-        "baseline_source": None,
-        "baseline_outcome": None,
-        "baseline_error_source": None,
-        "baseline_per_shape_us": None,
-        "baseline_fingerprint": None,
-        "seed_metric": None,
-        "plan_version": 0,
-        "next_pid": 0,
-        "num_cases": 1,
-        "per_shape_descs": None,
-        "diagnose_attempts": 0,
-        "diagnose_attempts_for_version": None,
-        "last_diagnose_failure_reason": None,
+        "progress_initialized": False,
         "pending_settle": None,
         "expected_plan_version": 0,
         "expected_history_round": 0,
@@ -282,6 +282,56 @@ def _our_session_id() -> str:
     """Caller's Claude Code session id (empty when not inside an agent
     process — supervisors like batch/run.py)."""
     return os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+
+
+# ---- Session→task index ---------------------------------------------------
+# Each Claude session points at exactly one task at a time. The index
+# is a single small file per session under <repo>/.session_tasks/. Why
+# files instead of a single .json: per-session files mean no inter-
+# session write contention, and stale sessions just leave orphan files
+# that are trivially gc-able (orphan = the pointed task no longer
+# names this session in its state.owner).
+
+def _session_index_path(session_id: str) -> str:
+    """Filesystem-safe per-session path. session_id is opaque (Claude
+    issues UUIDs); hash to keep filenames stable across OSes."""
+    import hashlib
+    h = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(_SESSION_TASKS_DIR, h)
+
+
+def _write_session_index(session_id: str, task_dir: str) -> None:
+    if not session_id:
+        return
+    path = _session_index_path(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(os.path.abspath(task_dir))
+    os.replace(tmp, path)
+
+
+def _read_session_index(session_id: str) -> Optional[str]:
+    if not session_id:
+        return None
+    path = _session_index_path(session_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            td = f.read().strip()
+    except OSError:
+        return None
+    return td if td and os.path.isdir(td) else None
+
+
+def _clear_session_index(session_id: str) -> None:
+    if not session_id:
+        return
+    try:
+        os.remove(_session_index_path(session_id))
+    except OSError:
+        pass
 
 
 def _heartbeat_fresh(state: dict) -> bool:
@@ -326,17 +376,22 @@ def _iter_task_dirs():
 
 def get_task_dir() -> str:
     """Return the task_dir owned by the current Claude session, or ""
-    when none is found. Falls back to AR_TASK_DIR env var (used by
-    legacy scripts that pass task_dir via env)."""
+    when none is found. Falls back to AR_TASK_DIR env var.
+
+    Lookup goes through the per-session index — O(1) and covers tasks
+    created with scaffold --output-dir pointing outside the repo
+    root. Cross-checks the pointed task's state.owner to drop stale
+    indexes (e.g. session ended without an explicit clear)."""
     session = _our_session_id()
     if session:
-        for td in _iter_task_dirs():
-            st = load_state(td)
-            if not st:
-                continue
-            owner = st.get("owner") or {}
+        pointed = _read_session_index(session)
+        if pointed:
+            st = load_state(pointed)
+            owner = (st or {}).get("owner") or {}
             if owner.get("session_id") == session:
-                return td
+                return pointed
+            # Stale index — clear it so the next lookup is fast.
+            _clear_session_index(session)
     return os.environ.get("AR_TASK_DIR", "")
 
 
@@ -344,22 +399,30 @@ def set_task_dir(task_dir: str, *, force: bool = False) -> bool:
     """Claim `task_dir` for the current session. Returns True on
     success, False when refused.
 
-    Refuse-overwrite logic (mirrors clear_active_task):
-      1. force=True                                           → write
-      2. no existing owner on `task_dir`                      → write
-      3. existing owner.session_id == our session             → write
+    Single-task-per-session invariant: if the current session already
+    owns a DIFFERENT task, that task's state.owner gets cleared first
+    (and its session index entry rewritten to point here). Without
+    this, a session could end up listed as owner on multiple state
+    files and get_task_dir would return whichever the OS happened to
+    list first.
+
+    Refuse-overwrite logic on the target:
+      1. force=True                                          → write
+      2. no existing owner on `task_dir`                     → write
+      3. existing owner.session_id == our session            → write
          (legitimate re-claim by the same agent)
       4. existing owner.session_id != ours, but state's
-         last_touched is older than heartbeat_fresh_seconds   → write
+         last_touched is older than heartbeat_fresh_seconds  → write
          (prior owner is silent → presumed dead)
-      5. otherwise (different session, fresh heartbeat)       → refuse
+      5. otherwise (different session, fresh heartbeat)      → refuse
     """
     if not os.path.isdir(task_dir):
         return False
     state = load_state(task_dir) or _fresh_state()
+    our_session = _our_session_id()
+    new_abs = os.path.abspath(task_dir)
     if not force:
         existing = state.get("owner") or {}
-        our_session = _our_session_id()
         existing_sid = existing.get("session_id") or ""
         same_session = our_session and existing_sid == our_session
         if existing_sid and not same_session and _heartbeat_fresh(state):
@@ -370,12 +433,25 @@ def set_task_dir(task_dir: str, *, force: bool = False) -> bool:
                   f"or rm state.json's owner to take over.",
                   file=sys.stderr)
             return False
+    # Release the prior task this session was driving (if any), so
+    # the session is never simultaneously listed as owner of two
+    # tasks. Skip when the prior task IS this one (idempotent re-set).
+    if our_session:
+        prior = _read_session_index(our_session)
+        if prior and os.path.abspath(prior) != new_abs:
+            prior_state = load_state(prior)
+            if prior_state and (prior_state.get("owner") or {}).get(
+                    "session_id") == our_session:
+                prior_state["owner"] = None
+                save_state(prior, prior_state)
     state["owner"] = {
-        "session_id": _our_session_id(),
+        "session_id": our_session,
         "pid":        os.getpid(),
         "claimed_at": _now_iso(),
     }
     save_state(task_dir, state)
+    if our_session:
+        _write_session_index(our_session, new_abs)
     return True
 
 
@@ -384,47 +460,42 @@ def clear_active_task(expected_task_dir: Optional[str] = None,
     """Release ownership.
 
     Two caller patterns:
-      - in-session hook releasing its own task: pass expected_task_dir
-        = our owned task, or omit to auto-find via session match
+      - in-session hook releasing its own task: omit expected_task_dir
+        (we look it up via the session index)
       - supervisor (batch/run.py) releasing a task it spawned: pass
         expected_task_dir = the task that just finished
 
-    Decision (each step short-circuits to clear+True):
+    Decision (each step short-circuits to clear + True):
       1. force=True with a target → clear unconditionally
       2. session match            → clear (mine via session)
       3. expected_task_dir match  → clear (mine via supervisor claim)
       4. heartbeat stale          → clear (prior owner dead)
       5. otherwise                → refuse (live different session)
     """
-    targets = []
+    our_session = _our_session_id()
+
+    targets: list[str] = []
     if expected_task_dir:
         if os.path.isdir(expected_task_dir):
             targets = [os.path.abspath(expected_task_dir)]
-    else:
-        # No explicit target — scan for one owned by our session.
-        for td in _iter_task_dirs():
-            st = load_state(td)
-            if not st:
-                continue
-            owner = st.get("owner") or {}
-            if owner.get("session_id") == _our_session_id():
-                targets.append(td)
+    elif our_session:
+        # Index lookup, not directory scan.
+        pointed = _read_session_index(our_session)
+        if pointed:
+            targets = [os.path.abspath(pointed)]
 
     if not targets:
-        return True  # nothing to clear
+        # Nothing to clear from our point of view; also clear the
+        # session index if it dangled.
+        _clear_session_index(our_session)
+        return True
 
-    cleared_any = False
-    our_session = _our_session_id()
     for td in targets:
         state = load_state(td)
         if not state or not state.get("owner"):
-            cleared_any = True
-            continue
-
-        if force:
-            state["owner"] = None
-            save_state(td, state)
-            cleared_any = True
+            # Already cleared on disk; just drop the index.
+            if our_session:
+                _clear_session_index(our_session)
             continue
 
         owner = state["owner"] or {}
@@ -433,10 +504,11 @@ def clear_active_task(expected_task_dir: Optional[str] = None,
         supervisor_claim = (expected_task_dir
                             and os.path.abspath(expected_task_dir) == td)
 
-        if same_session or supervisor_claim or not _heartbeat_fresh(state):
+        if force or same_session or supervisor_claim or not _heartbeat_fresh(state):
             state["owner"] = None
             save_state(td, state)
-            cleared_any = True
+            if our_session and (same_session or force):
+                _clear_session_index(our_session)
             continue
 
         print(f"[state_store] WARNING: refusing to clear ownership of "
@@ -446,7 +518,7 @@ def clear_active_task(expected_task_dir: Optional[str] = None,
               f"is truly done.", file=sys.stderr)
         return False
 
-    return cleared_any or True
+    return True
 
 
 def find_active_task_dir() -> Optional[str]:
@@ -501,6 +573,72 @@ def touch_heartbeat(task_dir: str):
 
 
 # ---------------------------------------------------------------------------
+# Public facade — task_summary
+# ---------------------------------------------------------------------------
+# Single helper that bundles the things outside callers (batch, resume,
+# dashboard, scaffold) actually need: phase, ownership/freshness,
+# progress numbers, baseline outcome, pending sentinel, consistency
+# status. Callers that need ONE of these used to read individual
+# state.json fields directly — leading to the regression class where
+# adding a field or changing semantics broke a different file's poke.
+
+def is_task_fresh(task_dir: str) -> bool:
+    """True iff state.last_touched is within heartbeat_fresh_seconds.
+    Used by resume to detect "another live session owns this task"."""
+    state = load_state(task_dir)
+    if state is None:
+        return False
+    return _heartbeat_fresh(state)
+
+
+def task_owner_info(task_dir: str) -> Optional[dict]:
+    """Return the owner record `{session_id, pid, claimed_at}` or
+    None when nobody owns this task."""
+    state = load_state(task_dir)
+    if state is None:
+        return None
+    return state.get("owner")
+
+
+def task_summary(task_dir: str) -> Optional[dict]:
+    """One-stop "what's the state of this task" view. Designed for
+    callers that need to display / decide based on task state
+    (batch / resume / dashboard / scaffold) without reaching into
+    the state.json schema themselves.
+
+    Returns None when no state.json exists for this task.
+    """
+    state = load_state(task_dir)
+    if state is None:
+        return None
+    consistency = check_state_consistency(task_dir)
+    return {
+        "phase":         state.get("phase", INIT),
+        "owner":         state.get("owner"),
+        "last_touched":  state.get("last_touched"),
+        "is_fresh":      _heartbeat_fresh(state),
+        "progress_initialized": bool(state.get("progress_initialized")),
+        # Progress fields are meaningful only when progress_initialized.
+        # Callers can still read them when False but should expect
+        # zeros / Nones (they're scaffold defaults from baseline init).
+        "task":          state.get("task") or "",
+        "eval_rounds":   state.get("eval_rounds") or 0,
+        "max_rounds":    state.get("max_rounds") or 0,
+        "best_metric":   state.get("best_metric"),
+        "baseline_metric":       state.get("baseline_metric"),
+        "baseline_outcome":      state.get("baseline_outcome"),
+        "baseline_error_source": state.get("baseline_error_source"),
+        "consecutive_failures":  state.get("consecutive_failures") or 0,
+        "plan_version":          state.get("plan_version") or 0,
+        # Replay sentinel — None when no in-flight settle.
+        "pending_settle": state.get("pending_settle"),
+        # Cross-file consistency vs plan.md / history.jsonl artifacts.
+        "consistent":    consistency["consistent"],
+        "issues":        consistency["issues"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Phase R/W (was .phase; now state.json.phase)
 # ---------------------------------------------------------------------------
 
@@ -537,10 +675,15 @@ def write_phase(task_dir: str, phase: str):
 
 def load_progress(task_dir: str) -> Optional[Progress]:
     """Read the Progress dataclass view from state.json, or None when
-    state is missing. Existing read sites use `progress.get("X",
-    default)`; Progress.get mirrors dict.get so they keep working."""
+    state is missing OR `progress_initialized` is False.
+
+    The False case keeps "task has been claimed by a session but
+    baseline hasn't run yet" distinct from "task has measured
+    progress". Without this gate resume/dashboard would treat a
+    freshly-claimed empty state as Round 0/0 and offer to resume it.
+    """
     state = load_state(task_dir)
-    if state is None:
+    if state is None or not state.get("progress_initialized"):
         return None
     progress_fields = {k: v for k, v in state.items()
                        if k in _PROGRESS_FIELD_NAMES}

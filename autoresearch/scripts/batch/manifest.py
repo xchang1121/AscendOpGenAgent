@@ -213,53 +213,63 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _ensure_phase_machine_on_path() -> None:
+    import sys as _sys
+    _scripts = str(Path(__file__).resolve().parent.parent)
+    if _scripts not in _sys.path:
+        _sys.path.insert(0, _scripts)
+
+
 def read_task_state(task_dir: Path) -> dict:
-    """Pull the result block from <task_dir>/.ar_state/progress.json. Returns
-    a dict with whichever fields could be read."""
+    """Pull the result block from this task's state.json via the
+    task_summary facade. Returns a dict with whichever fields could be
+    read; None for unknown values. progress.json is gone — every
+    Progress field now lives inside state.json gated by
+    `progress_initialized` (False before baseline.py has committed
+    anything), and the facade is the only place callers should reach in."""
     out: dict = {
         "baseline_metric": None,
         "best_metric": None,
         "rounds": None,
         "consecutive_failures": None,
     }
-    for name in ("progress.json", ".progress.json"):
-        pf = task_dir / ".ar_state" / name
-        if not pf.exists():
-            continue
-        try:
-            data = json.loads(pf.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        out["baseline_metric"] = data.get("baseline_metric")
-        out["best_metric"] = data.get("best_metric")
-        out["rounds"] = data.get("eval_rounds")
-        out["consecutive_failures"] = data.get("consecutive_failures")
-        break
+    _ensure_phase_machine_on_path()
+    from phase_machine import task_summary  # noqa: E402
+    summary = task_summary(str(task_dir))
+    if summary is None:
+        return out
+    # progress_initialized=False means baseline never landed: leave the
+    # output Nones (matches old "missing progress.json" semantics) so
+    # run.py's batch_progress shows blanks rather than misleading 0s.
+    if not summary.get("progress_initialized"):
+        return out
+    out["baseline_metric"] = summary.get("baseline_metric")
+    out["best_metric"] = summary.get("best_metric")
+    out["rounds"] = summary.get("eval_rounds")
+    out["consecutive_failures"] = summary.get("consecutive_failures")
     return out
 
 
 def read_phase(task_dir: Path) -> str:
-    """Read .phase via phase_machine so the on-disk format (currently
-    `PHASE|<txn>`, formerly plain `PHASE`) has a single owner — same
-    rationale as resume.py. Was a duplicate raw read that didn't
-    learn the `|<txn>` suffix added by the .txn refactor and so
-    returned `FINISH|9` instead of `FINISH`, which then failed the
-    `phase == "FINISH"` op-completion check in run.py and marked
-    every legitimate done op as an error."""
-    pf = task_dir / ".ar_state" / ".phase"
-    if not pf.exists():
+    """Return the task's current phase, or "UNKNOWN" when state.json
+    is missing / corrupt (matches this module's historical contract;
+    run.py and monitor treat UNKNOWN as "not done yet"). Goes through
+    phase_machine.read_phase so the state.json schema has a single
+    owner — the old `.ar_state/.phase` gate is gone."""
+    _ensure_phase_machine_on_path()
+    from phase_machine import read_phase as _pm_read_phase, load_state, INIT
+    # Distinguish "no state.json at all" (truly unknown) from "state
+    # exists, phase=INIT" (legitimate fresh task). _pm_read_phase
+    # collapses both to INIT; we need the original signal because
+    # run.py polls a worker that may finish in <1s and we don't want
+    # to mistake "state.json hasn't been created yet" for INIT.
+    state = load_state(str(task_dir))
+    if state is None:
         return "UNKNOWN"
-    # phase_machine.read_phase expects a str path, not Path; and it
-    # falls back to INIT on unparseable content. UNKNOWN preserves
-    # this module's historical contract — callers (run.py, monitor)
-    # treat both INIT and UNKNOWN as "not done yet", so the mapping
-    # is safe.
-    import sys as _sys, os as _os
-    _scripts = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-    if _scripts not in _sys.path:
-        _sys.path.insert(0, _scripts)
-    from phase_machine import read_phase as _pm_read_phase, INIT
     phase = _pm_read_phase(str(task_dir))
+    # INIT after state.json exists means a task that was claimed but
+    # hasn't advanced — treat as UNKNOWN for run.py's done-check
+    # purposes (same as the old `.phase` missing case).
     return "UNKNOWN" if phase == INIT else phase
 
 

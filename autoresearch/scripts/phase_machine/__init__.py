@@ -38,6 +38,11 @@ from .state_store import (
     # Cross-file consistency gate
     check_state_consistency, format_state_inconsistency,
     require_state_consistency,
+    # Outward-facing facade — preferred over direct state.json reads in
+    # batch / resume / dashboard / scaffold (those used to poke
+    # progress.json / .heartbeat / .phase directly and skew on schema
+    # changes).
+    task_summary, is_task_fresh, task_owner_info,
 )
 from .validators import (
     validate_plan,
