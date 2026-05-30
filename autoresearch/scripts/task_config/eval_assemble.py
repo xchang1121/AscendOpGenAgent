@@ -241,36 +241,69 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
         error = (f"worker infra failure: "
                  f"{verify_log.strip() or '(no detail)'}")
     elif outcome == EvalOutcome.INFRA_FAIL:
-        error = (f"reference.py failed: "
-                 f"{verify_json.get('error') or '(no detail)'}")
+        # Top-level verify_json.error was the only signal here before, but
+        # eval_kernel writes ref-side failure as a per_case entry (with
+        # failure_kind="ref_crash" / error="ref-side: …") instead of
+        # promoting to top-level. Surface the first ref-side case so
+        # "reference.py failed: (no detail)" stops swallowing the real
+        # exception.
+        top = verify_json.get("error")
+        if not top:
+            for entry in (verify_json.get("per_case") or []):
+                if isinstance(entry, dict) and (
+                        entry.get("failure_kind") == "ref_crash"
+                        or (entry.get("error") or "").startswith("ref-side:")):
+                    top = entry.get("error")
+                    break
+        error = f"reference.py failed: {top or '(no detail)'}"
     elif not verify_ok:
-        # eval_kernel's verify loop tags each failed case as
-        # "kernel-side: <Exception>: ..." (forward / instantiation crash)
-        # or "compare: ..." (compare phase crash) or the literal
-        # "kernel output != reference" (clean allclose miss). Looking at
-        # per_case lets us tell a compile/runtime crash from a real
-        # correctness mismatch -- previously every FAIL surfaced as
-        # "kernel output != reference" even for MLIR ub_overflow crashes,
-        # which misled both the dashboard and downstream guidance.
+        # eval_kernel tags each failed case with failure_kind
+        # (kernel_crash / kernel_miss / compare_crash / ref_crash). Prefer
+        # the enum; fall back to the legacy error-prefix string match so
+        # older verify_blocks (pre-failure_kind) still classify cleanly.
+        # Previously every kernel-side FAIL surfaced as "kernel output !=
+        # reference" even for MLIR ub_overflow crashes, misleading both
+        # the dashboard and downstream guidance.
         crash_err = None
         clean_miss = False
         for entry in (verify_json.get("per_case") or []):
             if not isinstance(entry, dict):
                 continue
+            kind = entry.get("failure_kind")
             e = entry.get("error") or ""
-            if e.startswith(("kernel-side:", "compare:")) and crash_err is None:
+            is_crash = kind in ("kernel_crash", "compare_crash") or (
+                kind is None and e.startswith(("kernel-side:", "compare:")))
+            is_miss = kind == "kernel_miss" or (
+                kind is None and e == "kernel output != reference")
+            if is_crash and crash_err is None:
                 crash_err = e
-            elif e == "kernel output != reference":
+            elif is_miss:
                 clean_miss = True
         if crash_err:
             error = f"kernel crashed during verify: {crash_err[:200]}"
         elif clean_miss:
             error = "kernel output != reference"
         else:
-            # verify subprocess died before populating per_case (import
-            # error, top-level MLIR blowup, etc.). failure_extractor on
-            # raw_output_tail will surface the cause.
-            error = ("kernel verify failed before per-case loop "
+            # verify subprocess died before populating per_case. Use the
+            # kernel-side returncode to distinguish: SIGKILL (rc<0,
+            # typically OOM-killer), timeout (rc==124, set by
+            # _run_subprocess_async on asyncio.TimeoutError), or other
+            # non-zero rc (import / top-level MLIR blowup before the
+            # per-case loop began). failure_extractor on raw_output_tail
+            # carries the structured signals; this string is for the
+            # dashboard and human-readable summary.
+            rc = verify_resp.get("returncode")
+            if rc is None:
+                detail = "rc unknown"
+            elif rc == 124:
+                detail = "subprocess timed out (rc=124)"
+            elif isinstance(rc, int) and rc < 0:
+                detail = f"subprocess killed by signal {-rc} (rc={rc})"
+            elif rc != 0:
+                detail = f"subprocess exited rc={rc} before per-case loop"
+            else:
+                detail = "rc=0 but no per_case data (sidecar missing?)"
+            error = (f"kernel verify failed before per-case loop: {detail} "
                      "(see failure_signals / raw_output_tail)")
     else:
         if per_gen is None:

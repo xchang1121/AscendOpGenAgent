@@ -211,6 +211,7 @@ def run_verify(ref_mod, kernel_mod, cases_cpu, init_inputs, device,
             err = f"{type(e).__name__}: {e}"
             case_entry["error"] = f"ref-side: {err}"
             case_entry["error_source"] = "ref"
+            case_entry["failure_kind"] = "ref_crash"
             diagnostics.append(skill_verify.truncate_error(
                 f"[case {idx}] ref-side: {err}\n{traceback.format_exc()}"
             ))
@@ -243,6 +244,7 @@ def run_verify(ref_mod, kernel_mod, cases_cpu, init_inputs, device,
             err = f"{type(e).__name__}: {e}"
             case_entry["error"] = f"kernel-side: {err}"
             case_entry["error_source"] = "kernel"
+            case_entry["failure_kind"] = "kernel_crash"
             diagnostics.append(skill_verify.truncate_error(
                 f"[case {idx}] kernel-side: {err}\n{traceback.format_exc()}"
             ))
@@ -265,6 +267,7 @@ def run_verify(ref_mod, kernel_mod, cases_cpu, init_inputs, device,
                 _tag_kernel_fail()
                 case_entry["error_source"] = "kernel"
                 case_entry["error"] = "kernel output != reference"
+                case_entry["failure_kind"] = "kernel_miss"
                 for d in cmp["diagnostics"]:
                     diagnostics.append(f"[case {idx}] {d}")
         except Exception as e:
@@ -274,6 +277,7 @@ def run_verify(ref_mod, kernel_mod, cases_cpu, init_inputs, device,
             err = f"{type(e).__name__}: {e}"
             case_entry["error"] = f"compare: {err}"
             case_entry["error_source"] = "kernel"
+            case_entry["failure_kind"] = "compare_crash"
             diagnostics.append(skill_verify.truncate_error(
                 f"[case {idx}] compare: {err}\n{traceback.format_exc()}"
             ))
