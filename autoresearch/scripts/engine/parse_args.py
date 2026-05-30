@@ -160,8 +160,13 @@ def main():
     missing = []
     if not args.op_name:
         missing.append("--op-name <name>")
-    if not args.devices:
-        missing.append("--devices <N>")
+    # scaffold accepts --worker-url as the remote-only escape from local
+    # --devices. Keep parse_args in lockstep so a dev box without an NPU
+    # can fire `/autoresearch --ref ... --kernel ... --op-name ...
+    # --worker-url ...` without being kicked into ask mode for a missing
+    # --devices it shouldn't need.
+    if not args.devices and not getattr(args, "worker_url", ""):
+        missing.append("--devices <N> (or --worker-url <host:port>)")
 
     values = {
         "ref": args.ref,

@@ -127,10 +127,16 @@ remote_worker:
 #                                       "unknown metric" branch.
 #   metric.lower_is_better (bool)       true = smaller wins (latency);
 #                                       false = larger wins (throughput).
-#   metric.improvement_threshold (float) KEEP only if (best - cand)/best
-#                                       > this. 0.0 keeps any strict
-#                                       improvement; 0.05 requires >5%
-#                                       better.
+#   metric.improvement_threshold (float) KEEP gate.  Unit is PERCENT
+#                                       (NOT a fraction), matching
+#                                       is_improvement's `relative_pct
+#                                       = (best-cand)/|best| * 100`
+#                                       comparison.  Examples:
+#                                         0.0  → any strict improvement keeps
+#                                         2.0  → requires >2 % better
+#                                         5.0  → requires >5 % better
+#                                       Setting 0.05 here means ">0.05 %"
+#                                       — almost any positive improvement.
 # ---------------------------------------------------------------------------
 defaults:
   max_rounds: 30
