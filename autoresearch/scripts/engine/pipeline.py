@@ -149,8 +149,16 @@ def _print_round_summary(t, decision: str, settled_id: str,
     print(get_guidance(t.task_dir))
 
 
-def _run_with_task(t):
-    """Body of pipeline.py inside the Task context manager."""
+def _run_with_task(t) -> int:
+    """Body of pipeline.py inside the Task context manager. Returns rc;
+    does NOT sys.exit. Caller invokes sys.exit(rc) after the with-block
+    so __exit__'s release-on-exception path only fires for genuine
+    failures (raised exceptions), not for normal completion with rc != 0.
+
+    All pipeline-level failures here (quick_check fail, eval crash,
+    settle failure, etc.) return rc instead of raising so the session
+    keeps its ownership claim — the agent will re-edit / retry and the
+    next post_bash hook needs to find the active task."""
     # === Replay-only settle ===
     # open_task already ran replay_intent; if state.pending_settle is
     # non-null after that, a prior round committed history but the
@@ -161,20 +169,22 @@ def _run_with_task(t):
               f"(skipping quick_check/eval/record_round).", flush=True)
         try:
             result = t.settle_round(kd_json)
-        except TaskCorrupted as e:
-            # _run_settle already wrote the stderr banner via
-            # _emit_settle_failure inside Task.settle_round.
-            sys.exit(1)
+        except TaskCorrupted:
+            # _emit_settle_failure already wrote the stderr banner
+            # inside Task.settle_round. The agent can re-run
+            # pipeline.py to re-enter this branch idempotently —
+            # keep claim.
+            return 1
         _print_round_summary(t, kd_json.get("decision", "?"),
                              result["settled_item"] or "?",
                              result["next_phase"])
-        return
+        return 0
 
     # Normal pipeline: quick_check → eval → record → settle.
     config = t.config
     if config is None:
         print("[PIPELINE] ERROR: task.yaml not found")
-        sys.exit(1)
+        return 1
 
     active = t.active_plan_item()
     desc = active["description"] if active else "optimization round"
@@ -203,7 +213,7 @@ def _run_with_task(t):
               f"{json.dumps(blob, ensure_ascii=False)[:200]}")
         print(f"[PIPELINE] Auto-rolled back. Fix and re-edit.")
         print(get_guidance(t.task_dir))
-        return
+        return 0  # rollback is normal pipeline flow — agent will re-edit
 
     print("[PIPELINE] Quick check PASS", flush=True)
 
@@ -215,7 +225,7 @@ def _run_with_task(t):
         t.rollback_edit()
         print(f"[PIPELINE] EVAL ERROR: run_eval raised "
               f"{type(e).__name__}: {e}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     eval_json = {
         "outcome": result.outcome.value,
@@ -242,7 +252,7 @@ def _run_with_task(t):
         print(f"[PIPELINE] INFRA_FAIL: "
               f"{eval_json.get('error', 'no data')}. "
               f"Rolled back, not recording round.", flush=True)
-        return
+        return 0
 
     if not correctness or eval_json.get("error"):
         if eval_json.get("error"):
@@ -260,17 +270,20 @@ def _run_with_task(t):
                              plan_item=plan_item)
     if kd_json.get("decision") == "ERROR":
         print(f"[PIPELINE] KEEP/DISCARD ERROR: {kd_json.get('error')}")
-        sys.exit(1)
+        return 1
     decision = kd_json.get("decision", "FAIL")
 
     # === Step 4 + 5: Settle (advances phase + clears pending) ===
     try:
         result = t.settle_round(kd_json)
     except TaskCorrupted:
-        # banner already printed by Task.settle_round
-        sys.exit(1)
+        # banner already printed by Task.settle_round; keep claim so
+        # the agent's next pipeline.py invocation enters the replay
+        # branch.
+        return 1
     _print_round_summary(t, decision, result["settled_item"] or "?",
                          result["next_phase"])
+    return 0
 
 
 def main():
@@ -280,15 +293,21 @@ def main():
 
     task_dir = os.path.abspath(sys.argv[1])
 
+    # The body returns rc; sys.exit happens AFTER the with-block so
+    # SystemExit from a non-zero normal completion doesn't trip
+    # __exit__'s release-on-exception path (which would unclaim the
+    # task and break the next post_bash hook's get_task_dir()).
+    rc = 1
     try:
         with open_task(task_dir, role=Role.AGENT) as t:
-            _run_with_task(t)
+            rc = _run_with_task(t)
     except TaskConsistencyError as e:
         print(f"[PIPELINE] REFUSING TO RUN — {e}", file=sys.stderr)
-        sys.exit(1)
     except TaskOwnershipError as e:
         print(f"[PIPELINE] cannot run: {e}", file=sys.stderr)
-        sys.exit(2)
+        rc = 2
+
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

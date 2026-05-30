@@ -71,86 +71,101 @@ def main():
 
     # open_task heals (replay_intent) + consistency check + claims
     # ownership. On exception inside the with-block, Task.__exit__
-    # releases the claim — failed runs can't leak ownership.
+    # releases the claim — failed runs can't leak ownership. Normal
+    # completion (any rc) must NOT raise inside the with — sys.exit
+    # raises SystemExit which __exit__ counts as a failure and would
+    # release the claim, breaking the next post_bash hook. The body
+    # is extracted into _run_baseline returning rc; main does
+    # sys.exit(rc) AFTER the with-block ends cleanly.
+    rc = 4  # fallback for caught exceptions
     try:
         with open_task(task_dir, role=Role.AGENT) as t:
-            # Classify pre-run state BEFORE run_eval so non-PROCEED
-            # outcomes don't burn device time. Four outcomes:
-            #   PROCEED      → normal first run; run eval + record.
-            #   ALREADY_DONE → state + body agree; advance phase and
-            #                  exit with the committed outcome's rc.
-            #   ORPHAN_SEED  → body ahead of state; fail loud (eval
-            #                  would silently overwrite the state
-            #                  baseline metric while keeping the
-            #                  orphan row's metric in history).
-            #   MISSING_SEED → state ahead of body; fail loud (eval
-            #                  would write a fresh row whose metrics
-            #                  don't match the committed state).
-            pre = t.baseline_preflight()
-
-            if pre.outcome == BaselinePrecheckOutcome.ALREADY_DONE:
-                # Idempotent: ensure phase advanced past BASELINE,
-                # then exit with the committed outcome's rc.
-                PhaseController(task_dir).on_baseline_settled()
-                rc = baseline_exit_code(task_dir)
-                print(f"[baseline] {pre.detail} (committed outcome → "
-                      f"exit={rc})", file=sys.stderr)
-                sys.exit(rc)
-
-            if pre.outcome in (BaselinePrecheckOutcome.ORPHAN_SEED,
-                                BaselinePrecheckOutcome.MISSING_SEED):
-                print(f"[baseline] FATAL ({pre.outcome.value}): "
-                      f"{pre.detail}", file=sys.stderr)
-                sys.exit(4)
-
-            # PROCEED: run eval + commit.
-            print("[baseline] Running baseline eval...", flush=True)
-            try:
-                result = run_eval(task_dir, t.config,
-                                  device_id=args.device_id,
-                                  worker_urls=worker_urls)
-            except Exception as e:
-                # run_eval is expected to convert its own internal
-                # failures to EvalResult(INFRA_FAIL, ...); reaching
-                # this branch means it raised instead.
-                print(f"[baseline] run_eval raised "
-                      f"{type(e).__name__}: {e}", file=sys.stderr)
-                sys.exit(4)
-
-            eval_data = _eval_result_to_dict(result)
-
-            # Pretty-print structured failure signals (UB overflow,
-            # aivec trap, OOM, correctness mismatch, ...) — mirrors
-            # pipeline.py so the seed-failure → PLAN flow surfaces
-            # the same actionable summary the EDIT loop does.
-            if not eval_data.get("correctness", False) or eval_data.get("error"):
-                if eval_data.get("error"):
-                    print(f"[baseline] Error: {eval_data['error']}",
-                          flush=True)
-                pretty = format_for_stdout(
-                    eval_data.get("failure_signals") or {})
-                if pretty:
-                    print(pretty, flush=True)
-                elif eval_data.get("raw_output_tail"):
-                    print("[baseline] Eval log tail (no structured "
-                          "signals matched):", flush=True)
-                    print(eval_data["raw_output_tail"], flush=True)
-
-            rc = t.record_baseline(eval_data)
-            sys.exit(rc)
+            rc = _run_baseline(task_dir, t, args, worker_urls)
     except TaskConsistencyError as e:
         print(f"[baseline] state inconsistent: {e}", file=sys.stderr)
-        sys.exit(4)
     except TaskOwnershipError as e:
         print(f"[baseline] cannot run: {e}", file=sys.stderr)
-        sys.exit(2)
+        rc = 2
     except TaskCorrupted as e:
-        # Defensive: record_baseline raises if misused (non-PROCEED
-        # outcome or empty eval_data). Should be unreachable after the
-        # preflight dispatch above; reaching here means the dispatch
-        # has a bug worth surfacing.
+        # ORPHAN_SEED / MISSING_SEED raise here (caller-flagged
+        # corruption); __exit__ released claim. Defensive: also
+        # catches a misused record_baseline call (non-PROCEED outcome
+        # or empty eval_data), which would be a bug in the dispatch.
         print(f"[baseline] FATAL: {e}", file=sys.stderr)
-        sys.exit(4)
+
+    sys.exit(rc)
+
+
+def _run_baseline(task_dir: str, t, args, worker_urls) -> int:
+    """Body of baseline.py main. Returns rc; does NOT sys.exit. Caller
+    invokes sys.exit(rc) after the with-block ends, so __exit__'s
+    release-on-exception path only fires for genuine failures (raises),
+    not for normal completion with rc != 0.
+
+    Classify pre-run state BEFORE run_eval so non-PROCEED outcomes
+    don't burn device time. Four outcomes:
+      PROCEED      → normal first run; run eval + record.
+      ALREADY_DONE → state + body agree; advance phase, return
+                     committed outcome's rc.
+      ORPHAN_SEED  → body ahead of state; raise TaskCorrupted (eval
+                     would silently overwrite the state metric while
+                     keeping the orphan row's metric in history).
+      MISSING_SEED → state ahead of body; raise TaskCorrupted (eval
+                     would write a fresh row whose metrics don't
+                     match the committed state).
+    """
+    pre = t.baseline_preflight()
+
+    if pre.outcome == BaselinePrecheckOutcome.ALREADY_DONE:
+        # Idempotent: ensure phase advanced past BASELINE, return rc
+        # mapped from the committed outcome.
+        PhaseController(task_dir).on_baseline_settled()
+        rc = baseline_exit_code(task_dir)
+        print(f"[baseline] {pre.detail} (committed outcome → "
+              f"exit={rc})", file=sys.stderr)
+        return rc
+
+    if pre.outcome in (BaselinePrecheckOutcome.ORPHAN_SEED,
+                       BaselinePrecheckOutcome.MISSING_SEED):
+        # Raise so __exit__ releases the claim — genuine corruption
+        # the operator must inspect, no further work in this session.
+        raise TaskCorrupted(f"({pre.outcome.value}): {pre.detail}")
+
+    # PROCEED: run eval + commit.
+    print("[baseline] Running baseline eval...", flush=True)
+    try:
+        result = run_eval(task_dir, t.config,
+                          device_id=args.device_id,
+                          worker_urls=worker_urls)
+    except Exception as e:
+        # run_eval is expected to convert internal failures to
+        # EvalResult(INFRA_FAIL, ...); reaching here means it raised.
+        # Not Task-body failure per se (env / device issue) — return
+        # rc=4 so the agent session can retry baseline. Keep claim.
+        print(f"[baseline] run_eval raised "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return 4
+
+    eval_data = _eval_result_to_dict(result)
+
+    # Pretty-print structured failure signals (UB overflow, aivec
+    # trap, OOM, correctness mismatch, ...) — mirrors pipeline.py so
+    # the seed-failure → PLAN flow surfaces the same actionable
+    # summary the EDIT loop does.
+    if not eval_data.get("correctness", False) or eval_data.get("error"):
+        if eval_data.get("error"):
+            print(f"[baseline] Error: {eval_data['error']}",
+                  flush=True)
+        pretty = format_for_stdout(
+            eval_data.get("failure_signals") or {})
+        if pretty:
+            print(pretty, flush=True)
+        elif eval_data.get("raw_output_tail"):
+            print("[baseline] Eval log tail (no structured "
+                  "signals matched):", flush=True)
+            print(eval_data["raw_output_tail"], flush=True)
+
+    return t.record_baseline(eval_data)
 
 
 if __name__ == "__main__":

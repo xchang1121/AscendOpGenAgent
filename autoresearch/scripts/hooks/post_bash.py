@@ -228,56 +228,67 @@ def main():
         emit_todowrite_context(task_dir, f"[AR] Round settled. Phase -> {new_phase}.")
 
     elif invoked == "create_plan.py" and phase in (PLAN, DIAGNOSE, REPLAN, EDIT):
-        # PLAN/DIAGNOSE/REPLAN: normal plan-creation flow.
-        # EDIT: only legal as a recovery path when settle kept failing
-        # on a malformed plan.md (gated in hooks/guard_bash by
-        # state.pending_settle being non-null). The new plan retires
-        # the broken plan_version, so the orphan kd_json is no longer
-        # actionable; clear it as part of the post-create_plan
-        # transition.
-        from phase_machine import validate_plan
-        from task_handle import (
-            open_task as _open_task, Role as _Role,
-            TaskConsistencyError as _Consistency,
-            TaskOwnershipError as _Ownership,
-        )
-        try:
-            with _open_task(task_dir, role=_Role.AGENT) as t:
-                pending = t.pending_settle
-                if phase == EDIT and not pending:
-                    # Defense-in-depth: guard_bash should have blocked
-                    # this, but if it slipped through, refuse.
-                    emit_status("[AR] create_plan.py in EDIT phase "
-                                "requires a pending settle recovery "
-                                "state; nothing to do.")
-                    sys.exit(0)
-                ok, err = validate_plan(task_dir)
-                if not ok:
-                    emit_status(f"[AR] Plan not valid yet: {err}")
-                    sys.exit(0)
-                _reset_failures_for_diagnose(task_dir, phase)
-                t.advance_on_plan_validated()
-                if phase == EDIT:
-                    # Recovery completed: discard the orphan kd_json.
-                    t.clear_pending_settle()
-                    emit_status(f"[AR] Pending settle abandoned; new "
-                                f"plan installed. Phase -> EDIT. "
-                                f"{get_guidance(task_dir)}")
-                else:
-                    emit_status(f"[AR] Plan validated. Phase -> EDIT. "
-                                f"{get_guidance(task_dir)}")
-                emit_todowrite_context(
-                    task_dir, "[AR] Plan validated. Phase -> EDIT.")
-        except _Consistency as e:
-            emit_status(
-                f"[AR] state.json and plan.md/history.jsonl are out "
-                f"of sync: {e}. Re-run create_plan.py with the same "
-                f"XML — replay_intent at the next open_task will "
-                f"reconcile.")
-        except _Ownership as e:
-            emit_status(f"[AR] post_bash: cannot advance — {e}")
+        _handle_post_create_plan(task_dir, phase)
 
     sys.exit(0)
+
+
+def _handle_post_create_plan(task_dir: str, phase: str) -> None:
+    """create_plan completion handler. Extracted into its own function
+    so the "nothing to do" early-out paths can use `return` instead of
+    sys.exit(0) — sys.exit raises SystemExit which Task.__exit__ counts
+    as a failure and would release the claim, leaving subsequent
+    hooks with no active task.
+
+    PLAN/DIAGNOSE/REPLAN: normal plan-creation flow.
+    EDIT: only legal as a recovery path when settle kept failing on a
+    malformed plan.md (gated in hooks/guard_bash by state.pending_
+    settle being non-null). The new plan retires the broken
+    plan_version, so the orphan kd_json is no longer actionable;
+    clear it as part of the post-create_plan transition.
+    """
+    from phase_machine import validate_plan
+    from task_handle import (
+        open_task as _open_task, Role as _Role,
+        TaskConsistencyError as _Consistency,
+        TaskOwnershipError as _Ownership,
+    )
+    try:
+        with _open_task(task_dir, role=_Role.AGENT) as t:
+            pending = t.pending_settle
+            if phase == EDIT and not pending:
+                # Defense-in-depth: guard_bash should have blocked
+                # this, but if it slipped through, refuse cleanly
+                # (no claim release).
+                emit_status("[AR] create_plan.py in EDIT phase "
+                            "requires a pending settle recovery "
+                            "state; nothing to do.")
+                return
+            ok, err = validate_plan(task_dir)
+            if not ok:
+                emit_status(f"[AR] Plan not valid yet: {err}")
+                return
+            _reset_failures_for_diagnose(task_dir, phase)
+            t.advance_on_plan_validated()
+            if phase == EDIT:
+                # Recovery completed: discard the orphan kd_json.
+                t.clear_pending_settle()
+                emit_status(f"[AR] Pending settle abandoned; new "
+                            f"plan installed. Phase -> EDIT. "
+                            f"{get_guidance(task_dir)}")
+            else:
+                emit_status(f"[AR] Plan validated. Phase -> EDIT. "
+                            f"{get_guidance(task_dir)}")
+            emit_todowrite_context(
+                task_dir, "[AR] Plan validated. Phase -> EDIT.")
+    except _Consistency as e:
+        emit_status(
+            f"[AR] state.json and plan.md/history.jsonl are out "
+            f"of sync: {e}. Re-run create_plan.py with the same "
+            f"XML — replay_intent at the next open_task will "
+            f"reconcile.")
+    except _Ownership as e:
+        emit_status(f"[AR] post_bash: cannot advance — {e}")
 
 
 def _print_resume_context(task_dir: str):

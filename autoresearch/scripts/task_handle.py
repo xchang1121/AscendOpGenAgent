@@ -56,6 +56,40 @@ don't run transactions; they call ``get_task_dir`` + ``read_phase`` +
 post_bash._handle_activation (transactional: claim + advance phase)
 and post_bash main's create_plan branch (transactional: validate +
 advance) — DO open a Task.
+
+Caller pattern: do NOT sys.exit inside the with-block
+=====================================================
+__exit__ releases ownership on exception. ``sys.exit(rc)`` raises
+``SystemExit``, which is an exception — so a script that uses
+``sys.exit(rc)`` inside the with-block to express NORMAL completion
+(rc=0 success, rc=4 INFRA_FAIL, etc.) would unclaim the task. The
+next post_bash hook would then call ``get_task_dir()`` and find
+nothing, dropping every subsequent phase guidance / todo / status
+emission.
+
+The contract for entry scripts:
+
+  def main():
+      rc = 1  # fallback for caught open_task exceptions
+      try:
+          with open_task(td, role=AGENT) as t:
+              rc = _do_work(t)   # _do_work RETURNS rc, never sys.exit
+      except (TaskConsistencyError, TaskOwnershipError) as e:
+          ...
+      sys.exit(rc)  # AFTER the with-block — claim already kept
+
+  def _do_work(t) -> int:
+      # Genuine failures that should release the claim: RAISE.
+      # Normal completion (any rc): RETURN.
+      if must_stop:
+          raise TaskCorrupted(...)   # __exit__ releases claim
+      return 4                       # __exit__ keeps claim
+
+This split is the load-bearing rule: ``return rc`` means "I'm done,
+keep my ownership"; ``raise`` means "I failed, drop my ownership."
+resume.py is the one entry that intentionally uses ``sys.exit(1)``
+inside the with-block — that's the validation-failure path where
+ownership release IS the right outcome.
 """
 from __future__ import annotations
 
