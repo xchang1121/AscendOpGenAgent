@@ -10,7 +10,8 @@ from typing import Any, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from phase_machine import (  # noqa: E402
-    Progress, append_history, auto_rollback, load_progress, save_progress,
+    Progress, append_history, auto_rollback, load_progress,
+    pending_settle_path, save_progress,
 )
 from task_config import (  # noqa: E402
     EvalOutcome, EvalResult, check_constraints, is_improvement,
@@ -160,10 +161,29 @@ def record_round(task_dir: str, eval_data: dict,
             hist["raw_output_tail"] = tail[-1500:]
     append_history(task_dir, hist)
 
-    return {
+    kd_json = {
         "decision": decision,
         "best_metric": progress.best_metric,
         "eval_rounds": round_num,
         "max_rounds": progress.max_rounds or config.max_rounds,
         "consecutive_failures": progress.consecutive_failures,
     }
+
+    # Persist the kd_json as the pending-settle sentinel BEFORE
+    # returning. Closes the previously-open crash window between this
+    # function returning and pipeline.py's settle call: if SIGKILL hits
+    # there, history.jsonl + progress.json are already advanced but
+    # plan.md is not, and without a sentinel the next pipeline.py run
+    # re-evaluates the same plan item, duplicating the history row and
+    # over-bumping eval_rounds. With the sentinel, pipeline.py's
+    # replay-only branch deterministically retries settle alone.
+    # pipeline.py clears the sentinel on settle success.
+    import json as _json
+    pending = pending_settle_path(task_dir)
+    os.makedirs(os.path.dirname(pending), exist_ok=True)
+    tmp = pending + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(kd_json, f)
+    os.replace(tmp, pending)
+
+    return kd_json

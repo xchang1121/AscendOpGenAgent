@@ -67,13 +67,6 @@ def _run_settle(task_dir: str, kd_json: dict) -> tuple:
         return False, f"{type(exc).__name__}: {exc}", None
 
 
-def _persist_pending_settle(task_dir: str, kd_json: dict) -> None:
-    path = pending_settle_path(task_dir)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(sanitize_floats(kd_json), f)
-
-
 def _clear_pending_settle(task_dir: str) -> None:
     path = pending_settle_path(task_dir)
     if os.path.exists(path):
@@ -311,14 +304,14 @@ def main():
     decision = kd_json.get("decision", "FAIL")
 
     # === Step 4: Settle (update plan.md) ===
-    # progress.json + history.jsonl were already mutated by record_round;
-    # plan.md is the only state piece settle.py owns. If settle fails, the
-    # kd_json is persisted to .pending_settle.json so the NEXT invocation
-    # of pipeline.py retries settle alone (no second eval, no duplicate
-    # history row). The advance-phase block is gated on settle success.
+    # progress.json + history.jsonl were already mutated by record_round,
+    # which also wrote .pending_settle.json (the kd_json sentinel) as its
+    # last act — so any crash between here and _clear_pending_settle is
+    # recoverable via pipeline.py's replay-only top-of-main branch (re-
+    # run pipeline.py, no quick_check/eval/record_round redo). plan.md
+    # is the only state piece settle owns.
     ok, error_tail, _settle_json = _run_settle(task_dir, kd_json)
     if not ok:
-        _persist_pending_settle(task_dir, kd_json)
         _emit_settle_failure(task_dir, error_tail)
         sys.exit(1)
     _clear_pending_settle(task_dir)
