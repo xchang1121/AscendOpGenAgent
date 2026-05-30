@@ -239,13 +239,28 @@ def read_task_state(task_dir: Path) -> dict:
 
 
 def read_phase(task_dir: Path) -> str:
+    """Read .phase via phase_machine so the on-disk format (currently
+    `PHASE|<txn>`, formerly plain `PHASE`) has a single owner — same
+    rationale as resume.py. Was a duplicate raw read that didn't
+    learn the `|<txn>` suffix added by the .txn refactor and so
+    returned `FINISH|9` instead of `FINISH`, which then failed the
+    `phase == "FINISH"` op-completion check in run.py and marked
+    every legitimate done op as an error."""
     pf = task_dir / ".ar_state" / ".phase"
-    if pf.exists():
-        try:
-            return pf.read_text(encoding="utf-8").strip() or "UNKNOWN"
-        except OSError:
-            pass
-    return "UNKNOWN"
+    if not pf.exists():
+        return "UNKNOWN"
+    # phase_machine.read_phase expects a str path, not Path; and it
+    # falls back to INIT on unparseable content. UNKNOWN preserves
+    # this module's historical contract — callers (run.py, monitor)
+    # treat both INIT and UNKNOWN as "not done yet", so the mapping
+    # is safe.
+    import sys as _sys, os as _os
+    _scripts = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _scripts not in _sys.path:
+        _sys.path.insert(0, _scripts)
+    from phase_machine import read_phase as _pm_read_phase, INIT
+    phase = _pm_read_phase(str(task_dir))
+    return "UNKNOWN" if phase == INIT else phase
 
 
 def repo_root() -> Path:
@@ -388,13 +403,19 @@ def find_running_case_task_dir(batch_dir: Path) -> Path | None:
     running.sort(key=lambda kv: kv[1].get("started_at", ""), reverse=True)
     op, case = running[0]
 
-    pointer = repo_root() / ".active_task"
-    if pointer.is_file():
-        try:
-            td = Path(pointer.read_text(encoding="utf-8").strip())
-        except OSError:
-            td = None
-        if td is not None and td.is_dir() and task_dir_belongs_to_op(td.name, op):
+    # Route through phase_machine.get_task_dir — the .active_task
+    # format owner (today JSON ownership record, formerly bare
+    # path text). Reading the file raw would treat the JSON as a
+    # path and fail; same bypass class as the .phase regression.
+    import sys as _sys, os as _os
+    _scripts = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _scripts not in _sys.path:
+        _sys.path.insert(0, _scripts)
+    from phase_machine import get_task_dir as _pm_get_task_dir
+    pointed = _pm_get_task_dir()
+    if pointed:
+        td = Path(pointed)
+        if td.is_dir() and task_dir_belongs_to_op(td.name, op):
             return td
 
     # run.py's stdout-parsed record: usable when claude has flushed.

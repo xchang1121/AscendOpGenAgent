@@ -49,6 +49,7 @@ from .state_store import (
     # `stale` / `extra` files) instead of silently corrupting state.
     TXN_FILE,
     begin_txn, commit_txn, read_txn, check_txn_consistency,
+    format_inconsistency_message, require_consistent_state,
 )
 from .validators import (
     # validate_kernel + validate_diagnose were re-exported here for a

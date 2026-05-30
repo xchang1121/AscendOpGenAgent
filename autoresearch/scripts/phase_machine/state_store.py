@@ -614,6 +614,70 @@ def _path_for(task_dir: str, file_label: str) -> str:
     return mapping.get(file_label, "")
 
 
+def format_inconsistency_message(report: dict) -> str:
+    """Render a check_txn_consistency report into a recovery message
+    naming which body files are ahead of commit, who the writer was,
+    and what to do. Used by require_consistent_state below and by
+    activation hooks that surface the diagnostic to the operator."""
+    if report["consistent"]:
+        return ""
+    extras = ", ".join(report["extra"]) or "<none>"
+    by = report.get("by") or "<unknown>"
+    cur = report["current_txn"]
+    # Concrete recovery hint per file kind. Each file's writer is
+    # responsible for the txn that tagged it — re-running that writer
+    # with the same input is idempotent because tmp + os.replace +
+    # commit_txn semantics ensure retries converge.
+    hints = []
+    for f in report["extra"]:
+        if f == "plan.md" or f == "progress.json":
+            hints.append("create_plan.py with the same XML input "
+                         "(plan + progress writes converge)")
+        elif f == "history.jsonl":
+            hints.append("pipeline.py — the .pending_settle.json "
+                         "replay branch retries settle alone")
+        elif f == ".phase":
+            hints.append("re-run whichever script the prior "
+                         f"transaction was driving ('by'={by})")
+        elif f == ".pending_settle.json":
+            hints.append("pipeline.py — its top-of-main branch "
+                         "auto-detects pending_settle.json and replays")
+    hint_block = "\n  - " + "\n  - ".join(hints) if hints else ""
+    return (
+        f".ar_state crashed mid-transaction. committed_txn={cur} "
+        f"(by={by!r}); body files tagged with a NEWER id: {extras}. "
+        f"This means the writer landed body bytes but commit_txn() "
+        f"never ran — pipeline / create_plan / baseline must converge "
+        f"the .txn marker before downstream readers can trust state.\n"
+        f"Recovery options:{hint_block}\n"
+        f"Or, if you've manually verified the state is fine, write a "
+        f"fresh `.ar_state/.txn` with the matching id to acknowledge "
+        f"(NOT recommended unless you understand what shipped)."
+    )
+
+
+def require_consistent_state(task_dir: str,
+                             *, on_inconsistent="raise") -> dict:
+    """Cross-file consistency gate for callers that must NOT advance
+    on inconsistent state (activation hooks, resume.py). Returns the
+    full report on success. On inconsistency:
+
+      - on_inconsistent="raise" (default): raise RuntimeError with
+        the recovery message. Caller's transcript already shows the
+        exception trace; this is the fail-loud path for pipelines.
+      - on_inconsistent="report":           return the report; caller
+        inspects `.consistent` and decides what to do. Use when the
+        caller needs to surface its own framing (hook stderr,
+        emit_status).
+    """
+    report = check_txn_consistency(task_dir)
+    if report["consistent"]:
+        return report
+    if on_inconsistent == "raise":
+        raise RuntimeError(format_inconsistency_message(report))
+    return report
+
+
 def find_active_task_dir() -> Optional[str]:
     """Single source of truth for "which task is currently active".
 

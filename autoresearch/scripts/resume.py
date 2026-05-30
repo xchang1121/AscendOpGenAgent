@@ -39,13 +39,24 @@ def _validate(task_dir: str) -> tuple[bool, str]:
     if missing:
         return False, f"progress.json missing fields: {missing} (incompatible version)"
 
-    # Validate .phase if present
+    # Validate .phase if present. Go through phase_machine.read_phase
+    # — it owns the on-disk format (today `PHASE|<txn>`, formerly
+    # `PHASE`) and the corrupt-content handling. Reading raw here
+    # would re-parse the format incorrectly the next time the writer
+    # side evolves (which already happened once: the .txn refactor
+    # added the `|<txn>` suffix and this bypass would have rejected
+    # every fresh task as "Unknown phase 'EDIT|7'").
     phase_file = state_path(task_dir, ".phase")
     if os.path.exists(phase_file):
-        with open(phase_file, "r") as f:
-            phase = f.read().strip()
-        if phase not in ALL_PHASES:
-            return False, f"Unknown phase '{phase}' in .phase file (incompatible version)"
+        from phase_machine import read_phase, INIT
+        phase = read_phase(task_dir)
+        # read_phase falls back to INIT on corrupt content (with a
+        # stderr warning); INIT here means the file existed but was
+        # unparseable, which is the same incompatible-version signal
+        # the old check produced.
+        if phase == INIT:
+            return False, ("Unparseable .phase file (read_phase fell "
+                           "back to INIT — see stderr for details)")
 
     # Validate plan.md if present. A fully-consumed plan (0 pending) is legal —
     # compute_resume_phase routes it to REPLAN. validate_plan would reject it
@@ -55,6 +66,21 @@ def _validate(task_dir: str) -> tuple[bool, str]:
         ok, err = validate_plan(task_dir)
         if not ok:
             return False, f"plan.md invalid: {err}"
+
+    # Cross-file txn consistency gate — see post_bash._handle_activation
+    # for the rationale. resume must NOT attach to a task with an
+    # in-flight transaction (extra body files not yet committed); the
+    # operator needs to re-run the original writer to converge first.
+    # Pending-settle-only inconsistency is allowed: pipeline.py's
+    # replay branch is the convergence path.
+    from phase_machine import (
+        require_consistent_state as _require,
+        format_inconsistency_message as _fmt_inconsistency,
+    )
+    rep = _require(task_dir, on_inconsistent="report")
+    if not rep["consistent"]:
+        if set(rep["extra"]) != {".pending_settle.json"}:
+            return False, _fmt_inconsistency(rep)
 
     return True, ""
 
@@ -123,8 +149,11 @@ def main():
     print(f"[resume] Best: {progress.get('best_metric')} | Baseline: {progress.get('baseline_metric')}")
     phase_file = state_path(task_dir, ".phase")
     if os.path.exists(phase_file):
-        with open(phase_file) as f:
-            print(f"[resume] Phase: {f.read().strip()}")
+        # Same reason as the validator above — go through read_phase
+        # so the displayed string is the phase NAME, not the raw
+        # `PHASE|<txn>` on-disk form.
+        from phase_machine import read_phase
+        print(f"[resume] Phase: {read_phase(task_dir)}")
 
     # Print task_dir on last line (for easy parsing)
     print(task_dir)

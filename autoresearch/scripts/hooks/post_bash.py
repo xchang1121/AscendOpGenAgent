@@ -106,33 +106,34 @@ def _handle_activation(new_task_dir: str):
 
     pc = PhaseController(new_task_dir)
     if has_phase:
-        # Cross-file txn consistency: if a previous transaction's body
-        # files landed (progress.json/history.jsonl/plan.md/.phase/
-        # .pending_settle.json tagged with a newer _txn_id than .txn
-        # records as committed), some writer crashed between body
-        # writes and commit. Surface this loudly — silent advance
-        # would let the agent compute next steps from inconsistent
-        # state. Don't auto-fix; the operator picks the recovery path
-        # (typically: re-run the script named in .extra[0]'s writer,
-        # or pipeline.py's replay branch for pending_settle).
-        from phase_machine import check_txn_consistency as _check
+        # Cross-file txn consistency gate. If the previous writer
+        # landed body bytes but commit_txn() never ran, ANY downstream
+        # logic from here on (compute_resume_phase, guidance,
+        # PhaseController transitions) is computed from inconsistent
+        # state. We previously only warned and advanced anyway —
+        # that was detect-not-enforce. Now: refuse to advance, hand
+        # the operator a concrete recovery message, exit.
+        #
+        # The .pending_settle.json branch in pipeline.py's top-of-
+        # main handles ITS specific crash window automatically (next
+        # pipeline.py invocation replays settle); for that case we
+        # don't want to block here, because the pending sentinel IS
+        # the recovery mechanism. So treat "only .pending_settle.json
+        # is extra" as an allowed pending-replay state.
+        from phase_machine import (
+            require_consistent_state as _require,
+            format_inconsistency_message as _fmt_inconsistency,
+        )
         try:
-            rep = _check(new_task_dir)
+            rep = _require(new_task_dir, on_inconsistent="report")
         except Exception:
             rep = None
         if rep is not None and not rep["consistent"]:
-            extras = ", ".join(rep["extra"]) or "<none>"
-            emit_status(
-                f"[AR] WARNING: .ar_state crashed mid-transaction. "
-                f"committed_txn={rep['current_txn']}, extra body files "
-                f"tagged with a newer id: {extras}. The previous writer "
-                f"(check pipeline.py's replay-only branch, or re-run "
-                f"create_plan.py / baseline.py per which file is extra) "
-                f"likely died between writing the body and committing "
-                f"the marker. Pipeline replay handles pending_settle.json "
-                f"automatically; for plan.md / .phase / progress.json "
-                f"alone, re-run the same script with the same input to "
-                f"reconverge.")
+            extras = set(rep["extra"])
+            pending_only = extras == {".pending_settle.json"}
+            if not pending_only:
+                emit_status("[AR] " + _fmt_inconsistency(rep))
+                return
         phase = read_phase(new_task_dir)
         # Stale-planning recovery: phase file says PLAN or REPLAN but
         # plan.md + progress.json show a validated plan with an active
