@@ -195,21 +195,36 @@ class Task:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        # We do NOT clear intent on exception — that's the journal's
-        # whole point: the NEXT caller's replay finishes what we
-        # started. Individual transaction methods (record_baseline,
-        # record_round, settle_round, commit_plan) clear their own
-        # intent on success and leave it on failure.
+        # Journal and ownership are ORTHOGONAL concerns; __exit__
+        # handles them independently.
         #
-        # We also do NOT release ownership on clean exit. The agent
-        # session continues to own the task until either:
-        #   - the agent explicitly calls t.release()
-        #   - the heartbeat goes stale (process died)
-        #   - the next set_task_dir from this session releases the
-        #     prior task (single-task-per-session invariant)
-        # That matches the prior behaviour of set_task_dir / clear_
-        # active_task and keeps hooks like guard_bash from seeing
-        # "owner=None" on a still-running session.
+        # Journal (intent.json): NEVER touched here. Body bytes +
+        # intent.json are the recovery mechanism — the next caller's
+        # replay_intent at open_task heals whatever we left. Individual
+        # transaction methods (record_baseline, record_round,
+        # settle_round, commit_plan) clear their own intent on success;
+        # the leftover-on-exception state is the journal doing its job.
+        #
+        # Ownership (state.owner): released on exception, kept on
+        # clean exit. Earlier the contract was "never release on exit"
+        # — but that was the ownership and journal concerns tangled
+        # into one rule. The journal doesn't need ownership to replay
+        # (it's file-based), and a Task body that raised is by
+        # definition unable to follow through; freeing the claim lets
+        # the next caller (manual retry, --resume from another
+        # session, supervisor re-run) take over without --force. Clean
+        # exit keeps the claim so subsequent in-session subprocesses
+        # see "owner = us" via get_task_dir.
+        if exc_type is not None and self._claimed:
+            try:
+                clear_active_task(expected_task_dir=self.task_dir)
+            except Exception:
+                # Release is best-effort. If state.json is unreadable
+                # at this point the next caller will see a stale
+                # owner + stale heartbeat (which goes cold quickly);
+                # not worth crashing on top of an existing exception.
+                pass
+            self._claimed = False
         return False  # don't suppress
 
     # ---- Read properties / accessors ------------------------------------
@@ -294,28 +309,61 @@ class Task:
     # All journal+body+commit sequences live here. Callers never
     # touch write_intent / append_history / save_state directly.
 
-    def record_baseline(self, eval_data: dict) -> int:
-        """Full baseline transaction. Returns the engine-baseline exit
-        code (0 / 4 per _EXIT_FOR).
+    def baseline_preflight(self):
+        """Read-only classification of the baseline transaction's
+        pre-run state. Returns a BaselinePrecheck (outcome + detail).
+        Pure read after replay — call this BEFORE expensive work
+        (run_eval) to decide whether to skip, fail, or proceed.
 
-        precheck_baseline already ran (inside require_state_consistency
-        at __enter__) — but replay isn't equivalent to precheck: replay
-        rebuilds state from intent, precheck decides what action to
-        take. Re-call precheck here so the three outcomes
-        (ALREADY_DONE / ORPHAN_SEED / PROCEED) get expressed as exit
-        codes / exceptions.
+        The classify/act split exists because run_eval is expensive
+        (device time, worker round-trip). If preflight returns
+        ALREADY_DONE / ORPHAN_SEED / MISSING_SEED the caller should
+        NOT call run_eval; bundling preflight into record_baseline
+        used to force callers either to pay the eval cost just to
+        learn the outcome, or to invoke record_baseline with empty
+        eval_data as a backdoor.
         """
         self._require_entered()
+        return precheck_baseline(self.task_dir)
+
+    def record_baseline(self, eval_data: dict) -> int:
+        """Commit the baseline transaction (journal → SEED row →
+        state → clear journal → phase transition). Returns the
+        engine-baseline exit code (0 / 4 per _EXIT_FOR).
+
+        Refuses non-PROCEED preflight outcomes (ALREADY_DONE /
+        ORPHAN_SEED / MISSING_SEED) — the caller MUST inspect
+        baseline_preflight() first and dispatch on the outcome. This
+        defensive gate keeps record_baseline as a pure commit: it
+        doesn't decide whether to act, it just acts.
+
+        Refuses empty / structurally-incomplete eval_data — earlier
+        engine/baseline.py would pass `{}` as a fast-path signal,
+        which silently routed through reduce_baseline_init and wrote
+        null metrics into state. The contract here is: eval_data MUST
+        be the dict shape engine.baseline._eval_result_to_dict
+        produces (outcome + correctness + metrics keys at minimum).
+        """
+        self._require_entered()
+        # Defensive: refuse misuse. ALREADY_DONE etc. are caller
+        # responsibility — see baseline_preflight().
         pre = precheck_baseline(self.task_dir)
-        if pre.outcome == BaselinePrecheckOutcome.ALREADY_DONE:
-            # Idempotent: the prior commit's outcome decides the rc.
-            # on_baseline_settled is also idempotent.
-            self._phase_controller().on_baseline_settled()
-            return baseline_exit_code(self.task_dir)
-        if pre.outcome == BaselinePrecheckOutcome.ORPHAN_SEED:
-            raise TaskCorrupted(pre.detail)
-        # PROCEED: run the transaction. run_baseline_init owns the
-        # journal+history+state sequence + phase transition + the
+        if pre.outcome != BaselinePrecheckOutcome.PROCEED:
+            raise TaskCorrupted(
+                f"record_baseline called with preflight outcome "
+                f"{pre.outcome.value!r}: {pre.detail} Caller must "
+                f"branch on baseline_preflight() and only call "
+                f"record_baseline on PROCEED.")
+        # Defensive: real eval_data required. The minimal shape is
+        # what _eval_result_to_dict produces; absence of `outcome` is
+        # the cheap discriminator for "empty / placeholder dict".
+        if not isinstance(eval_data, dict) or "outcome" not in eval_data:
+            raise TaskCorrupted(
+                f"record_baseline requires a real eval_data dict "
+                f"(outcome / correctness / metrics). Got: "
+                f"{type(eval_data).__name__} with keys "
+                f"{sorted(eval_data) if isinstance(eval_data, dict) else '<n/a>'}.")
+        # run_baseline_init owns journal + history + state + phase +
         # outcome→rc mapping.
         return run_baseline_init(self.task_dir, eval_data)
 

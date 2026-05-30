@@ -25,6 +25,8 @@ from task_handle import (
     open_task, Role,
     TaskCorrupted, TaskConsistencyError, TaskOwnershipError,
 )
+from workflow.baseline import BaselinePrecheckOutcome, baseline_exit_code
+from workflow.transition import PhaseController
 
 
 def _eval_result_to_dict(result) -> dict:
@@ -68,23 +70,40 @@ def main():
         worker_urls = [u.strip() for u in args.worker_url.split(",") if u.strip()]
 
     # open_task heals (replay_intent) + consistency check + claims
-    # ownership. The retry guard (ALREADY_DONE / ORPHAN_SEED / PROCEED)
-    # lives inside Task.record_baseline; this keeps the precheck's
-    # "don't re-eval; map prior outcome to rc" path single-owner.
+    # ownership. On exception inside the with-block, Task.__exit__
+    # releases the claim — failed runs can't leak ownership.
     try:
         with open_task(task_dir, role=Role.AGENT) as t:
-            # ALREADY_DONE returns the committed outcome's exit code
-            # without running eval; ORPHAN_SEED raises TaskCorrupted.
-            # PROCEED runs the eval + record_baseline transaction.
-            if t.progress_initialized:
-                # Idempotent fast-path — Task.record_baseline will
-                # also detect ALREADY_DONE, but checking here lets us
-                # skip run_eval entirely without re-loading state.
-                rc = t.record_baseline({})
-                print(f"[baseline] already committed; exit={rc}",
-                      file=sys.stderr)
+            # Classify pre-run state BEFORE run_eval so non-PROCEED
+            # outcomes don't burn device time. Four outcomes:
+            #   PROCEED      → normal first run; run eval + record.
+            #   ALREADY_DONE → state + body agree; advance phase and
+            #                  exit with the committed outcome's rc.
+            #   ORPHAN_SEED  → body ahead of state; fail loud (eval
+            #                  would silently overwrite the state
+            #                  baseline metric while keeping the
+            #                  orphan row's metric in history).
+            #   MISSING_SEED → state ahead of body; fail loud (eval
+            #                  would write a fresh row whose metrics
+            #                  don't match the committed state).
+            pre = t.baseline_preflight()
+
+            if pre.outcome == BaselinePrecheckOutcome.ALREADY_DONE:
+                # Idempotent: ensure phase advanced past BASELINE,
+                # then exit with the committed outcome's rc.
+                PhaseController(task_dir).on_baseline_settled()
+                rc = baseline_exit_code(task_dir)
+                print(f"[baseline] {pre.detail} (committed outcome → "
+                      f"exit={rc})", file=sys.stderr)
                 sys.exit(rc)
 
+            if pre.outcome in (BaselinePrecheckOutcome.ORPHAN_SEED,
+                                BaselinePrecheckOutcome.MISSING_SEED):
+                print(f"[baseline] FATAL ({pre.outcome.value}): "
+                      f"{pre.detail}", file=sys.stderr)
+                sys.exit(4)
+
+            # PROCEED: run eval + commit.
             print("[baseline] Running baseline eval...", flush=True)
             try:
                 result = run_eval(task_dir, t.config,
@@ -119,18 +138,19 @@ def main():
 
             rc = t.record_baseline(eval_data)
             sys.exit(rc)
-    except TaskCorrupted as e:
-        # ORPHAN_SEED is the main case here: history.jsonl carries a
-        # SEED row but state.progress_initialized is False AND no
-        # journal — would silently overwrite metrics if we re-evaluated.
-        print(f"[baseline] FATAL: {e}", file=sys.stderr)
-        sys.exit(4)
     except TaskConsistencyError as e:
         print(f"[baseline] state inconsistent: {e}", file=sys.stderr)
         sys.exit(4)
     except TaskOwnershipError as e:
         print(f"[baseline] cannot run: {e}", file=sys.stderr)
         sys.exit(2)
+    except TaskCorrupted as e:
+        # Defensive: record_baseline raises if misused (non-PROCEED
+        # outcome or empty eval_data). Should be unreachable after the
+        # preflight dispatch above; reaching here means the dispatch
+        # has a bug worth surfacing.
+        print(f"[baseline] FATAL: {e}", file=sys.stderr)
+        sys.exit(4)
 
 
 if __name__ == "__main__":

@@ -43,9 +43,10 @@ from .transition import PhaseController
 # when the first one's row is already on disk.
 
 class BaselinePrecheckOutcome(Enum):
-    PROCEED      = "proceed"
-    ALREADY_DONE = "already_done"
-    ORPHAN_SEED  = "orphan_seed"
+    PROCEED      = "proceed"        # no body, no state — run eval fresh
+    ALREADY_DONE = "already_done"   # state + body agree on a prior commit
+    ORPHAN_SEED  = "orphan_seed"    # body ahead of state, no journal
+    MISSING_SEED = "missing_seed"   # state ahead of body, no journal
 
 
 class BaselinePrecheck(NamedTuple):
@@ -54,21 +55,32 @@ class BaselinePrecheck(NamedTuple):
 
 
 def precheck_baseline(task_dir: str) -> BaselinePrecheck:
-    """Decide whether engine/baseline.py needs to run a fresh eval.
+    """Classify the baseline transaction's pre-run state. Pure read
+    after replay — the caller decides whether to act on the outcome.
+    Does NOT mutate state beyond the replay heal.
 
     Always runs replay_intent first so any in-flight baseline
-    transaction is healed before we read state. After replay:
+    transaction is healed before we read state. After replay, four
+    disk shapes are possible (matrix of progress_initialized × SEED
+    row presence):
 
-      - state.progress_initialized AND a SEED row on disk →
-        ALREADY_DONE. Caller advances the phase (idempotent
-        on_baseline_settled) and exits 0 without re-evaluating.
-      - SEED row on disk but state.progress_initialized=False AND
-        no intent.json (replay had nothing to replay) → ORPHAN_SEED.
-        Caller fails loud — re-running eval here would overwrite
-        state.baseline_metric with a fresh measurement while the
-        SEED row still carries the original.
-      - Otherwise → PROCEED. No SEED row, normal first run; or replay
-        moved us forward and we still need to (re)initialize.
+      progress_initialized | SEED row | outcome
+      ---------------------|----------|--------
+      True                 | True     | ALREADY_DONE
+      True                 | False    | MISSING_SEED  (state ahead of body)
+      False                | True     | ORPHAN_SEED   (body ahead of state)
+      False                | False    | PROCEED       (normal first run)
+
+    ALREADY_DONE: caller advances the phase (idempotent
+    on_baseline_settled) and exits with baseline_exit_code, no eval.
+
+    ORPHAN_SEED / MISSING_SEED: state and body have diverged in an
+    off-flow way the journal cannot reconstruct. Caller fails loud
+    instead of running eval — re-evaluating would either overwrite
+    the surviving artifact's metric (ORPHAN_SEED → state) or fabricate
+    a body that doesn't match state (MISSING_SEED).
+
+    PROCEED: caller runs run_eval then commits via record_baseline.
     """
     # Heal first. replay rebuilds state from journal when the SEED
     # row landed but state didn't; discards the journal when the
@@ -87,6 +99,19 @@ def precheck_baseline(task_dir: str) -> BaselinePrecheck:
             BaselinePrecheckOutcome.ALREADY_DONE,
             "baseline already committed (state.progress_initialized "
             "and SEED row on disk); skipping re-eval.")
+
+    if progress_done and not seed_on_disk:
+        return BaselinePrecheck(
+            BaselinePrecheckOutcome.MISSING_SEED,
+            "state.progress_initialized is True but history.jsonl has "
+            "no SEED row. State and body have diverged in an off-flow "
+            "way the journal cannot heal (intent.json absent). "
+            "Running eval here would write a fresh SEED row whose "
+            "metrics don't match the committed state.baseline_metric. "
+            "Recover by either (a) restoring the SEED row from a "
+            "backup of history.jsonl, or (b) clearing the offending "
+            "state fields (progress_initialized + baseline_*) and "
+            "re-running baseline.py from scratch.")
 
     if seed_on_disk and not progress_done:
         return BaselinePrecheck(
