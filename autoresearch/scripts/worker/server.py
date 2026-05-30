@@ -82,6 +82,62 @@ def _safe_extract_tar(tar_bytes: bytes, dest_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Source-drift detection
+# ---------------------------------------------------------------------------
+# Daemon-style workers keep `utils.eval_runner` (and friends) cached in
+# sys.modules across requests. If the operator `git pull`s the source
+# tree between requests the process keeps serving the in-memory copy,
+# which is how a wire-format-broken commit (e.g. 447da0f, which made
+# every fresh /run ModuleNotFoundError) "passed" smoke and batch tests
+# in the same session — the worker had been started before the offending
+# pull. The guard below snapshots .py mtimes once at startup, then
+# rejects /run when any tracked file has been touched since.
+
+def _snapshot_python_files(root: str) -> dict[str, float]:
+    """Map of `relpath -> st_mtime` for every .py under `root`. stat
+    failures (permission, race during walk) are skipped so a partial
+    snapshot is preferred to a hard startup failure."""
+    snap: dict[str, float] = {}
+    for dp, _dirs, files in os.walk(root):
+        # __pycache__ regenerates on .py import; tracking it would
+        # produce false drift the first time a fresh worker imports
+        # anything not yet compiled.
+        if "__pycache__" in dp.split(os.sep):
+            continue
+        for f in files:
+            if not f.endswith(".py"):
+                continue
+            full = os.path.join(dp, f)
+            try:
+                snap[os.path.relpath(full, root)] = os.path.getmtime(full)
+            except OSError:
+                continue
+    return snap
+
+
+def _check_source_drift() -> dict:
+    """Compare the live tree against the startup snapshot. Returns
+    `{"changed": [...], "added": [...], "removed": [...]}` with absolute
+    counts trimmed to 10 entries each for log readability. Empty lists
+    mean the on-disk tree still matches what's in memory."""
+    snap_before: dict[str, float] = _state.get("source_snapshot") or {}
+    snap_now = _snapshot_python_files(_SCRIPTS_DIR)
+    changed = [p for p, mt in snap_now.items()
+               if p in snap_before and snap_before[p] != mt]
+    added = [p for p in snap_now if p not in snap_before]
+    removed = [p for p in snap_before if p not in snap_now]
+    return {
+        "changed": sorted(changed)[:10],
+        "added":   sorted(added)[:10],
+        "removed": sorted(removed)[:10],
+    }
+
+
+def _drift_is_clean(drift: dict) -> bool:
+    return not (drift["changed"] or drift["added"] or drift["removed"])
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -93,9 +149,12 @@ async def lifespan(app: FastAPI):
     q: asyncio.Queue = asyncio.Queue()
     for d in devices:
         q.put_nowait(d)
-    _state.update(backend=backend, arch=arch, devices=devices, queue=q)
-    logger.info("worker ready: backend=%s arch=%s devices=%s",
-                backend, arch, devices)
+    snap = _snapshot_python_files(_SCRIPTS_DIR)
+    _state.update(backend=backend, arch=arch, devices=devices, queue=q,
+                  source_snapshot=snap)
+    logger.info("worker ready: backend=%s arch=%s devices=%s "
+                "source_snapshot=%d files under %s",
+                backend, arch, devices, len(snap), _SCRIPTS_DIR)
     yield
     logger.info("worker shutting down")
 
@@ -111,13 +170,26 @@ app = FastAPI(title="AutoResearch Worker", lifespan=lifespan)
 async def status():
     if "queue" not in _state:
         return {"status": "initializing"}
-    return {
+    # `status` stays "ready" so older clients that key off it (smoke
+    # tests, ar_cli pre-eval reachability check) don't suddenly see
+    # an unknown state — drift is advisory in /status and only
+    # enforced in /run, where the request would otherwise burn an
+    # eval slot serving stale code.
+    drift = _check_source_drift()
+    payload = {
         "status": "ready",
         "backend": _state["backend"],
         "arch": _state["arch"],
         "devices": _state["devices"],
         "free": _state["queue"].qsize(),
     }
+    # Only include `code_drift` when something actually drifted —
+    # keeps the response identical to the pre-change shape in the
+    # common case so JSON-strict consumers don't have to learn a
+    # new optional field unless they care.
+    if not _drift_is_clean(drift):
+        payload["code_drift"] = drift
+    return payload
 
 
 @app.post("/api/v1/run")
@@ -150,6 +222,19 @@ async def run(
     """
     if "queue" not in _state:
         raise HTTPException(status_code=503, detail="worker not initialised")
+
+    # Stale-code refuse. If any .py under scripts/ has been touched
+    # since startup, the in-memory module set no longer matches what's
+    # on disk; serving /run from here would silently use the old code
+    # (the exact failure mode that hid 447da0f's broken import for an
+    # entire session). Fail loud and tell the operator to restart.
+    drift = _check_source_drift()
+    if not _drift_is_clean(drift):
+        raise HTTPException(
+            status_code=503,
+            detail=(f"worker code is stale; restart required. "
+                    f"changed={drift['changed']}, added={drift['added']}, "
+                    f"removed={drift['removed']}"))
 
     package_bytes = await package.read()
 
