@@ -138,108 +138,119 @@ def read_task_dir_pointer(op_name: str) -> Optional[str]:
     return None
 
 
-def get_task_dir() -> str:
-    """Get active task_dir. Reads from autoresearch/.active_task file.
+# ---------------------------------------------------------------------------
+# Active-task ownership record
+# ---------------------------------------------------------------------------
+# `.active_task` is repo-wide and unscoped: any process can write it,
+# and there's no a-priori answer to "who owns this pointer?" without
+# an embedded identity. Earlier iterations stitched the question
+# together from indirect signals — heartbeat freshness, same task_dir
+# string, hook pid — and each indirect signal broke a different
+# legitimate caller. The structural fix is to store identity IN the
+# record so the question becomes a direct match.
+#
+# Record format (JSON; written atomically via tmp + os.replace):
+#
+#   {"task_dir":    "<absolute path>",
+#    "session_id":  "<CLAUDE_CODE_SESSION_ID or ''>",
+#    "owner_pid":   <int, getpid() of writer>,
+#    "claimed_at":  "<ISO 8601 UTC>"}
+#
+# session_id is the primary ownership token: Claude Code injects
+# CLAUDE_CODE_SESSION_ID into every hook process, so hooks of the
+# same agent session always match. Supervisors (batch/run.py) have
+# no Claude session of their own; they can still claim ownership by
+# passing expected_task_dir to clear_active_task — they know which
+# task_dir they just spawned + waited on.
+#
+# Backward compat: a single-line `.active_task` (plain task_dir) loads
+# as session_id="" / owner_pid=0. Clear/set then fall back to the
+# heartbeat defence so existing checkouts mid-upgrade keep working.
 
-    Falls back to AR_TASK_DIR env var for backward compat.
-    Returns "" if no active task.
-    """
-    if os.path.exists(_ACTIVE_TASK_FILE):
-        with open(_ACTIVE_TASK_FILE, "r") as f:
-            td = f.read().strip()
-        if td and os.path.isdir(td):
-            return td
-    return os.environ.get("AR_TASK_DIR", "")
-
-
-def clear_active_task(expected_task_dir: Optional[str] = None,
-                      *, force: bool = False) -> bool:
-    """Remove the repo-wide .active_task pointer if it's safe to do so.
-    Returns True when the pointer is gone after the call (deleted or
-    already absent), False when refused.
-
-    Ownership semantics (the structural piece that the earlier
-    heartbeat-only check kept conflating): `.active_task` is repo-wide
-    and unscoped, so "is this pointer mine?" is the question that
-    actually decides safety, not "is its task warm?". Callers that
-    just finished a task they themselves drove pass the task_dir they
-    were running as `expected_task_dir`:
-
-      - pointer absent                            → True (nothing to do)
-      - force=True                                → unlink, True
-      - pointer points at `expected_task_dir`     → unlink, True
-        (it IS the one I just finished, regardless of how warm the
-        heartbeat is — between batch ops the prior op's last hook
-        touched heartbeat seconds ago, so a heartbeat-only check
-        would block every legitimate transition)
-      - pointer points at a now-deleted dir       → unlink, True
-        (dangling)
-      - heartbeat is older than the configured
-        fresh window                              → unlink, True
-        (truly stale, prior owner died)
-      - everything else (different task_dir, fresh heartbeat)
-                                                  → refuse, False
-        (another live session looks active; silent unlink would let
-        the caller create its own activation and the two sessions
-        would then cross-write state)
-    """
+def _load_active_record() -> Optional[dict]:
+    """Read `.active_task` into a normalised dict, or None when missing /
+    unreadable / corrupt. Legacy (plain task_dir) records load with
+    empty session_id and owner_pid=0."""
     if not os.path.exists(_ACTIVE_TASK_FILE):
-        return True
+        return None
     try:
-        with open(_ACTIVE_TASK_FILE, "r") as f:
-            pointed = f.read().strip()
+        with open(_ACTIVE_TASK_FILE, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
     except OSError:
-        pointed = ""
-
-    if force:
-        _try_unlink_active()
-        return True
-
-    # "Mine" branch: caller asserts they own the task this pointer
-    # describes. Skip the heartbeat check entirely.
-    if (expected_task_dir
-            and pointed
-            and os.path.abspath(pointed) == os.path.abspath(expected_task_dir)):
-        _try_unlink_active()
-        return True
-
-    # Dangling pointer: nothing live can be writing it.
-    if pointed and not os.path.isdir(pointed):
-        _try_unlink_active()
-        return True
-
-    # Different pointer or no expected_task_dir given: fall through to
-    # the heartbeat-fresh defence (guards against a concurrent manual
-    # Claude session on the same checkout).
-    if pointed:
+        return None
+    if not raw:
+        return None
+    if raw.startswith("{"):
         try:
-            _scripts = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            if _scripts not in sys.path:
-                sys.path.insert(0, _scripts)
-            from utils.settings import heartbeat_fresh_seconds as _hb
-            fresh_window = _hb()
-        except Exception as _e:
-            print(f"[state_store] WARNING: heartbeat_fresh_seconds() "
-                  f"unavailable ({_e}); falling back to 180s.",
-                  file=sys.stderr)
-            fresh_window = 180
-        import time as _time
-        hb_path = state_path(pointed, HEARTBEAT_FILE)
-        try:
-            age = _time.time() - os.path.getmtime(hb_path)
-        except OSError:
-            age = float("inf")
-        if age < fresh_window:
-            print(f"[state_store] WARNING: refusing to clear .active_task "
-                  f"— points at {pointed} with a fresh heartbeat "
-                  f"({age:.0f}s ago, window={fresh_window}s) and the "
-                  f"caller didn't claim ownership (expected_task_dir="
-                  f"{expected_task_dir!r}). Pass force=True only if "
-                  f"you've verified that session is truly done.",
-                  file=sys.stderr)
-            return False
-    _try_unlink_active()
-    return True
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"[state_store] WARNING: {_ACTIVE_TASK_FILE} JSON "
+                  f"corrupt ({e}); treating as no active task. Delete "
+                  f"the file and re-run to recover.", file=sys.stderr)
+            return None
+        return {
+            "task_dir":   str(data.get("task_dir", "") or ""),
+            "session_id": str(data.get("session_id", "") or ""),
+            "owner_pid":  int(data.get("owner_pid") or 0),
+            "claimed_at": str(data.get("claimed_at", "") or ""),
+        }
+    # Legacy single-line form.
+    return {"task_dir": raw, "session_id": "", "owner_pid": 0,
+            "claimed_at": ""}
+
+
+def _write_active_record(task_dir: str) -> None:
+    """Atomic write of the ownership record. Auto-populates session_id
+    from env (hooks inherit CLAUDE_CODE_SESSION_ID from the agent)
+    and owner_pid from os.getpid()."""
+    from datetime import datetime, timezone
+    rec = {
+        "task_dir":   os.path.abspath(task_dir),
+        "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+        "owner_pid":  os.getpid(),
+        "claimed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    os.makedirs(os.path.dirname(_ACTIVE_TASK_FILE), exist_ok=True)
+    tmp = _ACTIVE_TASK_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    os.replace(tmp, _ACTIVE_TASK_FILE)
+
+
+def _our_session_id() -> str:
+    """Empty when our caller isn't inside a Claude agent process (e.g.
+    batch/run.py supervisor)."""
+    return os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+
+
+def _heartbeat_age_seconds(task_dir: str) -> float:
+    """Seconds since the task's `.heartbeat` was touched. inf when no
+    such file exists."""
+    import time as _time
+    try:
+        return _time.time() - os.path.getmtime(
+            state_path(task_dir, HEARTBEAT_FILE))
+    except OSError:
+        return float("inf")
+
+
+def _heartbeat_fresh(task_dir: str) -> bool:
+    """True iff the task's heartbeat is younger than
+    settings.heartbeat_fresh_seconds(). Loud-fallback to 180s if the
+    settings import path is broken (which it shouldn't be — the
+    fallback exists to keep the active_task guard usable rather than
+    crashing a hook)."""
+    try:
+        _scripts = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _scripts not in sys.path:
+            sys.path.insert(0, _scripts)
+        from utils.settings import heartbeat_fresh_seconds as _hb
+        window = _hb()
+    except Exception as e:
+        print(f"[state_store] WARNING: heartbeat_fresh_seconds() "
+              f"unavailable ({e}); falling back to 180s.", file=sys.stderr)
+        window = 180
+    return _heartbeat_age_seconds(task_dir) < window
 
 
 def _try_unlink_active() -> None:
@@ -249,70 +260,127 @@ def _try_unlink_active() -> None:
         pass
 
 
-def set_task_dir(task_dir: str, *, force: bool = False) -> bool:
-    """Write active task_dir to autoresearch/.active_task. Returns True
-    on success, False when the pointer is refused (see below).
+# ---------------------------------------------------------------------------
+# Public active-task API
+# ---------------------------------------------------------------------------
 
-    The .active_task pointer is repo-wide and unscoped — two Claude or
-    batch sessions sharing the same checkout used to silently clobber
-    each other's pointer, and the loser's hooks would then read the
-    wrong task_dir and gate / edit against unrelated files. Without
-    Claude Code passing a session id to hooks we can't fix the surface
-    fully, so the next-best guard: refuse to overwrite when the
-    EXISTING pointer's task_dir still has a fresh heartbeat (= some
-    other process is actively writing it). Pass force=True to override
-    when the caller explicitly knows it's taking over (batch/run.py
-    unlinks the pointer first and re-acquires).
+def get_task_dir() -> str:
+    """Return the active task_dir from `.active_task`, or AR_TASK_DIR
+    env fallback, or "". Reads both the JSON record and legacy single-
+    line forms (compat with mid-upgrade checkouts).
     """
-    import time as _time
+    rec = _load_active_record()
+    if rec and rec["task_dir"] and os.path.isdir(rec["task_dir"]):
+        return rec["task_dir"]
+    return os.environ.get("AR_TASK_DIR", "")
+
+
+def set_task_dir(task_dir: str, *, force: bool = False) -> bool:
+    """Claim `.active_task` for `task_dir`. Returns True on write,
+    False when refused.
+
+    Decision order (each step short-circuits):
+      1. force=True                            → write
+      2. no existing record / empty record     → write
+      3. existing.session_id == our session_id → write (same agent,
+         legitimate focus change)
+      4. existing.task_dir dangling            → write (prior dir gone,
+         can't be live)
+      5. heartbeat stale on existing.task_dir  → write (prior owner is
+         no longer touching it)
+      6. otherwise                             → refuse (live session
+         with a different identity is actively driving a different
+         task_dir; silent overwrite would cross-write state)
+    """
     new_abs = os.path.abspath(task_dir)
-    if not force and os.path.exists(_ACTIVE_TASK_FILE):
-        try:
-            with open(_ACTIVE_TASK_FILE, "r") as f:
-                existing = f.read().strip()
-        except OSError:
-            existing = ""
-        if (existing and existing != new_abs and os.path.isdir(existing)):
-            # `from .settings import` would resolve to phase_machine.settings
-            # which doesn't exist (I shipped this exact bug class in 447da0f
-            # and just repeated it in 8baf094) — fallback would always fire
-            # and silently lock the freshness window to 180s regardless of
-            # what the operator put in config.yaml. utils.settings is the
-            # canonical home; reach into it via absolute import.
-            try:
-                _scripts = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                if _scripts not in sys.path:
-                    sys.path.insert(0, _scripts)
-                from utils.settings import heartbeat_fresh_seconds as _hb
-                fresh_window = _hb()
-            except Exception as _e:
-                import sys as _sys
-                print(f"[state_store] WARNING: utils.settings.heartbeat_"
-                      f"fresh_seconds() unavailable ({_e}); falling back "
-                      f"to 180s. .active_task guard may be tighter than "
-                      f"you configured.", file=_sys.stderr)
-                fresh_window = 180
-            hb_path = state_path(existing, HEARTBEAT_FILE)
-            try:
-                age = _time.time() - os.path.getmtime(hb_path)
-            except OSError:
-                age = float("inf")
-            if age < fresh_window:
-                import sys as _sys
-                print(f"[state_store] WARNING: refusing to overwrite "
-                      f".active_task — currently points at {existing} "
-                      f"with a fresh heartbeat ({age:.0f}s ago, "
-                      f"window={fresh_window}s). Another Claude or batch "
-                      f"session looks active on that task. To take over "
-                      f"explicitly, delete {_ACTIVE_TASK_FILE} first, or "
-                      f"call set_task_dir(..., force=True).",
-                      file=_sys.stderr)
-                return False
-    os.makedirs(os.path.dirname(_ACTIVE_TASK_FILE), exist_ok=True)
-    with open(_ACTIVE_TASK_FILE, "w") as f:
-        f.write(new_abs)
-    touch_heartbeat(task_dir)
-    return True
+    rec = _load_active_record()
+
+    if force or rec is None or not rec["task_dir"]:
+        _write_active_record(new_abs)
+        touch_heartbeat(new_abs)
+        return True
+
+    our_session = _our_session_id()
+    if our_session and rec["session_id"] == our_session:
+        _write_active_record(new_abs)
+        touch_heartbeat(new_abs)
+        return True
+
+    if not os.path.isdir(rec["task_dir"]):
+        _write_active_record(new_abs)
+        touch_heartbeat(new_abs)
+        return True
+
+    if not _heartbeat_fresh(rec["task_dir"]):
+        _write_active_record(new_abs)
+        touch_heartbeat(new_abs)
+        return True
+
+    age = _heartbeat_age_seconds(rec["task_dir"])
+    print(f"[state_store] WARNING: refusing to overwrite .active_task — "
+          f"held by session_id={rec['session_id'] or '<legacy>'} on "
+          f"{rec['task_dir']} (heartbeat {age:.0f}s ago, still fresh). "
+          f"Our session_id={our_session or '<none>'}. Stop the other "
+          f"session, rm {_ACTIVE_TASK_FILE}, or call "
+          f"set_task_dir(..., force=True).", file=sys.stderr)
+    return False
+
+
+def clear_active_task(expected_task_dir: Optional[str] = None,
+                      *, force: bool = False) -> bool:
+    """Remove `.active_task` if it's safe to do so. Returns True when
+    the pointer is gone after the call (deleted or already absent),
+    False when refused.
+
+    Decision order (each step short-circuits to unlink + True):
+      1. no existing record                          → True
+      2. force=True                                  → unlink
+      3. existing.session_id == our session_id       → unlink (mine via
+         agent identity — primary path for hook-to-hook clears)
+      4. existing.task_dir == expected_task_dir      → unlink (mine via
+         supervisor claim — primary path for batch between-ops, where
+         the supervisor itself isn't inside a Claude session)
+      5. existing.task_dir dangling                  → unlink
+      6. heartbeat stale on existing.task_dir        → unlink
+      7. otherwise                                   → refuse (live
+         session, different identity, no supervisor claim)
+    """
+    rec = _load_active_record()
+    if rec is None:
+        return True
+
+    if force:
+        _try_unlink_active()
+        return True
+
+    our_session = _our_session_id()
+    if our_session and rec["session_id"] == our_session:
+        _try_unlink_active()
+        return True
+
+    if (expected_task_dir and rec["task_dir"]
+            and os.path.abspath(rec["task_dir"])
+                 == os.path.abspath(expected_task_dir)):
+        _try_unlink_active()
+        return True
+
+    if rec["task_dir"] and not os.path.isdir(rec["task_dir"]):
+        _try_unlink_active()
+        return True
+
+    if rec["task_dir"] and not _heartbeat_fresh(rec["task_dir"]):
+        _try_unlink_active()
+        return True
+
+    age = (_heartbeat_age_seconds(rec["task_dir"])
+           if rec["task_dir"] else 0.0)
+    print(f"[state_store] WARNING: refusing to clear .active_task — "
+          f"held by session_id={rec['session_id'] or '<legacy>'} on "
+          f"{rec['task_dir']} (heartbeat {age:.0f}s ago, fresh). Our "
+          f"session_id={our_session or '<none>'}, expected_task_dir="
+          f"{expected_task_dir!r}. Pass force=True only if you've "
+          f"verified that session is truly done.", file=sys.stderr)
+    return False
 
 
 def find_active_task_dir() -> Optional[str]:
@@ -336,19 +404,14 @@ def find_active_task_dir() -> Optional[str]:
          missing `task.yaml` are ignored (not a real task).
     Returns None if no task is found.
     """
-    if os.path.exists(_ACTIVE_TASK_FILE):
-        try:
-            with open(_ACTIVE_TASK_FILE, "r") as f:
-                td = f.read().strip()
-        except OSError:
-            td = ""
+    rec = _load_active_record()
+    if rec is not None:
+        td = rec["task_dir"]
         if td and os.path.isdir(td):
             return td
-        # Stale pointer — clean it so future callers skip step 1.
-        try:
-            os.remove(_ACTIVE_TASK_FILE)
-        except OSError:
-            pass
+        # Stale pointer (dangling or empty) — clean it so future
+        # callers skip step 1.
+        _try_unlink_active()
 
     tasks_root = os.path.join(_PROJECT_ROOT, "ar_tasks")
     if not os.path.isdir(tasks_root):
