@@ -66,6 +66,7 @@ EDIT_MARKER_FILE = ".edit_started"
 PENDING_SETTLE_FILE = ".pending_settle.json"  # kd_json saved when settle.py fails
 HEARTBEAT_FILE = ".heartbeat"
 ACTIVE_TASK_FILE = ".active_task"  # under autoresearch/, not .ar_state/
+TXN_FILE = ".txn"  # monotonic per-task transaction marker — see below
 
 # DIAGNOSE artifact contract — see CLAUDE.md invariant #10.
 # The DIAGNOSE phase is gated on a structured report at this path before
@@ -383,6 +384,236 @@ def clear_active_task(expected_task_dir: Optional[str] = None,
     return False
 
 
+# ---------------------------------------------------------------------------
+# Per-task transaction id (the .ar_state-wide invariant marker)
+# ---------------------------------------------------------------------------
+# A single monotonically-increasing integer that tags each "write a
+# coordinated group of .ar_state files" operation. Each writer in the
+# group embeds the txn id in its file; the LAST step writes
+# `.ar_state/.txn` containing the id + a "by" label naming the
+# operation. A reader inspecting the group can now answer "is this
+# state self-consistent?" by a direct compare — no more stitching the
+# answer together from heartbeat/pid/string heuristics.
+#
+# Convention:
+#   begin_txn(task_dir, by) -> id
+#       Allocates next id (read .txn, +1). NO disk write yet — the
+#       writer is responsible for putting `id` into every body file
+#       it then writes; commit_txn lands the marker.
+#   commit_txn(task_dir, id, by)
+#       Atomically writes .ar_state/.txn = {id, by, at}.
+#       MUST be the last step of the transaction. If the writer
+#       crashes before commit, the body files carry id but .txn
+#       still names id-1 → check_txn_consistency reports `extra`
+#       and tooling can identify which writer was in flight.
+#   read_txn(task_dir) -> {"id": int, "by": str, "at": str}
+#       Reads the committed-txn marker; returns id=0 for a fresh
+#       task with no .txn yet.
+#   check_txn_consistency(task_dir) -> report dict
+#       Inspects progress.json / history.jsonl tail / plan.md
+#       header / .phase / .pending_settle.json for embedded txn
+#       ids, returns {consistent, current_txn, files, stale, extra}.
+#       Used by post_bash activation to surface partial commits.
+
+def read_txn(task_dir: str) -> dict:
+    """Current committed transaction marker. Returns id=0 when no .txn
+    file exists (fresh task or pre-txn-system state)."""
+    path = state_path(task_dir, TXN_FILE)
+    if not os.path.exists(path):
+        return {"id": 0, "by": "", "at": ""}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            "id":  int(data.get("id") or 0),
+            "by":  str(data.get("by", "") or ""),
+            "at":  str(data.get("at", "") or ""),
+        }
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        print(f"[state_store] WARNING: {path} corrupt ({e}); treating "
+              f"as id=0. Re-run the writer or delete the file to "
+              f"recover.", file=sys.stderr)
+        return {"id": 0, "by": "", "at": ""}
+
+
+def begin_txn(task_dir: str) -> int:
+    """Reserve the next txn id. Single-process convention: the writer
+    that calls begin_txn is responsible for tagging every file it
+    then writes with the returned id, and for calling commit_txn
+    after the last body write. NO inter-process locking — concurrent
+    writers from different processes are out of scope (the framework
+    already routes everything through PhaseController + record_round
+    + create_plan, each of which runs in one process at a time).
+    The `by` label only lands at commit time."""
+    return read_txn(task_dir)["id"] + 1
+
+
+def commit_txn(task_dir: str, txn_id: int, by: str) -> None:
+    """Atomically commit the transaction marker. Should be the LAST
+    write of the transaction; body files that carry this id and
+    landed BEFORE the commit are the durable record of what was
+    committed."""
+    from datetime import datetime, timezone
+    path = state_path(task_dir, TXN_FILE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    rec = {"id": int(txn_id), "by": by,
+           "at": datetime.now(timezone.utc).isoformat()}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    os.replace(tmp, path)
+
+
+def _txn_from_progress(task_dir: str) -> Optional[int]:
+    """Extract `_txn_id` from progress.json, or None when missing /
+    pre-txn-system / file corrupt."""
+    path = progress_path(task_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        v = data.get("_txn_id")
+        return int(v) if isinstance(v, (int, float)) else None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _txn_from_history_tail(task_dir: str) -> Optional[int]:
+    """Extract `_txn_id` from the LAST history.jsonl row, or None.
+    history.jsonl is append-only and per-line JSON, so the tail is
+    the most-recent write."""
+    path = history_path(task_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(-1, os.SEEK_END)
+                while f.tell() > 0:
+                    if f.read(1) == b"\n":
+                        if f.tell() == os.path.getsize(path):
+                            f.seek(-2, os.SEEK_END)
+                            continue
+                        break
+                    f.seek(-2, os.SEEK_CUR)
+                last = f.readline().decode("utf-8", errors="replace").strip()
+            except OSError:
+                # Empty file
+                return None
+        if not last:
+            return None
+        row = json.loads(last)
+        v = row.get("_txn_id")
+        return int(v) if isinstance(v, (int, float)) else None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _txn_from_plan(task_dir: str) -> Optional[int]:
+    """Extract txn from `# Plan vN  <!-- txn: M -->` first line.
+    Returns None for pre-txn-system plan.md (just `# Plan vN`)."""
+    path = plan_path(task_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            first = f.readline()
+    except OSError:
+        return None
+    import re as _re
+    m = _re.search(r"<!--\s*txn:\s*(\d+)\s*-->", first)
+    return int(m.group(1)) if m else None
+
+
+def _txn_from_phase(task_dir: str) -> Optional[int]:
+    """Extract txn from `.phase` content `PHASE|N`. Pre-txn-system
+    .phase files just hold the phase name with no `|` — returns None."""
+    path = state_path(task_dir, PHASE_FILE)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            content = f.read().strip()
+    except OSError:
+        return None
+    if "|" not in content:
+        return None
+    try:
+        return int(content.split("|", 1)[1].strip())
+    except (ValueError, IndexError):
+        return None
+
+
+def _txn_from_pending_settle(task_dir: str) -> Optional[int]:
+    path = pending_settle_path(task_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        v = data.get("_txn_id")
+        return int(v) if isinstance(v, (int, float)) else None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def check_txn_consistency(task_dir: str) -> dict:
+    """Compare per-file embedded txn ids against the committed marker.
+
+    The only inconsistency is `extra` (file claims a newer txn than
+    .txn says is committed) — that's the in-flight signature: body
+    landed but the commit marker did not. Earlier-txn tags ("stale")
+    are normal: a file that wasn't part of the latest transaction
+    legitimately keeps the id of whichever earlier transaction last
+    touched it (e.g. plan.md keeps its create_plan txn id across
+    many subsequent rounds that only touch progress/history). The
+    reader exposes the stale list for diagnostics but doesn't treat
+    it as an inconsistency.
+
+    Files with txn=None (pre-txn-system data on disk) contribute no
+    constraint — surfaced under `untagged` for the operator's
+    information, doesn't affect `consistent`.
+    """
+    current = read_txn(task_dir)["id"]
+    files = {
+        "progress.json":          _txn_from_progress(task_dir),
+        "history.jsonl":          _txn_from_history_tail(task_dir),
+        "plan.md":                _txn_from_plan(task_dir),
+        ".phase":                 _txn_from_phase(task_dir),
+        ".pending_settle.json":   _txn_from_pending_settle(task_dir),
+    }
+    extra = [name for name, t in files.items()
+             if isinstance(t, int) and t > current]
+    stale = [name for name, t in files.items()
+             if isinstance(t, int) and t < current]
+    untagged = [name for name, t in files.items() if t is None
+                and os.path.exists(_path_for(task_dir, name))]
+    return {
+        "consistent": not extra,
+        "current_txn": current,
+        "by": read_txn(task_dir)["by"],
+        "files": files,
+        "extra": extra,
+        "stale": stale,        # informational only
+        "untagged": untagged,  # informational only
+    }
+
+
+def _path_for(task_dir: str, file_label: str) -> str:
+    """Map check_txn_consistency's label back to its on-disk path —
+    used only to filter the `untagged` list to files that actually
+    exist."""
+    mapping = {
+        "progress.json":        progress_path(task_dir),
+        "history.jsonl":        history_path(task_dir),
+        "plan.md":              plan_path(task_dir),
+        ".phase":               state_path(task_dir, PHASE_FILE),
+        ".pending_settle.json": pending_settle_path(task_dir),
+    }
+    return mapping.get(file_label, "")
+
+
 def find_active_task_dir() -> Optional[str]:
     """Single source of truth for "which task is currently active".
 
@@ -520,46 +751,52 @@ def diagnose_marker(plan_version: int) -> str:
 def read_phase(task_dir: str) -> str:
     """Read current phase. Returns INIT if the phase file is missing.
 
-    If the file exists but its content is unrecognised (truncated by a
-    crashed mid-write, hand-edited typo, or out-of-date phase name from
-    a downgrade), emit a stderr warning AND fall back to INIT — silent
-    fallback was hiding mid-write corruption from the operator until
-    resume.py also rejected it with a confusing "incompatible state".
-    The warning makes the corrupt-state path visible without crashing
-    every hook on the way to recovery.
+    Tolerates two on-disk forms:
+      - `PHASE`             (legacy / no txn tag)
+      - `PHASE|<txn_id>`    (txn-tagged — strip the suffix)
+
+    If the file exists but the (stripped) content is unrecognised
+    (truncated mid-write, hand-edited typo, out-of-date phase name
+    from a downgrade), emit a stderr warning AND fall back to INIT —
+    silent fallback was hiding mid-write corruption from the operator
+    until resume.py also rejected it with a confusing "incompatible
+    state". The warning makes the corrupt-state path visible without
+    crashing every hook on the way to recovery.
     """
     path = state_path(task_dir, PHASE_FILE)
     if not os.path.exists(path):
         return INIT
     with open(path, "r") as f:
-        phase = f.read().strip()
+        content = f.read().strip()
+    phase = content.split("|", 1)[0].strip() if "|" in content else content
     if phase in ALL_PHASES:
         return phase
     import sys as _sys
     print(f"[state_store] WARNING: {path} contains unrecognised phase "
-          f"{phase!r}; treating as INIT. If a hook or pipeline crashed "
-          f"mid-write, restoring from .ar_state/history.jsonl or "
-          f"deleting {path} and re-running /autoresearch may recover.",
-          file=_sys.stderr)
+          f"{content!r}; treating as INIT. If a hook or pipeline "
+          f"crashed mid-write, restoring from .ar_state/history.jsonl "
+          f"or deleting {path} and re-running /autoresearch may "
+          f"recover.", file=_sys.stderr)
     return INIT
 
 
-def write_phase(task_dir: str, phase: str):
-    """Write phase to .ar_state/.phase atomically.
+def write_phase(task_dir: str, phase: str, *, txn_id: int):
+    """Write phase to .ar_state/.phase atomically. On-disk content is
+    `PHASE|<txn_id>` so check_txn_consistency can extract the tag
+    without a separate sidecar.
 
     tmp + os.replace prevents read_phase from ever seeing an empty /
-    half-written file, which previously cascaded into the
-    INIT-fallback path above and gated the agent out of all AR
-    scripts. PhaseController owns the only callsite, so there is no
-    cross-writer race to worry about — atomicity is purely about
-    crash-mid-write.
+    half-written file, which previously cascaded into the INIT-
+    fallback path above and gated the agent out of all AR scripts.
+    PhaseController owns the only callsite, so there is no cross-
+    writer race — atomicity is purely about crash-mid-write.
     """
     assert phase in ALL_PHASES, f"Invalid phase: {phase}"
     path = state_path(task_dir, PHASE_FILE)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = path + ".tmp"
     with open(tmp_path, "w") as f:
-        f.write(phase)
+        f.write(f"{phase}|{int(txn_id)}")
     os.replace(tmp_path, path)
 
 
@@ -589,14 +826,21 @@ def load_progress(task_dir: str) -> Optional[Progress]:
 
 
 def save_progress(task_dir: str, progress: Union[Progress, dict],
-                  *, stamp: bool = True):
+                  *, stamp: bool = True, txn_id: int):
     """Write progress to .ar_state/progress.json atomically. Accepts
     Progress or a plain dict (the dict path stays for batch/manifest.py
     which has its own schema and predates the dataclass).
 
-    Atomicity: tmp + os.replace. Earlier non-atomic rewrites occasionally
-    let `load_progress` see an empty file mid-write and `compute_next_
-    phase` then short-circuit to FINISH well before max_rounds.
+    `txn_id` lands as the `_txn_id` field in the payload;
+    check_txn_consistency reads it back to verify this write belongs
+    to the currently-committed transaction (or is "extra" if a crash
+    left it ahead). Required — every save_progress must participate
+    in a transaction so the cross-file consistency invariant holds.
+
+    Atomicity: tmp + os.replace. Earlier non-atomic rewrites
+    occasionally let `load_progress` see an empty file mid-write and
+    `compute_next_phase` then short-circuit to FINISH well before
+    max_rounds.
     """
     from datetime import datetime, timezone
     path = progress_path(task_dir)
@@ -610,17 +854,22 @@ def save_progress(task_dir: str, progress: Union[Progress, dict],
         payload = dict(progress)
         if stamp:
             payload["last_updated"] = datetime.now(timezone.utc).isoformat()
+    payload["_txn_id"] = int(txn_id)
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(sanitize_floats(payload), f, indent=2)
     os.replace(tmp_path, path)
 
 
-def append_history(task_dir: str, record: dict):
-    """Append one JSON record to history.jsonl. Single canonical writer
-    used by keep_or_discard and _baseline_init."""
+def append_history(task_dir: str, record: dict, *, txn_id: int):
+    """Append one JSON record to history.jsonl. `txn_id` lands as a
+    `_txn_id` field on the row; check_txn_consistency reads the LAST
+    row's value to verify the most-recent append belongs to the
+    committed transaction. Required — every history write must
+    participate in a transaction."""
     path = history_path(task_dir)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    record = {**record, "_txn_id": int(txn_id)}
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(sanitize_floats(record), ensure_ascii=False) + "\n")
 
@@ -644,8 +893,13 @@ def update_progress(task_dir: str, **fields) -> Optional[Progress]:
     if progress is None:
         return None
     new_progress = progress.apply(**fields)
+    # update_progress is a standalone helper (hook reset paths,
+    # DIAGNOSE counter increments) — not part of a coordinated outer
+    # transaction. Allocate a micro-txn so the resulting progress.json
+    # is still tagged consistently with .txn.
+    txn = begin_txn(task_dir)
     try:
-        save_progress(task_dir, new_progress, stamp=False)
+        save_progress(task_dir, new_progress, stamp=False, txn_id=txn)
     except Exception as e:
         import sys as _sys
         print(f"[state_store] CRITICAL: failed to save progress.json for "
@@ -655,6 +909,7 @@ def update_progress(task_dir: str, **fields) -> Optional[Progress]:
               f"Free disk space / fix permissions and re-run the failed "
               f"action.", file=_sys.stderr)
         raise
+    commit_txn(task_dir, txn, by="update_progress")
     return new_progress
 
 

@@ -121,7 +121,13 @@ class Progress:
             return cls()
         known = {f.name for f in fields(cls)}
         kept = {k: v for k, v in data.items() if k in known}
-        unknown = sorted(set(data) - known - _LEGACY_DROPPED)
+        # Underscore-prefixed keys are sidecar metadata written by the
+        # storage layer (e.g. `_txn_id` from the .ar_state transaction
+        # marker) — Progress doesn't expose them as typed fields, but
+        # they're not "unknown" in the warn-worthy sense; suppress.
+        unknown = sorted(
+            k for k in set(data) - known - _LEGACY_DROPPED
+            if not k.startswith("_"))
         if unknown:
             import sys
             print(f"[Progress.from_dict] dropping unknown fields: {unknown}",

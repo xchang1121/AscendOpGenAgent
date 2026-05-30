@@ -11,7 +11,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from phase_machine import (  # noqa: E402
-    Progress, append_history, load_progress, save_progress,
+    Progress, append_history, begin_txn, commit_txn, load_progress,
+    save_progress,
 )
 from task_config import EvalOutcome, load_task_config  # noqa: E402
 from utils.git_utils import current_head_short  # noqa: E402
@@ -57,11 +58,14 @@ def run_baseline_init(task_dir: str, eval_data: dict) -> int:
     if reduction.anchor.message:
         print(f"[baseline] {reduction.anchor.message}", file=sys.stderr)
 
-    save_progress(task_dir, reduction.progress, stamp=True)
+    # Baseline transaction: progress + history + phase under one
+    # txn id; commit lands after the phase transition.
+    txn_id = begin_txn(task_dir)
+    save_progress(task_dir, reduction.progress, stamp=True, txn_id=txn_id)
 
     # Round 0 logs the SEED kernel's initial eval. `metrics.latency_us`
-    # is the seed's timing; `metrics.ref_latency_us` (if present) is the
-    # PyTorch baseline used as the speedup anchor.
+    # is the seed's timing; `metrics.ref_latency_us` (if present) is
+    # the PyTorch baseline used as the speedup anchor.
     append_history(task_dir, {
         "round": 0,
         "description": "seed kernel initial eval",
@@ -70,29 +74,35 @@ def run_baseline_init(task_dir: str, eval_data: dict) -> int:
         "outcome": reduction.outcome.value,
         "correctness": reduction.correctness,
         "commit": head_commit,
-    })
+    }, txn_id=txn_id)
 
     if reduction.outcome != EvalOutcome.OK:
-        # Phase transition (PLAN for kernel_fail, untouched for infra_fail)
-        # is owned by on_baseline_settled, which dispatches on the
-        # `baseline_outcome` we just persisted. Calling it here keeps
-        # non-hook callers (notebook re-runs, tests) on the same code
-        # path as the Bash-hook flow.
-        PhaseController(task_dir).on_baseline_settled()
+        # Phase transition (PLAN for kernel_fail, untouched for
+        # infra_fail) is owned by on_baseline_settled, which
+        # dispatches on the `baseline_outcome` we just persisted.
+        # Calling it here keeps non-hook callers (notebook re-runs,
+        # tests) on the same code path as the Bash-hook flow.
+        PhaseController(task_dir, txn_id=txn_id).on_baseline_settled()
+        commit_txn(task_dir, txn_id, by="baseline.init")
         print(f"[baseline] {reduction.outcome.value}: "
               f"{eval_data.get('error') or '(no detail)'}",
               file=sys.stderr)
         return _EXIT_FOR[reduction.outcome]
 
     if reduction.seed_metric is None:
-        # Degenerate: outcome=OK but no primary metric (rare). Treat as
-        # kernel-no-timing — leave phase at BASELINE so the agent retries.
+        # Degenerate: outcome=OK but no primary metric (rare). Treat
+        # as kernel-no-timing — leave phase at BASELINE so the agent
+        # retries. The transaction still commits with progress +
+        # history landed; .phase stays at whatever PhaseController
+        # left it before this branch (no advance event fires).
+        commit_txn(task_dir, txn_id, by="baseline.init_no_metric")
         print(f"[baseline] ERROR: outcome=OK but no valid "
               f"{config.primary_metric}; treating as kernel-no-timing.",
               file=sys.stderr)
         return 2
 
-    PhaseController(task_dir).on_baseline_settled()
+    PhaseController(task_dir, txn_id=txn_id).on_baseline_settled()
+    commit_txn(task_dir, txn_id, by="baseline.init")
     print(f"[baseline] Initialized: task={config.name}, "
           f"seed_{config.primary_metric}={reduction.seed_metric}, "
           f"baseline({reduction.anchor.source})={reduction.anchor.metric}, "

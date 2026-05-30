@@ -106,6 +106,33 @@ def _handle_activation(new_task_dir: str):
 
     pc = PhaseController(new_task_dir)
     if has_phase:
+        # Cross-file txn consistency: if a previous transaction's body
+        # files landed (progress.json/history.jsonl/plan.md/.phase/
+        # .pending_settle.json tagged with a newer _txn_id than .txn
+        # records as committed), some writer crashed between body
+        # writes and commit. Surface this loudly — silent advance
+        # would let the agent compute next steps from inconsistent
+        # state. Don't auto-fix; the operator picks the recovery path
+        # (typically: re-run the script named in .extra[0]'s writer,
+        # or pipeline.py's replay branch for pending_settle).
+        from phase_machine import check_txn_consistency as _check
+        try:
+            rep = _check(new_task_dir)
+        except Exception:
+            rep = None
+        if rep is not None and not rep["consistent"]:
+            extras = ", ".join(rep["extra"]) or "<none>"
+            emit_status(
+                f"[AR] WARNING: .ar_state crashed mid-transaction. "
+                f"committed_txn={rep['current_txn']}, extra body files "
+                f"tagged with a newer id: {extras}. The previous writer "
+                f"(check pipeline.py's replay-only branch, or re-run "
+                f"create_plan.py / baseline.py per which file is extra) "
+                f"likely died between writing the body and committing "
+                f"the marker. Pipeline replay handles pending_settle.json "
+                f"automatically; for plan.md / .phase / progress.json "
+                f"alone, re-run the same script with the same input to "
+                f"reconverge.")
         phase = read_phase(new_task_dir)
         # Stale-planning recovery: phase file says PLAN or REPLAN but
         # plan.md + progress.json show a validated plan with an active

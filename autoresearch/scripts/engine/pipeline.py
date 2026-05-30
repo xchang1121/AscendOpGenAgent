@@ -32,10 +32,11 @@ from phase_machine import (
     get_active_item,
     get_guidance, auto_rollback, load_progress, edit_marker_path,
     pending_settle_path, FINISH,
+    begin_txn, commit_txn,
 )
 
 
-def _run_settle(task_dir: str, kd_json: dict) -> tuple:
+def _run_settle(task_dir: str, kd_json: dict, *, txn_id: int) -> tuple:
     """Settle the active plan item in-process. Returns
     ``(ok: bool, error_tail: str, settle_json: dict | None)``.
 
@@ -92,7 +93,8 @@ def _run_settle(task_dir: str, kd_json: dict) -> tuple:
                     "already_settled": True,
                 }
 
-        settled_id, _ = store.settle_active(decision, metric_val)
+        settled_id, _ = store.settle_active(decision, metric_val,
+                                            txn_id=txn_id)
         return True, "", {
             "settled_item": settled_id,
             "decision": decision,
@@ -131,11 +133,16 @@ def _emit_settle_failure(task_dir: str, error_tail: str) -> None:
           f"error: {error_tail}", file=sys.stderr)
 
 
-def _post_settle(task_dir: str, decision: str, settled_id: str) -> None:
-    """Common path after a successful settle: advance phase, clear edit
-    marker, print status. Runs whether settle succeeded the first time or
-    on the replay-only retry."""
-    next_phase = PhaseController(task_dir).on_round_settled()
+def _post_settle(task_dir: str, decision: str, settled_id: str,
+                 *, txn_id: int) -> None:
+    """Common path after a successful settle: advance phase, clear
+    edit marker, print status. Runs whether settle succeeded the
+    first time or on the replay-only retry. `txn_id` is the outer
+    round transaction's id — passed into PhaseController so the phase
+    write tags .phase with the same id (rather than allocating a
+    second micro-txn that would land .phase ahead of the round
+    commit)."""
+    next_phase = PhaseController(task_dir, txn_id=txn_id).on_round_settled()
     marker = edit_marker_path(task_dir)
     if os.path.exists(marker):
         os.remove(marker)
@@ -209,7 +216,13 @@ def main():
             sys.exit(1)
         print(f"[PIPELINE] Retrying settle from {os.path.basename(pending_path)} "
               f"(skipping quick_check/eval/record_round).", flush=True)
-        ok, error_tail, settle_json = _run_settle(task_dir, kd_json)
+        # Reuse the txn id record_round assigned to the original
+        # round. Settle was the last write of that txn; if it
+        # completed this time, commit lands and check_txn_consistency
+        # sees a clean state.
+        replay_txn = int(kd_json.get("_txn_id") or begin_txn(task_dir))
+        ok, error_tail, settle_json = _run_settle(task_dir, kd_json,
+                                                  txn_id=replay_txn)
         if not ok:
             _emit_settle_failure(task_dir, error_tail)
             sys.exit(1)
@@ -217,7 +230,12 @@ def main():
         # Use _run_settle's reported settled_item, not get_active_item — by
         # this point ACTIVE has already advanced to the NEXT pending item.
         settled_id = (settle_json or {}).get("settled_item") or "?"
-        _post_settle(task_dir, kd_json.get("decision", "?"), settled_id)
+        # _post_settle's write_phase is the last body write of this
+        # replay; commit_txn lands AFTER so .phase is tagged with the
+        # same id check_txn_consistency will see post-commit.
+        _post_settle(task_dir, kd_json.get("decision", "?"), settled_id,
+                     txn_id=replay_txn)
+        commit_txn(task_dir, replay_txn, by="pipeline.replay_settle")
         return
 
     config = load_task_config(task_dir)
@@ -325,13 +343,21 @@ def main():
                   flush=True)
             print(eval_json["raw_output_tail"], flush=True)
 
+    # === Round transaction begins ===
+    # Allocate a single txn id; every body file written below
+    # (progress.json + history.jsonl + .pending_settle.json + plan.md
+    # + .phase) carries it. commit_txn lands LAST, so a crash mid-
+    # round leaves the body files "extra" (ahead of committed marker)
+    # and check_txn_consistency surfaces the partial state instead of
+    # the agent silently continuing on inconsistent .ar_state.
+    txn_id = begin_txn(task_dir)
+
     # === Step 3: Keep or discard ===
-    # Direct library call (was a subprocess + last-line-JSON parse before
-    # the deleted keep_or_discard.py shell wrapper was removed). In-process
-    # eliminates the JSON-protocol seam between pipeline and the round
-    # writer.
+    # Direct library call (was a subprocess + last-line-JSON parse
+    # before the deleted keep_or_discard.py shell wrapper was removed).
     kd_json = record_round(task_dir, eval_json,
-                           description=desc, plan_item=plan_item)
+                           description=desc, plan_item=plan_item,
+                           txn_id=txn_id)
     if kd_json.get("decision") == "ERROR":
         print(f"[PIPELINE] KEEP/DISCARD ERROR: {kd_json.get('error')}")
         sys.exit(1)
@@ -339,21 +365,30 @@ def main():
     decision = kd_json.get("decision", "FAIL")
 
     # === Step 4: Settle (update plan.md) ===
-    # progress.json + history.jsonl were already mutated by record_round,
-    # which also wrote .pending_settle.json (the kd_json sentinel) as its
-    # last act — so any crash between here and _clear_pending_settle is
-    # recoverable via pipeline.py's replay-only top-of-main branch (re-
-    # run pipeline.py, no quick_check/eval/record_round redo). plan.md
-    # is the only state piece settle owns.
-    ok, error_tail, _settle_json = _run_settle(task_dir, kd_json)
+    # progress.json + history.jsonl were already mutated by
+    # record_round, which also wrote .pending_settle.json (the
+    # kd_json sentinel) as its last act — so any crash between here
+    # and commit_txn is recoverable via pipeline.py's replay-only
+    # top-of-main branch (re-run pipeline.py, no quick_check / eval /
+    # record_round redo). plan.md is the only state piece settle owns.
+    ok, error_tail, _settle_json = _run_settle(task_dir, kd_json,
+                                               txn_id=txn_id)
     if not ok:
         _emit_settle_failure(task_dir, error_tail)
         sys.exit(1)
     _clear_pending_settle(task_dir)
 
-    # === Step 5+6: Advance phase + status report ===
+    # === Step 5+6: Advance phase + status report + commit ===
+    # PhaseController inherits the outer txn so write_phase tags
+    # .phase with `txn_id`; commit_txn lands LAST, so a crash here
+    # leaves all body files tagged `txn_id` but .txn still at the
+    # prior commit — check_txn_consistency reports "extra" and the
+    # replay path picks it up (sentinel is gone, so replay would
+    # see consistency-via-fresh-state; the operator just sees the
+    # status line was missed).
     settled_id = active["id"] if active else "?"
-    _post_settle(task_dir, decision, settled_id)
+    _post_settle(task_dir, decision, settled_id, txn_id=txn_id)
+    commit_txn(task_dir, txn_id, by="pipeline.round")
 
 
 if __name__ == "__main__":

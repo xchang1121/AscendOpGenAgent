@@ -44,6 +44,11 @@ from .state_store import (
     find_active_task_dir,
     # Per-op task_dir pointer (scaffold -> batch.run.py handoff)
     task_dir_pointer_path, write_task_dir_pointer, read_task_dir_pointer,
+    # Transaction marker — coordinates multi-file .ar_state writes so
+    # crash mid-transaction is detectable (check_txn_consistency reports
+    # `stale` / `extra` files) instead of silently corrupting state.
+    TXN_FILE,
+    begin_txn, commit_txn, read_txn, check_txn_consistency,
 )
 from .validators import (
     # validate_kernel + validate_diagnose were re-exported here for a
