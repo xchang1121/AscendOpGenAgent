@@ -55,7 +55,10 @@ def _preflight_check_hook_paths() -> int:
               file=sys.stderr)
         return 1
 
-    pattern = re.compile(r"\autoresearch/scripts/[\w/]+\.py")
+    # `r"\autoresearch/..."` was treated as `\a` (bell) + `utoresearch/`
+    # — the regex never matched, so missing hook scripts went undetected
+    # until the batch hit them at runtime. Use a raw-bytes-safe form.
+    pattern = re.compile(r"autoresearch/scripts/[\w/]+\.py")
     missing: list[tuple[str, str]] = []
     for phase, entries in (settings.get("hooks") or {}).items():
         for entry in entries:

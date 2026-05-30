@@ -444,7 +444,11 @@ async def local_eval_async(task_dir: str, op_name: str,
     the eval down promptly rather than leaving a zombie that holds the
     device until the eval finishes.
     """
-    from settings import eval_warmup, eval_repeats
+    # Was `from settings import …` (absolute); broke every fresh worker
+    # boot because worker.server only adds `scripts/` to sys.path, no
+    # top-level `settings.py` exists. Sync sibling at line 210 already
+    # used the relative form — keep them in lockstep.
+    from .settings import eval_warmup, eval_repeats
     if warmup is None:
         warmup = eval_warmup()
     if repeats is None:
