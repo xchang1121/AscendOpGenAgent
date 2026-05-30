@@ -300,22 +300,49 @@ def diagnose_marker(plan_version: int) -> str:
 # ---------------------------------------------------------------------------
 
 def read_phase(task_dir: str) -> str:
-    """Read current phase. Returns INIT if no phase file."""
+    """Read current phase. Returns INIT if the phase file is missing.
+
+    If the file exists but its content is unrecognised (truncated by a
+    crashed mid-write, hand-edited typo, or out-of-date phase name from
+    a downgrade), emit a stderr warning AND fall back to INIT — silent
+    fallback was hiding mid-write corruption from the operator until
+    resume.py also rejected it with a confusing "incompatible state".
+    The warning makes the corrupt-state path visible without crashing
+    every hook on the way to recovery.
+    """
     path = state_path(task_dir, PHASE_FILE)
     if not os.path.exists(path):
         return INIT
     with open(path, "r") as f:
         phase = f.read().strip()
-    return phase if phase in ALL_PHASES else INIT
+    if phase in ALL_PHASES:
+        return phase
+    import sys as _sys
+    print(f"[state_store] WARNING: {path} contains unrecognised phase "
+          f"{phase!r}; treating as INIT. If a hook or pipeline crashed "
+          f"mid-write, restoring from .ar_state/history.jsonl or "
+          f"deleting {path} and re-running /autoresearch may recover.",
+          file=_sys.stderr)
+    return INIT
 
 
 def write_phase(task_dir: str, phase: str):
-    """Write phase to .ar_state/.phase."""
+    """Write phase to .ar_state/.phase atomically.
+
+    tmp + os.replace prevents read_phase from ever seeing an empty /
+    half-written file, which previously cascaded into the
+    INIT-fallback path above and gated the agent out of all AR
+    scripts. PhaseController owns the only callsite, so there is no
+    cross-writer race to worry about — atomicity is purely about
+    crash-mid-write.
+    """
     assert phase in ALL_PHASES, f"Invalid phase: {phase}"
     path = state_path(task_dir, PHASE_FILE)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
         f.write(phase)
+    os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +414,13 @@ def update_progress(task_dir: str, **fields) -> Optional[Progress]:
     becomes TypeError instead of a silently-dropped attribute (which is
     what `progress["typo"] = ...` produced in the dict-era code).
 
-    Silently no-ops if progress.json does not exist.
+    Returns None only when progress.json does not yet exist (pre-scaffold,
+    legitimate no-op). Save failures (disk full, permission, racing
+    rename) re-raise after a loud stderr warning — earlier callers
+    silently lost DIAGNOSE attempt counts and consecutive_failures
+    resets when the underlying write failed, producing infinite-retry
+    loops or repeated DIAGNOSE entry that the operator couldn't trace
+    back to the dropped write.
     """
     progress = load_progress(task_dir)
     if progress is None:
@@ -395,8 +428,15 @@ def update_progress(task_dir: str, **fields) -> Optional[Progress]:
     new_progress = progress.apply(**fields)
     try:
         save_progress(task_dir, new_progress, stamp=False)
-    except Exception:
-        return None
+    except Exception as e:
+        import sys as _sys
+        print(f"[state_store] CRITICAL: failed to save progress.json for "
+              f"{task_dir}: {type(e).__name__}: {e}. fields={list(fields)}. "
+              f"The in-memory update is lost; the next round may see stale "
+              f"state (wrong consecutive_failures, diagnose_attempts, etc). "
+              f"Free disk space / fix permissions and re-run the failed "
+              f"action.", file=_sys.stderr)
+        raise
     return new_progress
 
 
