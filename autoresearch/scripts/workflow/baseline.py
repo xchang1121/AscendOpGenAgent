@@ -12,12 +12,39 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from phase_machine import (  # noqa: E402
     Progress, append_history, load_progress, load_state, save_state,
+    history_path, write_intent, clear_intent,
 )
 from task_config import EvalOutcome, load_task_config  # noqa: E402
 from utils.git_utils import current_head_short  # noqa: E402
 
 from .progress_reducer import reduce_baseline_init
 from .transition import PhaseController
+
+
+def _existing_seed_row(task_dir: str) -> bool:
+    """True iff history.jsonl already has a round=0 SEED row.
+    Idempotency hook for the baseline transaction: a SIGKILL between
+    append_history and save_state used to leave an orphan SEED row
+    that a retried baseline would happily duplicate. With this gate +
+    the journal at the call site, a retry either: (a) sees no SEED row
+    and starts fresh, or (b) sees the orphan SEED row and skips the
+    append while still rewriting state from the journal."""
+    import os as _os, json as _json
+    path = history_path(task_dir)
+    if not _os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            first = f.readline().strip()
+    except OSError:
+        return False
+    if not first:
+        return False
+    try:
+        row = _json.loads(first)
+    except _json.JSONDecodeError:
+        return False
+    return row.get("round") == 0 and row.get("decision") == "SEED"
 
 
 # Outcome → exit code. Binary: 0 = task is activatable (kernel may need
@@ -57,30 +84,51 @@ def run_baseline_init(task_dir: str, eval_data: dict) -> int:
     if reduction.anchor.message:
         print(f"[baseline] {reduction.anchor.message}", file=sys.stderr)
 
-    # Append SEED history row first (durable artifact).
-    append_history(task_dir, {
+    progress_fields = reduction.progress.to_dict()
+
+    # ---- Journal ----
+    # Write intent FIRST so a crash between body append and state
+    # commit is recoverable: pipeline.py / future baseline invocations
+    # call replay_intent which rebuilds state.json from this payload
+    # when it sees an orphan SEED row.
+    write_intent(task_dir, {
+        "kind": "baseline",
         "round": 0,
-        "description": "seed kernel initial eval",
-        "decision": "SEED",
-        "metrics": reduction.metrics,
-        "outcome": reduction.outcome.value,
-        "correctness": reduction.correctness,
-        "commit": head_commit,
+        "progress_fields": progress_fields,
     })
 
+    # ---- Body: history.jsonl ----
+    # Idempotent: a previous crash may have left an orphan SEED row.
+    # Skip the append in that case — replay_intent / this save_state
+    # below will reconcile state.json against the existing row.
+    if not _existing_seed_row(task_dir):
+        append_history(task_dir, {
+            "round": 0,
+            "description": "seed kernel initial eval",
+            "decision": "SEED",
+            "metrics": reduction.metrics,
+            "outcome": reduction.outcome.value,
+            "correctness": reduction.correctness,
+            "commit": head_commit,
+        })
+
+    # ---- Commit: state.json ----
     # Single atomic commit: merge progress fields + bump
     # expected_history_round so the consistency check matches the row
-    # we just appended. progress_initialized flips on here — this is the
+    # above. progress_initialized flips on here — this is the
     # discriminator load_progress() uses to distinguish "claimed by a
     # session but never measured" from "has baseline data". Resume /
     # dashboard rely on it to avoid offering a Round 0/0 view on a task
     # that hasn't run baseline yet.
     state = load_state(task_dir) or {}
-    for k, v in reduction.progress.to_dict().items():
+    for k, v in progress_fields.items():
         state[k] = v
     state["expected_history_round"] = 0
     state["progress_initialized"] = True
     save_state(task_dir, state)
+
+    # ---- Journal clear ----
+    clear_intent(task_dir)
 
     # Phase transition (PLAN for kernel_fail, untouched for infra_fail)
     # is owned by on_baseline_settled.

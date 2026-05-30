@@ -51,14 +51,14 @@ CRITICAL rules — read carefully, this session is non-interactive:
    subsequent action MUST be exactly:
        export AR_TASK_DIR="<that path>"
    The double quotes are required so paths with spaces or backslashes
-   (e.g. C:\\Users\\Foo Bar\\...) survive shell parsing. This single
-   command writes autoresearch/.active_task, which activates the hook
-   chain — every PostToolUse gate keys off that file. THIS IS THE
-   SINGLE MOST IMPORTANT STEP.
+   (e.g. C:\\Users\\Foo Bar\\...) survive shell parsing. The post-Bash
+   hook reads AR_TASK_DIR and claims the task into state.json (owner +
+   session_id). Every later hook keys off get_task_dir() / state.owner.
+   THIS IS THE SINGLE MOST IMPORTANT STEP.
 
 2. The kernel.py we passed via --kernel is a verified seed. Scaffold's
-   --run-baseline runs it; on PASS .ar_state/.phase is set to PLAN
-   immediately. Your job is PERFORMANCE OPTIMIZATION via
+   --run-baseline runs it; on PASS the phase advances to PLAN in
+   state.json immediately. Your job is PERFORMANCE OPTIMIZATION via
    PLAN -> EDIT -> VERIFY for the configured max-rounds: propose
    targeted incremental edits to ModelNew (block sizes, memory layout,
    vectorization, fewer DRAM round-trips) and let pipeline.py measure
@@ -77,7 +77,7 @@ CRITICAL rules — read carefully, this session is non-interactive:
    framework itself writes phase=FINISH (which only happens when
    eval_rounds reaches max-rounds — settling all current plan items
    triggers REPLAN, not FINISH). The session is fully unattended; the
-   orchestrator detects completion by reading .ar_state/.phase. When
+   orchestrator detects completion by reading state.json's phase. When
    the hooks have nothing more to ask of you, the session ends
    naturally on your last tool call.
 """
@@ -176,32 +176,38 @@ def release_lock(lock: Path) -> None:
 def recover_stale_running(progress: dict) -> int:
     """Demote 'running' cases that are demonstrably orphaned. We hold the
     batch dir lock when this fires, so anything still 'running' was left
-    by a previous run.py. But "previous run.py" used to mean any of:
+    by a previous run.py. "Previous run.py" can mean any of:
     SIGKILLed, OOM-killed, machine rebooted (true orphans) OR another
     runner that's still alive but raced us through the (now atomic)
     lock OR a case whose runner is gone but whose claude --print is
-    still finishing its last tool call (heartbeat is fresh on the
-    task_dir).
+    still finishing its last tool call (state.json keeps getting
+    touched on the task_dir).
 
     Demoting all "running" indiscriminately means --retry-errored
     later re-launches a case that's still in flight, putting two
-    Claude processes on the same .active_task and the same worker.
-    Check before demoting:
+    Claude processes on the same task and the same worker — the exact
+    silent double-run footgun the previous .heartbeat-sidecar check
+    was meant to prevent (and broke when .heartbeat retired into
+    state.json). Check before demoting:
       - if the case carries a `runner_pid` and that pid is alive,
         it's not orphaned — skip.
-      - if the case has a `task_dir` and the task_dir's .heartbeat
-        is fresher than heartbeat_fresh_seconds, /autoresearch is
-        still writing — skip.
+      - if the task_dir is_task_active (owner + fresh heartbeat in
+        state.json), /autoresearch is still writing — skip.
       - otherwise the case is a real orphan; demote with a note.
     """
+    # Route through the phase_machine facade so the "is this task
+    # still live" judgement has one owner. The previous direct read of
+    # <task_dir>/.ar_state/.heartbeat mtime broke silently when
+    # .heartbeat moved into state.json.last_touched.
+    import sys as _sys
+    _scripts = str(Path(__file__).resolve().parent.parent)
+    if _scripts not in _sys.path:
+        _sys.path.insert(0, _scripts)
+    from phase_machine import is_task_active  # noqa: E402
+
     cases = progress.get("cases", {})
     n = 0
     now = mf.now_iso()
-    try:
-        from utils.settings import heartbeat_fresh_seconds
-        fresh_window = heartbeat_fresh_seconds()
-    except Exception:
-        fresh_window = 180
     for c in cases.values():
         if c.get("status") != "running":
             continue
@@ -209,23 +215,17 @@ def recover_stale_running(progress: dict) -> int:
         runner_pid = c.get("runner_pid")
         if isinstance(runner_pid, int) and runner_pid > 0 and _pid_alive(runner_pid):
             continue
-        # Skip if the task_dir's heartbeat is still fresh — claude --print
-        # may have lost its runner pid (e.g. detached) but the agent loop
-        # is still writing inside the task.
+        # Skip if the task is still active — claude --print may have
+        # lost its runner pid (e.g. detached) but the agent loop is
+        # still bumping state.last_touched.
         td = c.get("task_dir")
-        if td:
-            try:
-                hb = Path(td) / ".ar_state" / ".heartbeat"
-                age = time.time() - hb.stat().st_mtime
-                if age < fresh_window:
-                    continue
-            except OSError:
-                pass  # no heartbeat => proceed with demote
+        if td and is_task_active(td):
+            continue
         c["status"] = "error"
         c["finished_at"] = now
         existing = (c.get("note") or "").strip()
         tag = ("stale running, demoted on batch restart "
-               "(no live runner_pid, no fresh heartbeat)")
+               "(no live runner_pid, task not active in state.json)")
         c["note"] = f"{existing}; {tag}" if existing else tag
         n += 1
     return n
@@ -298,36 +298,26 @@ def run_one(batch_dir: Path, case: dict,
     pre_task_dirs = mf.snapshot_task_dirs()
     bound_task_dir: Path | None = None
 
-    # Clear stale .active_task left by a prior op / batch / interactive
-    # session. The activation hook reads this file on claude startup and
-    # silently resumes the pointed task, bypassing /autoresearch's
-    # scaffold dispatch. Reset so parse_args -> scaffold is the only entry.
-    #
-    # Use the guarded clear_active_task helper so an unrelated live
-    # session (e.g. manual Claude on this checkout) doesn't get its
-    # pointer silently nuked between batch ops. The previous op's
-    # pointer will have stale heartbeat by now, so the normal path
-    # still clears fine; only a truly-live concurrent session causes
-    # a refuse, in which case the op aborts loudly instead of
-    # cross-writing state.
-    # Pass our just-finished task_dir as `expected_task_dir` so the
-    # ownership branch fires instead of the heartbeat-fresh defence.
-    # Between batch ops the previous op's last hook touched heartbeat
-    # seconds ago; a heartbeat-only check would refuse every legitimate
-    # transition. With the expected pointer matching, clear_active_task
-    # treats it as "mine" and clears regardless of warmth. First op
-    # of the run (prev_task_dir is None) falls through to the heartbeat
-    # defence, which correctly protects against a manual Claude session
-    # already running on this checkout.
+    # Release the previous op's owner record before launching the
+    # next claude --print. The repo-level .active_task pointer is
+    # gone; ownership now lives in <task_dir>/.ar_state/state.json's
+    # owner field and the per-session index. Pass our just-finished
+    # task_dir as expected_task_dir so the ownership branch fires
+    # instead of the heartbeat-fresh defence (the previous op's last
+    # hook touched the heartbeat seconds ago and a heartbeat-only
+    # check would refuse every legitimate transition). First op of
+    # the run (prev_task_dir is None) falls through to the heartbeat
+    # defence, which protects against a manual Claude session
+    # already running against this checkout.
     from phase_machine import clear_active_task
     if not clear_active_task(expected_task_dir=prev_task_dir):
         sys.stdout.write(f"[run] op={op}: refusing to start — another "
                          f"session is active on this checkout. Stop it "
-                         f"or rm autoresearch/.active_task to take over.\n")
+                         f"before retrying.\n")
         sys.stdout.flush()
         mf.update_case(batch_dir, op, status="error",
                        finished_at=mf.now_iso(),
-                       note="aborted: active_task busy")
+                       note="aborted: prior owner still active")
         return 2
 
     header = (f"\n{'=' * 72}\n"

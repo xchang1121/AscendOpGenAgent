@@ -33,6 +33,7 @@ from phase_machine import (
     get_guidance, auto_rollback, load_progress, load_state, save_state,
     edit_marker_path, FINISH,
     require_state_consistency, format_state_inconsistency,
+    replay_intent,
 )
 
 
@@ -183,19 +184,28 @@ def main():
 
     task_dir = os.path.abspath(sys.argv[1])
 
+    # === Journal replay ===
+    # A prior writer (record_round / baseline) journals its intent
+    # before touching bodies, then clears the journal after state.json
+    # commits. A crash in the window leaves intent.json behind;
+    # replay_intent inspects it and the actual artifacts to either
+    # rebuild state (bodies landed, state didn't), discard (bodies
+    # never landed), or clear (state already caught up). After this
+    # returns, the consistency gate below is meaningful: any remaining
+    # inconsistency is a genuine off-flow corruption, not a normal
+    # crash window we know how to heal.
+    replayed = replay_intent(task_dir)
+    if replayed is not None:
+        print(f"[PIPELINE] intent.json {replayed['action']}: "
+              f"{replayed['detail']}", file=sys.stderr)
+
     # === Cross-file consistency gate ===
     # state.json is the commit barrier; plan.md + history.jsonl are
-    # durable bodies written ahead of it. A prior writer that landed
-    # body bytes but crashed before save_state leaves an artifact
-    # ahead of state.expected_*. Running record_round on top would
-    # double-count: the existing body becomes legit (mismatched
-    # expected_* is repaired by the next save), and our fresh body
-    # appends another row.
-    # Recovery is to re-run the original writer (create_plan.py for
-    # plan.md mismatches, pipeline.py replay path for history.jsonl
-    # mismatches — itself reached by setting state.pending_settle).
-    # We refuse loudly here so the operator notices instead of
-    # silently corrupting accounting.
+    # durable bodies written ahead of it. With the journal in place,
+    # any inconsistency that reaches here is off-flow (manual file
+    # edits, external rewrites) and the operator must fix the
+    # specific artifact named in the report — re-running the writer
+    # is no longer a generic recovery.
     report = require_state_consistency(task_dir, on_inconsistent="report")
     if not report["consistent"]:
         print(f"[PIPELINE] REFUSING TO RUN — "

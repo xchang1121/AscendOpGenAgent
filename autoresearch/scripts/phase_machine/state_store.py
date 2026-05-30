@@ -64,6 +64,11 @@ HISTORY_FILE = "history.jsonl"
 PLAN_FILE = "plan.md"
 PLAN_ITEMS_FILE = "plan_items.xml"  # agent-written XML, validated by create_plan
 EDIT_MARKER_FILE = ".edit_started"
+# Journal / write-ahead intent for round and baseline transactions.
+# Owners write it BEFORE appending bodies, clear it AFTER state.json
+# commits. pipeline.py's replay branch reconstructs an in-flight
+# transaction from this file. See `write_intent` / `replay_intent`.
+INTENT_FILE = "intent.json"
 
 # DIAGNOSE artifact — see CLAUDE.md invariant #10.
 DIAGNOSE_ARTIFACT_TEMPLATE = "diagnose_v{}.md"
@@ -149,6 +154,10 @@ def history_path(task_dir: str) -> str:
 
 def edit_marker_path(task_dir: str) -> str:
     return state_path(task_dir, EDIT_MARKER_FILE)
+
+
+def intent_path(task_dir: str) -> str:
+    return state_path(task_dir, INTENT_FILE)
 
 
 def diagnose_artifact_path(task_dir: str, plan_version: int) -> str:
@@ -374,24 +383,78 @@ def _iter_task_dirs():
             yield full
 
 
+def current_session_task_dir() -> Optional[str]:
+    """Task this Claude session is currently driving, or None.
+
+    Single shared facade for resume / dashboard / find_active_task_dir /
+    hooks. Lookup order:
+
+      1. Per-session index (<repo>/.session_tasks/<sha(sid)>).
+         O(1). Covers tasks created with scaffold --output-dir pointing
+         OUTSIDE <repo>/ar_tasks, which the ar_tasks scan in step 2 can
+         never see.
+      2. Fallback: scan <repo>/ar_tasks and pick the task whose
+         state.owner.session_id == our session. Useful when the index
+         file was lost (manual deletion, fresh checkout that inherited
+         only the task dir). The matched task gets re-written into the
+         index so subsequent lookups are O(1) again.
+
+    Returns None when no session_id is set (supervisor processes like
+    batch/run.py have no Claude session) — caller decides what to do
+    with that signal."""
+    session = _our_session_id()
+    if not session:
+        return None
+
+    pointed = _read_session_index(session)
+    if pointed:
+        st = load_state(pointed)
+        owner = (st or {}).get("owner") or {}
+        if owner.get("session_id") == session:
+            return pointed
+        # Stale index — clear it before falling through to scan, so
+        # the scan's findings aren't overwritten by the stale entry.
+        _clear_session_index(session)
+
+    # Scan ar_tasks/ for a state.owner.session_id match — recovers the
+    # ownership when the index file is missing (fresh checkout, manual
+    # cleanup, etc.). Multiple matches shouldn't happen because
+    # set_task_dir enforces single-task-per-session, but if they do
+    # pick the most recently touched one and warn loudly.
+    matches: list[tuple[float, str]] = []
+    for td in _iter_task_dirs():
+        st = load_state(td)
+        if not st:
+            continue
+        owner = st.get("owner") or {}
+        if owner.get("session_id") == session:
+            matches.append((_age_seconds(st.get("last_touched")), td))
+    if not matches:
+        return None
+    matches.sort(key=lambda x: x[0])
+    if len(matches) > 1:
+        others = ", ".join(td for _, td in matches[1:])
+        print(f"[state_store] WARNING: session_id={session} owns "
+              f"{len(matches)} tasks (single-task invariant violated). "
+              f"Picking most-recently touched: {matches[0][1]}. "
+              f"Others: {others}", file=sys.stderr)
+    chosen = matches[0][1]
+    # Rehydrate the index so the next call is O(1).
+    _write_session_index(session, chosen)
+    return chosen
+
+
 def get_task_dir() -> str:
     """Return the task_dir owned by the current Claude session, or ""
     when none is found. Falls back to AR_TASK_DIR env var.
 
-    Lookup goes through the per-session index — O(1) and covers tasks
-    created with scaffold --output-dir pointing outside the repo
-    root. Cross-checks the pointed task's state.owner to drop stale
-    indexes (e.g. session ended without an explicit clear)."""
-    session = _our_session_id()
-    if session:
-        pointed = _read_session_index(session)
-        if pointed:
-            st = load_state(pointed)
-            owner = (st or {}).get("owner") or {}
-            if owner.get("session_id") == session:
-                return pointed
-            # Stale index — clear it so the next lookup is fast.
-            _clear_session_index(session)
+    Thin shim over current_session_task_dir — kept as a separate name
+    because hooks call it dozens of times per session and the string
+    return convention ("" not None) matches the env-var contract they
+    expect."""
+    td = current_session_task_dir()
+    if td:
+        return td
     return os.environ.get("AR_TASK_DIR", "")
 
 
@@ -526,16 +589,18 @@ def find_active_task_dir() -> Optional[str]:
     monitor when no specific task is in mind.
 
     Priority:
-      1. A task whose owner.session_id matches our env (we're inside
-         that agent)
+      1. The current session's task via current_session_task_dir
+         (covers external --output-dir paths; this used to be an
+         ar_tasks-only scan and silently missed them).
       2. The task with the most-recent last_touched among those with
          an owner (= last live activation, regardless of which agent)
       3. The most-recently touched task overall (no owner anywhere,
          dashboard fallback)
       4. None
     """
-    our_session = _our_session_id()
-    owned_match: Optional[tuple] = None
+    pinned = current_session_task_dir()
+    if pinned:
+        return pinned
     owned_freshest: Optional[tuple] = None
     any_freshest: Optional[tuple] = None
     for td in _iter_task_dirs():
@@ -550,10 +615,7 @@ def find_active_task_dir() -> Optional[str]:
         if owner.get("session_id"):
             if owned_freshest is None or last_touched < owned_freshest[0]:
                 owned_freshest = cand
-            if our_session and owner.get("session_id") == our_session:
-                if owned_match is None or last_touched < owned_match[0]:
-                    owned_match = cand
-    for pick in (owned_match, owned_freshest, any_freshest):
+    for pick in (owned_freshest, any_freshest):
         if pick is not None:
             return pick[1]
     return None
@@ -584,9 +646,35 @@ def touch_heartbeat(task_dir: str):
 
 def is_task_fresh(task_dir: str) -> bool:
     """True iff state.last_touched is within heartbeat_fresh_seconds.
-    Used by resume to detect "another live session owns this task"."""
+    Pure time signal — does NOT require an owner. Use is_task_active
+    for "is somebody currently driving this", which is what resume /
+    batch supervisors usually want."""
     state = load_state(task_dir)
     if state is None:
+        return False
+    return _heartbeat_fresh(state)
+
+
+def is_task_active(task_dir: str) -> bool:
+    """True iff someone currently OWNS the task AND has touched it
+    recently. The conjunction matters:
+
+      - clear_active_task / save_state bumps last_touched every time,
+        so is_task_fresh stays True for heartbeat_fresh_seconds after
+        the supervisor explicitly released the task — long enough
+        for a batch restart to see "fresh, refuse takeover" and pin a
+        no-owner task.
+      - A crashed agent leaves state.owner non-None but stops bumping
+        last_touched; is_task_fresh goes False after the window and
+        recovery callers can take over safely.
+
+    Resume's "another session is running this" gate and batch's
+    "demote stale running" check both want this stronger predicate."""
+    state = load_state(task_dir)
+    if state is None:
+        return False
+    owner = state.get("owner") or {}
+    if not owner.get("session_id"):
         return False
     return _heartbeat_fresh(state)
 
@@ -612,11 +700,18 @@ def task_summary(task_dir: str) -> Optional[dict]:
     if state is None:
         return None
     consistency = check_state_consistency(task_dir)
+    owner = state.get("owner") or {}
+    fresh = _heartbeat_fresh(state)
     return {
         "phase":         state.get("phase", INIT),
         "owner":         state.get("owner"),
         "last_touched":  state.get("last_touched"),
-        "is_fresh":      _heartbeat_fresh(state),
+        # is_fresh = recently touched (time only). is_active = somebody
+        # owns it AND time is recent. Callers that decide "can I take
+        # this over" want is_active; callers that decide "is this
+        # responsive at all" want is_fresh.
+        "is_fresh":      fresh,
+        "is_active":     fresh and bool(owner.get("session_id")),
         "progress_initialized": bool(state.get("progress_initialized")),
         # Progress fields are meaningful only when progress_initialized.
         # Callers can still read them when False but should expect
@@ -830,20 +925,27 @@ def check_state_consistency(task_dir: str) -> dict:
     if plan_on_disk is not None and plan_on_disk != expected_plan:
         issues.append(
             f"plan.md is at v{plan_on_disk} but state.expected_plan_"
-            f"version={expected_plan}. The plan writer (create_plan.py "
-            f"or pipeline.py's settle path) landed plan.md but did not "
-            f"commit the matching state.json. Re-run the original "
-            f"writer with the same input — both reach the same target "
-            f"version idempotently.")
+            f"version={expected_plan}. Normal crashes are healed by "
+            f"replay_intent at pipeline entry; reaching this point "
+            f"means either an off-flow edit to plan.md or a "
+            f"create_plan.py run that failed AFTER landing plan.md "
+            f"but BEFORE its save_state. Re-run create_plan.py with "
+            f"the same input — it's idempotent on the target version.")
 
     expected_round = int(state.get("expected_history_round") or 0)
     last_round = _read_last_history_round(task_dir)
     if last_round is not None and last_round != expected_round:
         issues.append(
             f"history.jsonl last row is round {last_round} but state."
-            f"expected_history_round={expected_round}. Round writer "
-            f"appended history but did not commit state.json. Re-run "
-            f"pipeline.py — the pending_settle path will reconcile.")
+            f"expected_history_round={expected_round} and no intent."
+            f"json journal is present. Normal crashes are healed by "
+            f"replay_intent; reaching this point means either an "
+            f"off-flow append to history.jsonl or an intent.json that "
+            f"was manually deleted before the next pipeline run. "
+            f"Inspect the orphan row — if it's safe to discard, "
+            f"delete it and re-run; if it's the missing settle, "
+            f"hand-set state.pending_settle from the row and re-run "
+            f"pipeline.py.")
 
     return {"consistent": not issues, "state": state, "issues": issues}
 
@@ -858,6 +960,199 @@ def format_state_inconsistency(report: dict) -> str:
     head = (f".ar_state is inconsistent (phase={phase}). Writer landed "
             f"body artifacts but never committed state.json:")
     return head + "\n  - " + "\n  - ".join(report["issues"])
+
+
+# ---------------------------------------------------------------------------
+# Journal / write-ahead intent
+# ---------------------------------------------------------------------------
+# Round and baseline transactions write body artifacts (history.jsonl,
+# plan.md) BEFORE the matching state.json save_state. A crash in the
+# window leaves bodies ahead of state.expected_*; the previous design
+# refused pipeline.py with "pending_settle path will reconcile" — but
+# pending_settle was also written by that same final save_state, so
+# the message lied. The journal closes the loop:
+#
+#   1. caller writes intent.json (kind + minimal payload to reconstruct
+#      the next state.json) BEFORE touching bodies.
+#   2. caller writes bodies + final save_state.
+#   3. caller clears intent.json.
+#
+# On crash recovery, replay_intent at pipeline.py entry inspects the
+# leftover intent.json and the existing artifacts to decide:
+#   - state already caught up (expected_* match bodies) → just clear
+#     the intent file.
+#   - bodies landed but state didn't → rebuild state.json from the
+#     intent (set pending_settle so the existing replay branch runs).
+#   - bodies didn't land → caller can safely redo the whole action.
+
+_INTENT_KIND_ROUND = "round"
+_INTENT_KIND_BASELINE = "baseline"
+
+
+def write_intent(task_dir: str, intent: dict) -> None:
+    """Atomic intent commit. Caller passes a dict carrying enough to
+    reconstruct the post-action state.json (kind + kd_json for
+    rounds; kind + progress dict for baseline). Bumping state.last_
+    touched is intentionally NOT done here — touch_heartbeat owns
+    that and the intent layer should be invisible to "is this task
+    fresh" callers."""
+    path = intent_path(task_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sanitize_floats(intent), f, indent=2)
+    os.replace(tmp, path)
+
+
+def read_intent(task_dir: str) -> Optional[dict]:
+    """Returns the intent dict, or None when no journal exists / it's
+    corrupt (corruption is logged loudly — same WARNING pattern as
+    load_state, since acting on a corrupt journal could double-write
+    history)."""
+    path = intent_path(task_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        print(f"[state_store] WARNING: intent.json at {path} corrupt "
+              f"({e}); treating as missing. Inspect and rm to recover.",
+              file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def clear_intent(task_dir: str) -> None:
+    path = intent_path(task_dir)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def replay_intent(task_dir: str) -> Optional[dict]:
+    """Reconcile an in-flight transaction journaled before the crash.
+    Returns a status dict for callers that want to surface what
+    happened, or None when no intent exists.
+
+    Status dict shape: {"kind": str, "action": str, "detail": str}
+    action ∈ {
+       "cleared":      intent existed but state had already caught up.
+       "rebuilt":      bodies landed pre-crash; we rebuilt state.json
+                       (pending_settle / progress fields) so the
+                       normal replay branch in pipeline.py can finish.
+       "discarded":    bodies didn't land pre-crash; intent dropped.
+                       Caller can safely redo the whole action.
+       "skipped":      intent unrecognised; left in place. Loud
+                       warning to stderr — caller should inspect.
+    }
+    """
+    intent = read_intent(task_dir)
+    if intent is None:
+        return None
+    kind = intent.get("kind")
+    if kind == _INTENT_KIND_ROUND:
+        return _replay_round_intent(task_dir, intent)
+    if kind == _INTENT_KIND_BASELINE:
+        return _replay_baseline_intent(task_dir, intent)
+    print(f"[state_store] WARNING: intent.json has unknown kind "
+          f"{kind!r}; leaving in place. Inspect "
+          f"{intent_path(task_dir)} and rm if safe to discard.",
+          file=sys.stderr)
+    return {"kind": str(kind), "action": "skipped",
+            "detail": f"unknown kind {kind!r}"}
+
+
+def _replay_round_intent(task_dir: str, intent: dict) -> dict:
+    """Round intent payload:
+        {"kind":"round", "kd_json":{...}, "round":N,
+         "progress_fields":{<Progress.to_dict subset>}}
+
+    On crash recovery the three possible disk states are:
+      (a) state already at round N (expected_history_round==N AND
+          pending_settle ≈ kd_json): intent is leftover, clear it.
+      (b) history.jsonl last row.round == N but state isn't caught
+          up: rebuild state from the intent so the existing
+          pending_settle replay branch in pipeline.py runs.
+      (c) history.jsonl last row.round != N (or no history yet):
+          the body never landed; drop the intent so the action can
+          be redone.
+    """
+    target_round = int(intent.get("round") or 0)
+    state = load_state(task_dir) or {}
+
+    if state.get("expected_history_round") == target_round:
+        # State caught up. pending_settle may or may not still be
+        # there depending on where we crashed; either way, the
+        # journal has nothing to add. Drop it.
+        clear_intent(task_dir)
+        return {"kind": "round", "action": "cleared",
+                "detail": f"state.expected_history_round already {target_round}"}
+
+    last_round = _read_last_history_round(task_dir)
+    if last_round == target_round:
+        # Body landed; rebuild state so consistency gate passes and
+        # the replay branch reconstructs the settle.
+        kd_json = intent.get("kd_json") or {}
+        progress_fields = intent.get("progress_fields") or {}
+        for k, v in progress_fields.items():
+            if k in _PROGRESS_FIELD_NAMES:
+                state[k] = v
+        state["pending_settle"] = kd_json
+        state["expected_history_round"] = target_round
+        save_state(task_dir, state)
+        clear_intent(task_dir)
+        return {"kind": "round", "action": "rebuilt",
+                "detail": f"reconstructed pending_settle for round "
+                          f"{target_round} from journal"}
+
+    # Body didn't land — discard.
+    clear_intent(task_dir)
+    return {"kind": "round", "action": "discarded",
+            "detail": f"history.jsonl last_round={last_round} != "
+                      f"intent.round={target_round} (body never landed)"}
+
+
+def _replay_baseline_intent(task_dir: str, intent: dict) -> dict:
+    """Baseline intent payload:
+        {"kind":"baseline", "progress_fields":{...},
+         "expected_history_round": 0}
+
+    Three disk shapes:
+      (a) state already progress_initialized=True AND
+          expected_history_round=0: intent is leftover; clear it.
+      (b) history.jsonl already has a round=0 SEED row but state
+          isn't caught up: rebuild progress + flip
+          progress_initialized so dashboards / pipeline see the
+          baseline as committed.
+      (c) no SEED row yet: discard — caller redoes baseline cleanly.
+    """
+    state = load_state(task_dir) or {}
+    if state.get("progress_initialized") and \
+            state.get("expected_history_round") == 0:
+        clear_intent(task_dir)
+        return {"kind": "baseline", "action": "cleared",
+                "detail": "state already shows baseline committed"}
+
+    last_round = _read_last_history_round(task_dir)
+    if last_round == 0:
+        for k, v in (intent.get("progress_fields") or {}).items():
+            if k in _PROGRESS_FIELD_NAMES:
+                state[k] = v
+        state["progress_initialized"] = True
+        state["expected_history_round"] = 0
+        save_state(task_dir, state)
+        clear_intent(task_dir)
+        return {"kind": "baseline", "action": "rebuilt",
+                "detail": "reconstructed progress fields from journal "
+                          "(SEED row already in history.jsonl)"}
+
+    clear_intent(task_dir)
+    return {"kind": "baseline", "action": "discarded",
+            "detail": "no SEED row on disk; intent dropped"}
 
 
 def require_state_consistency(task_dir: str,

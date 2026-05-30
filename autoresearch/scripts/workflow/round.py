@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from phase_machine import (  # noqa: E402
     Progress, append_history, auto_rollback, load_progress,
     load_state, save_state,
+    write_intent, clear_intent,
 )
 # save_progress not imported — record_round writes progress fields
 # directly into state.json as part of one atomic save_state, so it
@@ -146,31 +147,6 @@ def record_round(task_dir: str, eval_data: dict,
 
     progress = reduction.progress
 
-    # Append the history row FIRST (append-only artifact). Cross-file
-    # consistency with state.json's expected_history_round is set when
-    # we commit the state record below.
-    hist: dict[str, Any] = {
-        "round": round_num,
-        "plan_item": plan_item,
-        "description": description,
-        "decision": decision,
-        "metrics": eval_result.metrics,
-        "correctness": eval_result.correctness,
-        "error": eval_result.error,
-        "commit": commit_hash,
-    }
-    # Only FAIL rows carry the failure_signals + raw tail.
-    if decision == "FAIL":
-        sig = eval_data.get("failure_signals")
-        if isinstance(sig, dict) and (sig.get("primary")
-                                      or sig.get("python_error")
-                                      or sig.get("signals")):
-            hist["failure_signals"] = sig
-        tail = (eval_data.get("raw_output_tail") or "").strip()
-        if tail:
-            hist["raw_output_tail"] = tail[-1500:]
-    append_history(task_dir, hist)
-
     kd_json = {
         "decision": decision,
         "best_metric": progress.best_metric,
@@ -185,18 +161,62 @@ def record_round(task_dir: str, eval_data: dict,
         "round": round_num,
     }
 
-    # Single atomic commit: merge new progress + pending_settle +
-    # expected_history_round into state.json. A SIGKILL before this
-    # write leaves history.jsonl ahead of state.expected_history_round
-    # — check_state_consistency detects it; the recovery path is
-    # pipeline.py's replay branch (which keys off state.pending_settle
-    # being non-None).
-    state = load_state(task_dir) or {}
+    # Build the history row up-front so the journaled intent and the
+    # body write share the same dict — a crash between the two can't
+    # leave the journal claiming a row the body never wrote.
+    hist: dict[str, Any] = {
+        "round": round_num,
+        "plan_item": plan_item,
+        "description": description,
+        "decision": decision,
+        "metrics": eval_result.metrics,
+        "correctness": eval_result.correctness,
+        "error": eval_result.error,
+        "commit": commit_hash,
+    }
+    if decision == "FAIL":
+        sig = eval_data.get("failure_signals")
+        if isinstance(sig, dict) and (sig.get("primary")
+                                      or sig.get("python_error")
+                                      or sig.get("signals")):
+            hist["failure_signals"] = sig
+        tail = (eval_data.get("raw_output_tail") or "").strip()
+        if tail:
+            hist["raw_output_tail"] = tail[-1500:]
+
+    # ---- Journal/WAL ----
+    # Write intent FIRST. Carries enough to reconstruct the
+    # post-action state.json on crash recovery: progress fields,
+    # kd_json (becomes pending_settle), and round number (the
+    # discriminator the replay path keys off).
     progress_fields = progress.to_dict()
+    write_intent(task_dir, {
+        "kind": "round",
+        "round": round_num,
+        "kd_json": kd_json,
+        "progress_fields": progress_fields,
+    })
+
+    # ---- Body: history.jsonl ----
+    append_history(task_dir, hist)
+
+    # ---- Commit: state.json ----
+    # Single atomic merge of new progress + pending_settle + expected_
+    # history_round. A SIGKILL between append_history and this save
+    # leaves history.jsonl ahead of state — pipeline.py's
+    # replay_intent() at entry reconstructs pending_settle from the
+    # journal so the existing replay branch can finish.
+    state = load_state(task_dir) or {}
     for k, v in progress_fields.items():
         state[k] = v
     state["pending_settle"] = kd_json
     state["expected_history_round"] = round_num
     save_state(task_dir, state)
+
+    # ---- Journal clear ----
+    # Last; a crash here just leaves a leftover intent.json which
+    # replay_intent will recognise (state already caught up) and
+    # drop with "cleared" status.
+    clear_intent(task_dir)
 
     return kd_json

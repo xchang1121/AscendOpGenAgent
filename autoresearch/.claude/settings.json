@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ ! -f \"$CLAUDE_PROJECT_DIR/.active_task\" ] && exit 0; python \"$CLAUDE_PROJECT_DIR/scripts/hooks/guard_edit.py\""
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/hooks/guard_edit.py\""
           }
         ]
       },
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ ! -f \"$CLAUDE_PROJECT_DIR/.active_task\" ] && exit 0; python \"$CLAUDE_PROJECT_DIR/scripts/hooks/guard_task.py\""
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/hooks/guard_task.py\""
           }
         ]
       }
@@ -62,7 +62,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ ! -f \"$CLAUDE_PROJECT_DIR/.active_task\" ] && exit 0; python \"$CLAUDE_PROJECT_DIR/scripts/hooks/post_edit.py\""
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/hooks/post_edit.py\""
           }
         ]
       },
@@ -71,7 +71,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ ! -f \"$CLAUDE_PROJECT_DIR/.active_task\" ] && exit 0; python \"$CLAUDE_PROJECT_DIR/scripts/hooks/post_task.py\""
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/hooks/post_task.py\""
           }
         ]
       }
@@ -82,7 +82,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ ! -f \"$CLAUDE_PROJECT_DIR/.active_task\" ] && exit 0; python \"$CLAUDE_PROJECT_DIR/scripts/hooks/stop_save.py\""
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/hooks/stop_save.py\""
           }
         ]
       }

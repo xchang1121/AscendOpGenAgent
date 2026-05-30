@@ -36,33 +36,59 @@ DASHBOARD_PY = mf.repo_root() / "scripts" / "dashboard.py"
 
 
 def task_state(task_dir: Path) -> dict:
+    """Snapshot of one task for the monitor TUI. Goes through
+    phase_machine.task_summary so the schema has one owner; the
+    monitor used to read .ar_state/progress.json and .heartbeat
+    directly and silently went blank on every field after both
+    moved into state.json."""
+    import sys as _sys
+    _scripts = str(Path(__file__).resolve().parent.parent)
+    if _scripts not in _sys.path:
+        _sys.path.insert(0, _scripts)
+    from phase_machine import task_summary  # noqa: E402
+    from datetime import datetime as _dt
+
     out: dict = {"task_dir": str(task_dir)}
-    out["phase"] = mf.read_phase(task_dir)
-    for name in ("progress.json", ".progress.json"):
-        pf = task_dir / ".ar_state" / name
-        if not pf.exists():
-            continue
+    summary = task_summary(str(task_dir))
+    if summary is None:
+        out["phase"] = "UNKNOWN"
+        return out
+
+    out["phase"] = summary.get("phase") or "UNKNOWN"
+    # Render zeros (not Nones) for the round counters so the existing
+    # f-string formatting in render() doesn't show "None/None". When
+    # progress hasn't been initialised yet we leave baseline/best out
+    # entirely; the renderer already handles missing keys gracefully.
+    out["eval_rounds"] = summary.get("eval_rounds") or 0
+    out["max_rounds"]  = summary.get("max_rounds") or 0
+    out["consecutive_failures"] = summary.get("consecutive_failures") or 0
+    out["plan_version"] = summary.get("plan_version") or 0
+    # task_summary exposes baseline_outcome (which used to live on
+    # progress.json as `status`); keep the old key name so render()
+    # doesn't have to know about the rename.
+    if summary.get("baseline_outcome") is not None:
+        out["status"] = summary.get("baseline_outcome")
+    if summary.get("progress_initialized"):
+        out["baseline_metric"] = summary.get("baseline_metric")
+        out["best_metric"]     = summary.get("best_metric")
+
+    # Heartbeat age — last_touched is the new single source of truth.
+    last_touched = summary.get("last_touched")
+    if last_touched:
         try:
-            data = json.loads(pf.read_text(encoding="utf-8"))
-            for k in ("baseline_metric", "best_metric", "eval_rounds",
-                      "max_rounds", "consecutive_failures", "plan_version",
-                      "status"):
-                if k in data:
-                    out[k] = data[k]
-        except Exception as e:
-            out["_progress_read_error"] = str(e)
-        break
-    hb = task_dir / ".ar_state" / ".heartbeat"
-    if hb.exists():
-        try:
-            ts = int(hb.read_text(encoding="utf-8").strip())
+            ts = _dt.fromisoformat(last_touched).timestamp()
             out["heartbeat_age_s"] = int(time.time() - ts)
-        except Exception:
+        except (ValueError, TypeError):
             pass
+
+    # history.jsonl / plan.md are external artifacts; task_summary
+    # doesn't bundle them (they can be large). Read here directly,
+    # gracefully.
     hist = task_dir / ".ar_state" / "history.jsonl"
     if hist.exists():
         try:
-            lines = [l for l in hist.read_text(encoding="utf-8").splitlines() if l.strip()]
+            lines = [l for l in hist.read_text(encoding="utf-8").splitlines()
+                     if l.strip()]
             out["history_tail"] = [json.loads(l) for l in lines[-3:]]
         except Exception:
             pass

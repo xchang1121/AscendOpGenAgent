@@ -21,10 +21,13 @@ from .state_store import (
     DIAGNOSE, REPLAN, FINISH, ALL_PHASES,
     # File constants
     STATE_FILE, HISTORY_FILE, PLAN_FILE, PLAN_ITEMS_FILE, EDIT_MARKER_FILE,
+    INTENT_FILE,
     DIAGNOSE_ARTIFACT_TEMPLATE, DIAGNOSE_MARKER_TEMPLATE, DIAGNOSE_ATTEMPTS_CAP,
     # Path builders
     state_path, state_record_path, plan_path, history_path, edit_marker_path,
-    diagnose_artifact_path, diagnose_marker,
+    intent_path, diagnose_artifact_path, diagnose_marker,
+    # Journal / write-ahead intent (closes the bodies-without-state crash window)
+    write_intent, read_intent, clear_intent, replay_intent,
     # State record I/O — single source of truth
     load_state, save_state, update_state,
     # Typed views over state.json
@@ -32,7 +35,7 @@ from .state_store import (
     load_progress, save_progress, append_history, update_progress,
     # Ownership (was repo-level .active_task; now per-task owner field)
     get_task_dir, set_task_dir, clear_active_task, touch_heartbeat,
-    find_active_task_dir,
+    find_active_task_dir, current_session_task_dir,
     # Per-op task_dir pointer (scaffold -> batch.run.py handoff)
     task_dir_pointer_path, write_task_dir_pointer, read_task_dir_pointer,
     # Cross-file consistency gate
@@ -42,7 +45,7 @@ from .state_store import (
     # batch / resume / dashboard / scaffold (those used to poke
     # progress.json / .heartbeat / .phase directly and skew on schema
     # changes).
-    task_summary, is_task_fresh, task_owner_info,
+    task_summary, is_task_fresh, is_task_active, task_owner_info,
 )
 from .validators import (
     validate_plan,

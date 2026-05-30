@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from phase_machine import (
     load_progress, plan_path, edit_marker_path,
     has_pending_items, find_active_task_dir,
-    is_task_fresh, task_summary,
+    is_task_active, task_summary,
 )
 
 
@@ -69,23 +69,23 @@ def _validate(task_dir: str) -> tuple[bool, str]:
 
 def _check_active_lock(task_dir: str, force: bool) -> None:
     """Refuse to attach when another Claude Code session is actively
-    driving this task. "Active" = state.last_touched is within
-    `heartbeat_fresh_seconds`. The retired `.heartbeat` sidecar is
-    gone; heartbeats are bumped in-place on state.json by
-    touch_heartbeat, and `is_task_fresh` is the only thing callers
-    should ask about freshness."""
-    if not is_task_fresh(task_dir):
+    driving this task. "Active" = owner is set AND state.last_touched
+    is within `heartbeat_fresh_seconds` — gated on is_task_active
+    rather than is_task_fresh so that a supervisor-released task
+    (owner cleared, but save_state bumped last_touched on the way out)
+    doesn't show up as "active" for the next heartbeat window."""
+    if not is_task_active(task_dir):
         return
     if force:
-        print(f"[resume] WARNING: Task is fresh (state.last_touched within "
-              f"the heartbeat window). Forcing takeover (--force).",
-              file=sys.stderr)
+        print(f"[resume] WARNING: Task is active (owner present, "
+              f"state.last_touched within the heartbeat window). "
+              f"Forcing takeover (--force).", file=sys.stderr)
         return
     summary = task_summary(task_dir) or {}
     owner = summary.get("owner") or {}
     print(f"[resume] ERROR: Task is currently active "
-          f"(state.last_touched={summary.get('last_touched')}, "
-          f"owner.session_id={owner.get('session_id') or '<none>'}).",
+          f"(owner.session_id={owner.get('session_id') or '<none>'}, "
+          f"last_touched={summary.get('last_touched')}).",
           file=sys.stderr)
     print(f"[resume] Another Claude Code session may be running it.",
           file=sys.stderr)
