@@ -19,7 +19,7 @@ moves, fix `_SKILL_SCRIPTS` below.
 import os
 import sys
 
-from utils.external_paths import kernel_verifier_dir
+from .external_paths import kernel_verifier_dir
 _SKILL_SCRIPTS = kernel_verifier_dir()
 if _SKILL_SCRIPTS not in sys.path:
     sys.path.insert(0, _SKILL_SCRIPTS)

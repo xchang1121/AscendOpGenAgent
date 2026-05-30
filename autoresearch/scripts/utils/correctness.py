@@ -40,7 +40,7 @@ import sys
 # `autoresearch/scripts/batch/verify.py` if both end up on sys.path.
 # ---------------------------------------------------------------------------
 
-from utils.external_paths import kernel_verifier_dir
+from .external_paths import kernel_verifier_dir
 _SKILL_VERIFY_PATH = os.path.join(kernel_verifier_dir(), "verify.py")
 
 
