@@ -1,8 +1,29 @@
-# Framework reference tables. Loaded once per process by settings.py.
+# Framework reference tables. Loaded once per process by settings.py
+# (scripts/utils/settings.py exposes one typed accessor per key).
+#
+# Two categories live in this file:
+#   1. Reference tables consumed verbatim (hallucinated_scripts,
+#      remote_worker.hosts). Free-form structure.
+#   2. Tunable knobs that ship with NO in-code defaults — a missing
+#      section/key raises a hard error in settings._get. See the
+#      "Tunable knobs" banner below.
+#
+# Edit values in place; settings.py reads via @lru_cache so a long-lived
+# process won't pick up edits without a restart.
 
-# Common hallucinated script names → the real script Claude should use.
-# hook_guard_bash flags these early with a targeted error rather than a
-# generic "unknown script" rejection.
+
+# ---------------------------------------------------------------------------
+# Hallucinated-script alias map. hooks/guard_bash classifies Bash calls
+# against this table BEFORE running them: if Claude tries `python scripts/
+# engine/<key>.py ...`, the hook rewrites the rejection message to point
+# at <value>.py — a targeted "did you mean ...?" instead of a generic
+# "unknown script" error.
+#
+# Add an entry here whenever a new plausible-looking-but-wrong script
+# name shows up in transcripts. The keys are the wrong names Claude
+# invents; the values are the real entry-point scripts (must exist on
+# disk under scripts/engine/).
+# ---------------------------------------------------------------------------
 hallucinated_scripts:
   eval.py: baseline.py
   run_eval.py: baseline.py
@@ -13,23 +34,36 @@ hallucinated_scripts:
   profile.py: baseline.py
 
 
+# ---------------------------------------------------------------------------
 # Remote worker SSH dispatch — used by
 #   `python scripts/ar_cli.py worker --remote-host <alias> ...`
 #
 # Each alias under `hosts:` describes a machine ar_cli can SSH into and
-# launch a worker daemon on. The alias name is also the ssh hostname
-# unless `ssh_alias:` overrides it. `repo_path` is required and must
-# point at the remote `autoresearch/` directory (NOT the outer
-# AscendOpGenAgent checkout) — the SSH command does
-# `cd <repo_path> && python scripts/ar_cli.py worker --start ...`.
-# `env_script` is sourced before invoking the remote ar_cli. `python`
-# defaults to "python".
+# launch a worker daemon on. ar_cli reads this table on every --start /
+# --status / --stop --remote-host invocation.
 #
-# The CLI handles tunnel setup itself: on --start it opens
-# `ssh -L <port>:127.0.0.1:<port> <alias> -N -f` and stashes the pid in
-# ~/.autoresearch_state/tunnels/<port>.pid, so subsequent --status /
-# --stop / orchestrator --worker-url 127.0.0.1:<port> transparently
-# hit the remote daemon.
+# Field reference:
+#   repo_path   (required)  absolute path to the remote `autoresearch/`
+#                           dir (NOT the outer AscendOpGenAgent
+#                           checkout). The SSH command does
+#                           `cd <repo_path> && python scripts/ar_cli.py
+#                           worker --start ...`.
+#   env_script  (required)  shell script source'd before the remote
+#                           ar_cli runs. Must leave `python -c
+#                           "import torch_npu, triton"` working in the
+#                           non-interactive shell.
+#   python      (optional)  python binary to invoke remotely. Default
+#                           "python" (whatever env_script puts on PATH).
+#   ssh_alias   (optional)  hostname passed to ssh. Default = the key
+#                           name itself; override when the host alias in
+#                           ~/.ssh/config differs from how you want to
+#                           refer to it here.
+#
+# Tunnel handling is automatic: on --start ar_cli opens
+# `ssh -L <port>:127.0.0.1:<port> <alias> -N -f` and stores the local
+# tunnel pid at ~/.autoresearch_state/tunnels/<port>.pid. Subsequent
+# --status / --stop / `--worker-url 127.0.0.1:<port>` calls all
+# transparently hit the remote daemon over that tunnel.
 #
 # Example (uncomment + edit before use):
 #
@@ -40,61 +74,184 @@ hallucinated_scripts:
 #       env_script: /home/<user>/env.sh
 #       python: python
 #       ssh_alias: my-npu              # optional; defaults to the key
+# ---------------------------------------------------------------------------
 remote_worker:
   hosts: {}
 
 
-# ---------------------------------------------------------------------------
-# Tunable knobs. config.yaml is the SINGLE SOURCE OF TRUTH — settings.py has
-# NO in-code defaults, so every key below is REQUIRED and a missing key is a
-# hard error. Retune by editing the values here.
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Tunable knobs.
+#
+# config.yaml is the SINGLE SOURCE OF TRUTH for everything below.
+# settings.py exposes one accessor per key (settings.<name>()) and ships
+# NO in-code defaults — a missing section or key raises KeyError on first
+# read. Retune by editing the values here; do NOT add fallback defaults
+# in settings.py or downstream callers, that defeats the single-source
+# guarantee. To remove a knob, delete its accessor in settings.py AND
+# the key here AND audit `git grep <accessor>` for callers.
+# ===========================================================================
 
-# Task defaults applied when a task.yaml (or scaffold CLI) omits the field.
-# Precedence for these: task.yaml > this config > (no in-code default).
+
+# ---------------------------------------------------------------------------
+# Task defaults — applied when a scaffold CLI flag is omitted AND the
+# task.yaml doesn't pin the field. Precedence at runtime:
+#       task.yaml field   >  this defaults block  >  (no in-code default)
+#
+# scaffold pins the resolved value into task.yaml at create time, so a
+# settled task keeps the value it was scaffolded with even if you retune
+# the defaults here.
+# ---------------------------------------------------------------------------
 defaults:
-  max_rounds: 30          # optimization-round budget for a new/under-specified task
-  eval_timeout: 600       # per-shape verify/profile budget (seconds); scaled by num_cases
-  smoke_test_timeout: 10  # quick_check smoke-test budget (seconds)
-  code_checker_enabled: true   # run the triton-impl AST regression check by default
-  metric:                 # primary optimization metric (scaffold writes it; loader falls back here)
-    primary: latency_us
-    lower_is_better: true
-    improvement_threshold: 0.0
+  # Optimization-round budget for new tasks: PLAN → EDIT → eval cycles.
+  # Hit max_rounds and the loop auto-transitions to FINISH and writes
+  # report.md. Override per task via scaffold's --max-rounds.
+  max_rounds: 30
 
-# Eval timing measurement. Read where the timing runs: on remote eval the
-# WORKER's config.yaml applies.
+  # Wall-clock budget per single verify or profile subprocess, in
+  # seconds. eval_runner scales this by num_cases internally so a
+  # 50-shape op gets ~50× the budget for the verify pass. Bump if you
+  # see SIGKILL/124 returncodes; shrink if you want kernels that hang
+  # to fail faster.
+  eval_timeout: 600
+
+  # Wall-clock budget for quick_check's optional smoke test (per task,
+  # not per shape). Only fires when task.yaml sets smoke_test_script.
+  # Keep small — quick_check runs every EDIT, on the critical path.
+  smoke_test_timeout: 10
+
+  # Whether the Triton-impl AST regression check
+  # (scripts/utils/validate_triton_impl.py via quick_check.py) runs by
+  # default on new tasks. Catches kernels that fake the @triton.jit
+  # contract — pure-PyTorch impls, defined-but-never-launched kernels,
+  # forward routes that still go through torch.* / tensor methods.
+  # Flip per-task via task.yaml `code_checker: {enabled: false}` or
+  # scaffold's --no-code-checker.
+  code_checker_enabled: true
+
+  # Primary optimization metric. scaffold writes the full block into a
+  # new task.yaml; loader falls back here when the task omits `metric`.
+  # Currently only `latency_us` is interpreted by the runtime — other
+  # values land on report.py's "unknown metric" branch.
+  metric:
+    primary: latency_us           # metric name keep_or_discard reads
+    lower_is_better: true         # true = smaller wins (latency)
+    improvement_threshold: 0.0    # KEEP only if (best - cand)/best > this;
+                                  # 0.0 keeps any strict improvement
+
+
+# ---------------------------------------------------------------------------
+# Eval timing measurement (utils/eval_runner.local_eval{,_async}).
+# Read where the timing runs: on remote eval the WORKER's config.yaml
+# applies, not the orchestrator's. Keep both in sync, or accept that
+# warmup/repeats can diverge between local-baseline and remote rounds.
+# ---------------------------------------------------------------------------
 eval:
-  warmup: 10        # untimed warmup iterations before measurement
-  repeats: 100      # measured iterations averaged per shape
+  # Untimed warmup iterations before measurement begins. Higher = more
+  # JIT/cache warming, longer per-round wall clock. 10 is enough for
+  # triton-ascend's compile cache to settle on most ops.
+  warmup: 10
 
-# Remote worker daemon. Single source for both the ar_cli tunnel/status
-# side and the worker bind side — the two must agree. The *_timeout knobs
-# tune how the dev-side ar_cli waits on the (possibly remote, possibly
-# slow) worker over the ssh -L tunnel.
+  # Measured iterations whose mean becomes the reported latency_us per
+  # shape. Higher = lower variance, longer per-round wall clock. 100 is
+  # the variance/cost sweet spot we've seen on 910B.
+  repeats: 100
+
+
+# ---------------------------------------------------------------------------
+# Remote worker daemon. Single source for BOTH sides of the wire:
+#   - ar_cli (dev side): tunnel port, readiness wait, status probes
+#   - worker.server  : bind port (so the two cannot drift)
+#
+# The ready_* / status_* timeouts cover ar_cli's wait on a remote
+# daemon over `ssh -L`, which adds variable round-trip latency on top
+# of the daemon's own startup time. Bump if you see "worker not ready"
+# false-negatives on slow networks; shrink to fail fast on a wedged
+# daemon.
+# ---------------------------------------------------------------------------
 worker:
+  # TCP port the worker binds (127.0.0.1 only — never 0.0.0.0; routing
+  # to the dev box goes through ssh -L). Also the default --port for
+  # ar_cli's --start / --status / --stop. Change this and the next
+  # `ar_cli worker --start` will use the new port automatically.
   port: 9111
-  ready_timeout: 20.0       # total seconds to wait for a freshly started daemon to answer /status
-  ready_poll_interval: 0.5  # seconds between readiness polls during startup
-  ready_probe_timeout: 1.5  # per-poll /status probe timeout during the readiness loop (short, kept responsive)
-  status_timeout: 5.0       # seconds for a standalone /status probe (reachability check)
 
-# Batch pre-flight verification (scripts/batch/verify.py), in seconds.
-# tier2 cold JIT across ~50 cases on triton-ascend can take minutes for
-# kernels with many constexpr specializations (maxpool3d, ...).
+  # Total seconds ar_cli waits after spawning the remote daemon for it
+  # to answer /status. Polls every ready_poll_interval until success or
+  # this budget elapses. CANN import + worker boot is ~5s on warm cache,
+  # ~15s cold; 20s leaves headroom.
+  ready_timeout: 20.0
+
+  # Seconds between readiness polls during the startup loop. Smaller =
+  # faster pickup once the daemon is up, more SSH chatter while waiting.
+  ready_poll_interval: 0.5
+
+  # Per-poll /status probe timeout DURING the readiness loop. Kept
+  # short so a wedged tunnel doesn't burn the whole ready_timeout on
+  # one poll. Different from status_timeout below — that's for
+  # standalone reachability checks, this one is for the inner loop.
+  ready_probe_timeout: 1.5
+
+  # Seconds for a standalone /status reachability probe (the path
+  # `ar_cli worker --status` takes, and eval_client uses to fail-fast
+  # before sending a multipart /run). Bump on high-latency links.
+  status_timeout: 5.0
+
+
+# ---------------------------------------------------------------------------
+# Batch driver knobs (scripts/batch/*). Two unrelated kinds of timeouts
+# bundled together: pre-flight Tier 1/2 verify (used by batch/verify.py
+# before the long batch run) and the per-op driver wall clock + cooldown
+# (used by batch/run.py while looping through ops).
+# ---------------------------------------------------------------------------
 batch:
-  tier1_timeout: 30    # smoke: import + tiny shape
-  tier2_timeout: 600   # full correctness
-  # batch/run.py per-op driver knobs (overridable via --timeout-min / --cooldown-sec).
-  run_timeout_min: 180 # hard wall-clock cap per op in minutes
-  cooldown_sec: 5      # seconds to sleep between ops
+  # Tier 1 verify budget per op (seconds): import + tiny-shape smoke.
+  # Runs without an NPU, mainly catches syntax / missing-export errors.
+  tier1_timeout: 30
 
-# Speedup classification for batch reports (x relative to the ref).
+  # Tier 2 verify budget per op (seconds): full multi-shape correctness
+  # with the actual kernel. Cold JIT across ~50 cases on triton-ascend
+  # can take minutes for kernels with many constexpr specializations
+  # (maxpool3d, attention variants).
+  tier2_timeout: 600
+
+  # Hard wall-clock cap per op in batch/run.py, in MINUTES (not
+  # seconds). Each op gets at most this many minutes before run.py
+  # SIGTERMs claude --print and marks the op `error`. Override per
+  # invocation via `batch/run.py --timeout-min N`. Calibrate to
+  # ~3× the median observed (cold JIT + 30 rounds + report).
+  run_timeout_min: 180
+
+  # Seconds to sleep between ops in batch/run.py. Lets the worker
+  # finish cleanup (release device, GC HBM) before the next op
+  # acquires. Override via `--cooldown-sec N`. 0 is allowed but
+  # invites flaky device-acquire races.
+  cooldown_sec: 5
+
+
+# ---------------------------------------------------------------------------
+# Speedup classification used by batch reporters (summarize.py /
+# monitor.py) and the shared classify_speedup() in settings.py.
+# Values are speedup factors v = baseline_us / candidate_us; v=1.0 means
+# the kernel matches the ref exactly.
+#
+# Three buckets: v > improved_above → "improved"; v < regress_below →
+# "regress"; everything in between → "on-par". Widen the gap to be
+# more forgiving (treat noise as on-par); tighten to flag smaller wins.
+# ---------------------------------------------------------------------------
 metrics:
-  speedup_improved_above: 1.05   # v > this → "improved"
-  speedup_regress_below: 0.95    # v < this → "regress"; between → "on-par"
+  speedup_improved_above: 1.05   # v > 1.05 → "improved"
+  speedup_regress_below: 0.95    # v < 0.95 → "regress"
 
-# Resume heartbeat: a task whose .heartbeat mtime is fresher than this
-# (seconds) is assumed still driven by another session (scripts/resume.py).
+
+# ---------------------------------------------------------------------------
+# Resume heartbeat freshness window (scripts/resume.py).
+#
+# /autoresearch writes <task_dir>/.ar_state/.heartbeat on each tool call.
+# A task whose heartbeat mtime is FRESHER than this many seconds is
+# treated as still owned by another live session — resume refuses to
+# attach (which would race the live writer). Bump if a slow Edit round
+# can take longer than this; shrink to recover from killed sessions
+# faster.
+# ---------------------------------------------------------------------------
 resume:
   heartbeat_fresh_seconds: 180
