@@ -64,16 +64,6 @@ hallucinated_scripts:
 # tunnel pid at ~/.autoresearch_state/tunnels/<port>.pid. Subsequent
 # --status / --stop / `--worker-url 127.0.0.1:<port>` calls all
 # transparently hit the remote daemon over that tunnel.
-#
-# Example (uncomment + edit before use):
-#
-# remote_worker:
-#   hosts:
-#     my-npu:
-#       repo_path: /home/<user>/AscendOpGenAgent/autoresearch
-#       env_script: /home/<user>/env.sh
-#       python: python
-#       ssh_alias: my-npu              # optional; defaults to the key
 # ---------------------------------------------------------------------------
 remote_worker:
   hosts: {}
@@ -100,43 +90,57 @@ remote_worker:
 # scaffold pins the resolved value into task.yaml at create time, so a
 # settled task keeps the value it was scaffolded with even if you retune
 # the defaults here.
+#
+# Field reference:
+#   max_rounds            (int)         optimization-round budget for a
+#                                       new task: PLAN → EDIT → eval
+#                                       cycles. Hit max_rounds and the
+#                                       loop auto-transitions to FINISH
+#                                       and writes report.md. Override
+#                                       per task via scaffold's
+#                                       --max-rounds.
+#   eval_timeout          (int seconds) wall-clock budget per single
+#                                       verify or profile subprocess.
+#                                       eval_runner scales by num_cases
+#                                       so a 50-shape op gets ~50× the
+#                                       budget. Bump on SIGKILL/124;
+#                                       shrink to fail-fast hangs.
+#   smoke_test_timeout    (int seconds) budget for quick_check's optional
+#                                       smoke test (per task, not per
+#                                       shape). Only fires when task.yaml
+#                                       sets smoke_test_script. Keep
+#                                       small — runs every EDIT, on the
+#                                       critical path.
+#   code_checker_enabled  (bool)        whether the Triton-impl AST
+#                                       regression check
+#                                       (scripts/utils/validate_triton_impl.py
+#                                       via quick_check.py) runs by
+#                                       default. Catches kernels that
+#                                       fake the @triton.jit contract.
+#                                       Flip per-task via task.yaml
+#                                       `code_checker: {enabled: false}`
+#                                       or scaffold's --no-code-checker.
+#   metric.primary        (str)         metric name keep_or_discard
+#                                       reads. Currently only
+#                                       `latency_us` is interpreted;
+#                                       other values land on report.py's
+#                                       "unknown metric" branch.
+#   metric.lower_is_better (bool)       true = smaller wins (latency);
+#                                       false = larger wins (throughput).
+#   metric.improvement_threshold (float) KEEP only if (best - cand)/best
+#                                       > this. 0.0 keeps any strict
+#                                       improvement; 0.05 requires >5%
+#                                       better.
 # ---------------------------------------------------------------------------
 defaults:
-  # Optimization-round budget for new tasks: PLAN → EDIT → eval cycles.
-  # Hit max_rounds and the loop auto-transitions to FINISH and writes
-  # report.md. Override per task via scaffold's --max-rounds.
   max_rounds: 30
-
-  # Wall-clock budget per single verify or profile subprocess, in
-  # seconds. eval_runner scales this by num_cases internally so a
-  # 50-shape op gets ~50× the budget for the verify pass. Bump if you
-  # see SIGKILL/124 returncodes; shrink if you want kernels that hang
-  # to fail faster.
   eval_timeout: 600
-
-  # Wall-clock budget for quick_check's optional smoke test (per task,
-  # not per shape). Only fires when task.yaml sets smoke_test_script.
-  # Keep small — quick_check runs every EDIT, on the critical path.
   smoke_test_timeout: 10
-
-  # Whether the Triton-impl AST regression check
-  # (scripts/utils/validate_triton_impl.py via quick_check.py) runs by
-  # default on new tasks. Catches kernels that fake the @triton.jit
-  # contract — pure-PyTorch impls, defined-but-never-launched kernels,
-  # forward routes that still go through torch.* / tensor methods.
-  # Flip per-task via task.yaml `code_checker: {enabled: false}` or
-  # scaffold's --no-code-checker.
   code_checker_enabled: true
-
-  # Primary optimization metric. scaffold writes the full block into a
-  # new task.yaml; loader falls back here when the task omits `metric`.
-  # Currently only `latency_us` is interpreted by the runtime — other
-  # values land on report.py's "unknown metric" branch.
   metric:
-    primary: latency_us           # metric name keep_or_discard reads
-    lower_is_better: true         # true = smaller wins (latency)
-    improvement_threshold: 0.0    # KEEP only if (best - cand)/best > this;
-                                  # 0.0 keeps any strict improvement
+    primary: latency_us
+    lower_is_better: true
+    improvement_threshold: 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -144,56 +148,67 @@ defaults:
 # Read where the timing runs: on remote eval the WORKER's config.yaml
 # applies, not the orchestrator's. Keep both in sync, or accept that
 # warmup/repeats can diverge between local-baseline and remote rounds.
+#
+# Field reference:
+#   warmup   (int) untimed warmup iterations before measurement begins.
+#                  Higher = more JIT/cache warming, longer per-round
+#                  wall clock. 10 is enough for triton-ascend's compile
+#                  cache to settle on most ops.
+#   repeats  (int) measured iterations whose mean becomes the reported
+#                  latency_us per shape. Higher = lower variance, longer
+#                  per-round wall clock. 100 is the variance/cost sweet
+#                  spot observed on 910B.
 # ---------------------------------------------------------------------------
 eval:
-  # Untimed warmup iterations before measurement begins. Higher = more
-  # JIT/cache warming, longer per-round wall clock. 10 is enough for
-  # triton-ascend's compile cache to settle on most ops.
   warmup: 10
-
-  # Measured iterations whose mean becomes the reported latency_us per
-  # shape. Higher = lower variance, longer per-round wall clock. 100 is
-  # the variance/cost sweet spot we've seen on 910B.
   repeats: 100
 
 
 # ---------------------------------------------------------------------------
 # Remote worker daemon. Single source for BOTH sides of the wire:
 #   - ar_cli (dev side): tunnel port, readiness wait, status probes
-#   - worker.server  : bind port (so the two cannot drift)
+#   - worker.server   : bind port (so the two cannot drift)
 #
 # The ready_* / status_* timeouts cover ar_cli's wait on a remote
 # daemon over `ssh -L`, which adds variable round-trip latency on top
 # of the daemon's own startup time. Bump if you see "worker not ready"
-# false-negatives on slow networks; shrink to fail fast on a wedged
+# false-negatives on slow networks; shrink to fail-fast on a wedged
 # daemon.
+#
+# Field reference:
+#   port                (int)   TCP port the worker binds (127.0.0.1
+#                               only; routing to the dev box goes
+#                               through ssh -L). Also the default
+#                               --port for ar_cli's --start / --status
+#                               / --stop. Change this and the next
+#                               `ar_cli worker --start` uses the new
+#                               port automatically.
+#   ready_timeout       (float) total seconds ar_cli waits after
+#                               spawning the remote daemon for it to
+#                               answer /status. Polls every
+#                               ready_poll_interval. CANN import +
+#                               worker boot is ~5s warm cache, ~15s
+#                               cold; 20s leaves headroom.
+#   ready_poll_interval (float) seconds between readiness polls during
+#                               the startup loop. Smaller = faster
+#                               pickup, more SSH chatter while waiting.
+#   ready_probe_timeout (float) per-poll /status probe timeout DURING
+#                               the readiness loop. Kept short so a
+#                               wedged tunnel doesn't burn the whole
+#                               ready_timeout on one poll. Distinct from
+#                               status_timeout below.
+#   status_timeout      (float) seconds for a standalone /status
+#                               reachability probe (the path
+#                               `ar_cli worker --status` takes, and
+#                               eval_client uses to fail-fast before
+#                               sending a multipart /run). Bump on
+#                               high-latency links.
 # ---------------------------------------------------------------------------
 worker:
-  # TCP port the worker binds (127.0.0.1 only — never 0.0.0.0; routing
-  # to the dev box goes through ssh -L). Also the default --port for
-  # ar_cli's --start / --status / --stop. Change this and the next
-  # `ar_cli worker --start` will use the new port automatically.
   port: 9111
-
-  # Total seconds ar_cli waits after spawning the remote daemon for it
-  # to answer /status. Polls every ready_poll_interval until success or
-  # this budget elapses. CANN import + worker boot is ~5s on warm cache,
-  # ~15s cold; 20s leaves headroom.
   ready_timeout: 20.0
-
-  # Seconds between readiness polls during the startup loop. Smaller =
-  # faster pickup once the daemon is up, more SSH chatter while waiting.
   ready_poll_interval: 0.5
-
-  # Per-poll /status probe timeout DURING the readiness loop. Kept
-  # short so a wedged tunnel doesn't burn the whole ready_timeout on
-  # one poll. Different from status_timeout below — that's for
-  # standalone reachability checks, this one is for the inner loop.
   ready_probe_timeout: 1.5
-
-  # Seconds for a standalone /status reachability probe (the path
-  # `ar_cli worker --status` takes, and eval_client uses to fail-fast
-  # before sending a multipart /run). Bump on high-latency links.
   status_timeout: 5.0
 
 
@@ -202,29 +217,39 @@ worker:
 # bundled together: pre-flight Tier 1/2 verify (used by batch/verify.py
 # before the long batch run) and the per-op driver wall clock + cooldown
 # (used by batch/run.py while looping through ops).
+#
+# Field reference:
+#   tier1_timeout    (int seconds)  Tier 1 verify budget per op: import
+#                                   + tiny-shape smoke. Runs without an
+#                                   NPU, mainly catches syntax /
+#                                   missing-export errors.
+#   tier2_timeout    (int seconds)  Tier 2 verify budget per op: full
+#                                   multi-shape correctness with the
+#                                   actual kernel. Cold JIT across ~50
+#                                   cases on triton-ascend can take
+#                                   minutes for kernels with many
+#                                   constexpr specializations
+#                                   (maxpool3d, attention variants).
+#   run_timeout_min  (int minutes)  hard wall-clock cap per op in
+#                                   batch/run.py (note: MINUTES, not
+#                                   seconds). Each op gets at most this
+#                                   many minutes before run.py SIGTERMs
+#                                   claude --print and marks the op
+#                                   `error`. Override per invocation via
+#                                   `batch/run.py --timeout-min N`.
+#                                   Calibrate to ~3× the median observed
+#                                   (cold JIT + 30 rounds + report).
+#   cooldown_sec     (int seconds)  sleep between ops in batch/run.py.
+#                                   Lets the worker finish cleanup
+#                                   (release device, GC HBM) before the
+#                                   next op acquires. Override via
+#                                   `--cooldown-sec N`. 0 is allowed but
+#                                   invites flaky device-acquire races.
 # ---------------------------------------------------------------------------
 batch:
-  # Tier 1 verify budget per op (seconds): import + tiny-shape smoke.
-  # Runs without an NPU, mainly catches syntax / missing-export errors.
   tier1_timeout: 30
-
-  # Tier 2 verify budget per op (seconds): full multi-shape correctness
-  # with the actual kernel. Cold JIT across ~50 cases on triton-ascend
-  # can take minutes for kernels with many constexpr specializations
-  # (maxpool3d, attention variants).
   tier2_timeout: 600
-
-  # Hard wall-clock cap per op in batch/run.py, in MINUTES (not
-  # seconds). Each op gets at most this many minutes before run.py
-  # SIGTERMs claude --print and marks the op `error`. Override per
-  # invocation via `batch/run.py --timeout-min N`. Calibrate to
-  # ~3× the median observed (cold JIT + 30 rounds + report).
   run_timeout_min: 180
-
-  # Seconds to sleep between ops in batch/run.py. Lets the worker
-  # finish cleanup (release device, GC HBM) before the next op
-  # acquires. Override via `--cooldown-sec N`. 0 is allowed but
-  # invites flaky device-acquire races.
   cooldown_sec: 5
 
 
@@ -235,12 +260,18 @@ batch:
 # the kernel matches the ref exactly.
 #
 # Three buckets: v > improved_above → "improved"; v < regress_below →
-# "regress"; everything in between → "on-par". Widen the gap to be
-# more forgiving (treat noise as on-par); tighten to flag smaller wins.
+# "regress"; everything in between → "on-par". Widen the gap to be more
+# forgiving (treat noise as on-par); tighten to flag smaller wins.
+#
+# Field reference:
+#   speedup_improved_above  (float)  upper bucket threshold. v above
+#                                    this is reported as "improved".
+#   speedup_regress_below   (float)  lower bucket threshold. v below
+#                                    this is reported as "regress".
 # ---------------------------------------------------------------------------
 metrics:
-  speedup_improved_above: 1.05   # v > 1.05 → "improved"
-  speedup_regress_below: 0.95    # v < 0.95 → "regress"
+  speedup_improved_above: 1.05
+  speedup_regress_below: 0.95
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +283,10 @@ metrics:
 # attach (which would race the live writer). Bump if a slow Edit round
 # can take longer than this; shrink to recover from killed sessions
 # faster.
+#
+# Field reference:
+#   heartbeat_fresh_seconds  (int seconds)  freshness window described
+#                                           above.
 # ---------------------------------------------------------------------------
 resume:
   heartbeat_fresh_seconds: 180
