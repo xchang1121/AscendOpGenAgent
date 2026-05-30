@@ -113,22 +113,56 @@ def _pid_alive(pid: int) -> bool:
 
 def acquire_lock(batch_dir: Path) -> Path:
     """Prevent two run.py instances racing on the same batch_progress.json.
-    Stale locks (PID gone) are auto-cleared; live locks abort with a hint."""
+    Stale locks (PID gone) are auto-cleared; live locks abort with a hint.
+
+    Uses os.open(O_CREAT|O_EXCL) — atomic create-or-fail on every OS
+    Python supports (POSIX + Windows). The old "exists() then write_text"
+    pattern was a check-then-act race: two run.py instances starting in
+    parallel could both see no lock, both write their PID, and both
+    proceed to corrupt batch_progress.json. Atomic create eliminates
+    that race; the stale-lock retry path is bounded to one cycle so two
+    racers both finding a stale lock can't ping-pong it forever — the
+    loser of the second atomic create aborts with a clear hint.
+    """
     lock = batch_dir / LOCK_FILENAME
-    if lock.exists():
+    for attempt in range(2):
         try:
-            pid = int(lock.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            pid = -1
-        if pid > 0 and _pid_alive(pid):
+            fd = os.open(str(lock),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                pid = int(lock.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                pid = -1
+            if pid > 0 and _pid_alive(pid):
+                sys.exit(
+                    f"\nanother batch run is active on this batch dir "
+                    f"(pid={pid}, lock={lock}).\n"
+                    f"if you're sure no run.py is running, remove {lock} "
+                    f"and retry.\n"
+                )
+            if attempt == 0:
+                # stale; unlink and retry atomic create. A second racer
+                # who also sees the stale lock may unlink between us, in
+                # which case our retry's O_EXCL wins one of the two.
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+                continue
+            # Second collision = real concurrent racer. Bail.
             sys.exit(
-                f"\nanother batch run is active on this batch dir "
-                f"(pid={pid}, lock={lock}).\n"
-                f"if you're sure no run.py is running, remove {lock} and retry.\n"
+                f"\nbatch dir {batch_dir} is being claimed concurrently "
+                f"(another run.py won the lock race).\n"
+                f"retry in a moment.\n"
             )
-        # stale lock — overwrite below
-    lock.write_text(str(os.getpid()), encoding="utf-8")
-    return lock
+        else:
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+            return lock
+    return lock  # unreachable, the loop either returns or sys.exits
 
 
 def release_lock(lock: Path) -> None:
@@ -139,20 +173,60 @@ def release_lock(lock: Path) -> None:
 
 
 def recover_stale_running(progress: dict) -> int:
-    """Demote any 'running' cases to 'error'. We hold the batch dir lock by
-    the time this is called, so anything still 'running' is an orphan from a
-    previous run.py that died (SIGKILL, OOM, machine reboot)."""
+    """Demote 'running' cases that are demonstrably orphaned. We hold the
+    batch dir lock when this fires, so anything still 'running' was left
+    by a previous run.py. But "previous run.py" used to mean any of:
+    SIGKILLed, OOM-killed, machine rebooted (true orphans) OR another
+    runner that's still alive but raced us through the (now atomic)
+    lock OR a case whose runner is gone but whose claude --print is
+    still finishing its last tool call (heartbeat is fresh on the
+    task_dir).
+
+    Demoting all "running" indiscriminately means --retry-errored
+    later re-launches a case that's still in flight, putting two
+    Claude processes on the same .active_task and the same worker.
+    Check before demoting:
+      - if the case carries a `runner_pid` and that pid is alive,
+        it's not orphaned — skip.
+      - if the case has a `task_dir` and the task_dir's .heartbeat
+        is fresher than heartbeat_fresh_seconds, /autoresearch is
+        still writing — skip.
+      - otherwise the case is a real orphan; demote with a note.
+    """
     cases = progress.get("cases", {})
     n = 0
     now = mf.now_iso()
+    try:
+        from utils.settings import heartbeat_fresh_seconds
+        fresh_window = heartbeat_fresh_seconds()
+    except Exception:
+        fresh_window = 180
     for c in cases.values():
-        if c.get("status") == "running":
-            c["status"] = "error"
-            c["finished_at"] = now
-            existing = (c.get("note") or "").strip()
-            tag = "stale running, demoted on batch restart"
-            c["note"] = f"{existing}; {tag}" if existing else tag
-            n += 1
+        if c.get("status") != "running":
+            continue
+        # Skip if the previous runner is still alive.
+        runner_pid = c.get("runner_pid")
+        if isinstance(runner_pid, int) and runner_pid > 0 and _pid_alive(runner_pid):
+            continue
+        # Skip if the task_dir's heartbeat is still fresh — claude --print
+        # may have lost its runner pid (e.g. detached) but the agent loop
+        # is still writing inside the task.
+        td = c.get("task_dir")
+        if td:
+            try:
+                hb = Path(td) / ".ar_state" / ".heartbeat"
+                age = time.time() - hb.stat().st_mtime
+                if age < fresh_window:
+                    continue
+            except OSError:
+                pass  # no heartbeat => proceed with demote
+        c["status"] = "error"
+        c["finished_at"] = now
+        existing = (c.get("note") or "").strip()
+        tag = ("stale running, demoted on batch restart "
+               "(no live runner_pid, no fresh heartbeat)")
+        c["note"] = f"{existing}; {tag}" if existing else tag
+        n += 1
     return n
 
 
@@ -211,6 +285,10 @@ def run_one(batch_dir: Path, case: dict,
                    task_dir=None,
                    final_phase=None,
                    rc=None,
+                   # Record the runner pid so a future recover_stale_
+                   # running call can tell "this case is being driven by
+                   # a live process" from "this case is an orphan".
+                   runner_pid=os.getpid(),
                    note="")
 
     # Identity-bound task_dir from same-Popen scaffold markers; snapshot
