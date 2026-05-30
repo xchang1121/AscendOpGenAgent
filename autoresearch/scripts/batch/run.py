@@ -300,7 +300,24 @@ def run_one(batch_dir: Path, case: dict,
     # session. The activation hook reads this file on claude startup and
     # silently resumes the pointed task, bypassing /autoresearch's
     # scaffold dispatch. Reset so parse_args -> scaffold is the only entry.
-    (repo_root / ".active_task").unlink(missing_ok=True)
+    #
+    # Use the guarded clear_active_task helper so an unrelated live
+    # session (e.g. manual Claude on this checkout) doesn't get its
+    # pointer silently nuked between batch ops. The previous op's
+    # pointer will have stale heartbeat by now, so the normal path
+    # still clears fine; only a truly-live concurrent session causes
+    # a refuse, in which case the op aborts loudly instead of
+    # cross-writing state.
+    from phase_machine import clear_active_task
+    if not clear_active_task():
+        sys.stdout.write(f"[run] op={op}: refusing to start — another "
+                         f"session is active on this checkout. Stop it "
+                         f"or rm autoresearch/.active_task to take over.\n")
+        sys.stdout.flush()
+        mf.update_case(batch_dir, op, status="error",
+                       finished_at=mf.now_iso(),
+                       note="aborted: active_task busy")
+        return 2
 
     header = (f"\n{'=' * 72}\n"
               f"[run {datetime.now().isoformat(timespec='seconds')}] op={op} "

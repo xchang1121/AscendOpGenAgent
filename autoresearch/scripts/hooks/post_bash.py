@@ -84,7 +84,21 @@ def _handle_activation(new_task_dir: str):
         emit_status(f"[AR] ERROR: task_dir not found: {new_task_dir}")
         return
 
-    set_task_dir(new_task_dir)
+    # set_task_dir returns False when refusing to overwrite a
+    # heartbeat-fresh pointer (= another live Claude/batch session
+    # owns the active task). Without checking the return value, the
+    # transcript here would claim B is now activated while .active_task
+    # still points at A — guard_bash then evaluates phase against A
+    # while B's commands name B's task_dir, and the two sessions
+    # cross-write each other's state. Bail loudly.
+    if not set_task_dir(new_task_dir):
+        emit_status(
+            f"[AR] ERROR: refused to activate {new_task_dir} — another "
+            f"session is active on a different task (heartbeat fresh). "
+            f"Stop the other session, or rm autoresearch/.active_task to "
+            f"force takeover."
+        )
+        return
     _clean_stale_edit_marker(new_task_dir)
 
     has_phase = os.path.exists(state_path(new_task_dir, PHASE_FILE))
@@ -93,6 +107,25 @@ def _handle_activation(new_task_dir: str):
     pc = PhaseController(new_task_dir)
     if has_phase:
         phase = read_phase(new_task_dir)
+        # Stale-planning recovery: phase file says PLAN / DIAGNOSE /
+        # REPLAN but the on-disk plan.md + progress.json show a
+        # validated plan with an active item. This is the state left
+        # by a create_plan.py that finished both disk writes (plan +
+        # progress) but crashed before PostToolUse advanced .phase to
+        # EDIT. Without recovery, the agent would re-run create_plan
+        # and bump to vN+1, losing the pending items of vN.
+        # compute_resume_phase already returns EDIT for this shape;
+        # call on_activation_resume to apply it via the same atomic
+        # phase-write path.
+        if phase in (PLAN, DIAGNOSE, REPLAN):
+            recomputed = pc.on_activation_resume()
+            if recomputed != phase:
+                emit_status(
+                    f"[AR] Phase file was {phase} but plan.md + "
+                    f"progress.json show round-ready state — "
+                    f"advancing to {recomputed} (create_plan.py "
+                    f"likely crashed before PostToolUse could advance).")
+                phase = recomputed
         emit_status(f"[AR] Resuming. Phase: {phase}.")
         _print_resume_context(new_task_dir)
         emit_status(get_guidance(new_task_dir))

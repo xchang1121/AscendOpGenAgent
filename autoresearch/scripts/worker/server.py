@@ -150,26 +150,52 @@ def _snapshot_python_files(root: str) -> dict[str, float]:
     return snap
 
 
+def _config_yaml_hash() -> Optional[str]:
+    """SHA-256 of config.yaml on disk, or None when unreadable. Worker
+    startup snapshots this alongside the .py mtime set; without it,
+    retunes to eval.warmup / repeats / worker defaults made WHILE the
+    worker is up land silently — utils.settings._raw is @lru_cache'd
+    per process, so the daemon keeps using the boot-time values
+    indefinitely. The drift guard at /run treats config.yaml the same
+    way it treats a .py edit: refuse + tell the operator to restart."""
+    import hashlib
+    cfg = os.path.join(os.path.dirname(_SCRIPTS_DIR), "config.yaml")
+    try:
+        with open(cfg, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def _check_source_drift() -> dict:
     """Compare the live tree against the startup snapshot. Returns
-    `{"changed": [...], "added": [...], "removed": [...]}` with absolute
-    counts trimmed to 10 entries each for log readability. Empty lists
-    mean the on-disk tree still matches what's in memory."""
+    `{"changed": [...], "added": [...], "removed": [...],
+      "config_yaml": "changed" | None}`. Empty lists + config_yaml
+    None mean the on-disk tree still matches what's in memory."""
     snap_before: dict[str, float] = _state.get("source_snapshot") or {}
     snap_now = _snapshot_python_files(_SCRIPTS_DIR)
     changed = [p for p, mt in snap_now.items()
                if p in snap_before and snap_before[p] != mt]
     added = [p for p in snap_now if p not in snap_before]
     removed = [p for p in snap_before if p not in snap_now]
+    config_hash_before = _state.get("config_hash")
+    config_hash_now = _config_yaml_hash()
+    config_drift = ("changed"
+                    if (config_hash_before is not None
+                        and config_hash_now is not None
+                        and config_hash_before != config_hash_now)
+                    else None)
     return {
         "changed": sorted(changed)[:10],
         "added":   sorted(added)[:10],
         "removed": sorted(removed)[:10],
+        "config_yaml": config_drift,
     }
 
 
 def _drift_is_clean(drift: dict) -> bool:
-    return not (drift["changed"] or drift["added"] or drift["removed"])
+    return not (drift["changed"] or drift["added"]
+                or drift["removed"] or drift.get("config_yaml"))
 
 
 # ---------------------------------------------------------------------------
@@ -185,13 +211,17 @@ async def lifespan(app: FastAPI):
     for d in devices:
         q.put_nowait(d)
     snap = _snapshot_python_files(_SCRIPTS_DIR)
+    cfg_hash = _config_yaml_hash()
     cleaned = _janitor_clean_stale_tmp_dirs()
     _state.update(backend=backend, arch=arch, devices=devices, queue=q,
-                  source_snapshot=snap)
+                  source_snapshot=snap, config_hash=cfg_hash)
     logger.info("worker ready: backend=%s arch=%s devices=%s "
                 "source_snapshot=%d files under %s "
+                "config_yaml_hash=%s "
                 "janitor_cleaned=%d stale tmp dirs",
-                backend, arch, devices, len(snap), _SCRIPTS_DIR, cleaned)
+                backend, arch, devices, len(snap), _SCRIPTS_DIR,
+                (cfg_hash[:12] + "...") if cfg_hash else "<unreadable>",
+                cleaned)
     yield
     logger.info("worker shutting down")
 
@@ -271,7 +301,8 @@ async def run(
             status_code=503,
             detail=(f"worker code is stale; restart required. "
                     f"changed={drift['changed']}, added={drift['added']}, "
-                    f"removed={drift['removed']}"))
+                    f"removed={drift['removed']}, "
+                    f"config_yaml={drift.get('config_yaml')}"))
 
     package_bytes = await package.read()
 

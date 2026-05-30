@@ -40,7 +40,7 @@ from .state_store import (
     # Progress + history I/O
     load_progress, save_progress, append_history, update_progress,
     # Active-task pointer
-    get_task_dir, set_task_dir, touch_heartbeat,
+    get_task_dir, set_task_dir, clear_active_task, touch_heartbeat,
     find_active_task_dir,
     # Per-op task_dir pointer (scaffold -> batch.run.py handoff)
     task_dir_pointer_path, write_task_dir_pointer, read_task_dir_pointer,

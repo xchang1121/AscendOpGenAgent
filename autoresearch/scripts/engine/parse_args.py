@@ -63,7 +63,10 @@ def _build_scaffold_command(args) -> str:
         parts += ["--devices", str(args.devices)]
     parts += ["--max-rounds", str(args.max_rounds)]
     parts += ["--eval-timeout", str(args.eval_timeout)]
-    parts += ["--output-dir", args.output_dir or "ar_tasks"]
+    # shlex.quote here too: --output-dir "C:\tmp\my tasks" would
+    # otherwise be re-split into "C:\tmp\my" + "tasks" when the
+    # generated command line is re-parsed by bash.
+    parts += ["--output-dir", shlex.quote(args.output_dir or "ar_tasks")]
     parts.append("--run-baseline")
     # scaffold's CLI uses dest='code_checker' with store_const:
     # None (no flag) -> omit, let scaffold resolve from config;

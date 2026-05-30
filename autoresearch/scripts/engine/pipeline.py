@@ -39,6 +39,16 @@ def _run_settle(task_dir: str, kd_json: dict) -> tuple:
     """Settle the active plan item in-process. Returns
     ``(ok: bool, error_tail: str, settle_json: dict | None)``.
 
+    Idempotent w.r.t. plan_item: when kd_json carries `plan_item`
+    (populated by record_round since the round-transaction fix), this
+    function verifies the current (ACTIVE) item matches the expected
+    one. If it doesn't — i.e. PlanStore.settle_active() ran in a prior
+    invocation, committed plan.md, but the worker died before the
+    sentinel could be cleared — the replay returns a synthetic
+    success rather than wrongly settling the NEXT ACTIVE item against
+    the same kd_json. Without this check, plan.md ended up with two
+    settled rows for a single history-round.
+
     Used to subprocess `engine/settle.py` and parse its stdout; now
     inlined here (`engine/settle.py` was deleted). For manual recovery
     after a failed settle, the operator re-runs pipeline.py — the
@@ -57,6 +67,31 @@ def _run_settle(task_dir: str, kd_json: dict) -> tuple:
         store = PlanStore(task_dir)
         if not store.exists():
             return False, "plan.md not found", None
+
+        expected_item = kd_json.get("plan_item")
+        if expected_item:
+            current_active = get_active_item(task_dir)
+            current_id = (current_active or {}).get("id")
+            if current_id != expected_item:
+                # The plan already advanced past `expected_item`. Two
+                # cases land here:
+                #   1. PlanStore.settle_active() ran before crash;
+                #      ACTIVE is now the next pid. Replay must NOT
+                #      settle the new ACTIVE against this kd_json.
+                #   2. plan.md was rewritten by a manual create_plan
+                #      between the crash and this replay; the expected
+                #      pid no longer exists.
+                # In both cases, the safe move is to treat the settle
+                # as already-done: return success with the expected_id
+                # so pipeline's _post_settle reports correctly, and
+                # _clear_pending_settle drops the sentinel.
+                return True, "", {
+                    "settled_item": expected_item,
+                    "decision": decision,
+                    "metric": metric_val,
+                    "already_settled": True,
+                }
+
         settled_id, _ = store.settle_active(decision, metric_val)
         return True, "", {
             "settled_item": settled_id,

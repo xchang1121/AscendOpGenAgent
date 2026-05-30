@@ -193,8 +193,33 @@ def run_eval(task_dir: str, config: TaskConfig,
                 timeout=request.timeout * (1 if request.sticky else 2) + 60,
             )
         except Exception as e:
+            # Pull the response body out of HTTPError so structured worker
+            # errors (e.g. drift-guard "restart required, changed=[...]"
+            # at 503; "client disconnected while queued" at 499) reach the
+            # user instead of being squashed into "HTTP Error 503: Service
+            # Unavailable". Without this, the operator only sees the
+            # status line and has to ssh into the worker log to find out
+            # whether to restart the daemon or chase an NPU fault.
+            from urllib.error import HTTPError as _HTTPError
+            detail = str(e)
+            if isinstance(e, _HTTPError):
+                try:
+                    body_bytes = e.read()
+                    if body_bytes:
+                        try:
+                            body = json.loads(body_bytes.decode("utf-8",
+                                                                errors="replace"))
+                            body_str = (body.get("detail")
+                                        if isinstance(body, dict)
+                                        else None) or json.dumps(body)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            body_str = body_bytes.decode(
+                                "utf-8", errors="replace")
+                        detail = f"HTTP {e.code}: {body_str[:500]}"
+                except Exception:
+                    pass
             return EvalResult(outcome=EvalOutcome.INFRA_FAIL,
-                              error=f"worker /run failed: {e}")
+                              error=f"worker /run failed: {detail}")
 
         return _assemble_eval_result(
             resp.get("verify_resp") or {},

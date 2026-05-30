@@ -39,6 +39,54 @@ def py_stem(name: str) -> str:
     return name[:-3] if name.endswith(".py") else name
 
 
+def _is_contained(path: str) -> bool:
+    """Return True iff `path` is a relative path that doesn't escape its
+    parent. False for absolute paths (any platform), drive-letter forms,
+    paths containing `..` segments, or paths whose normalised form would
+    resolve outside the empty-base join target.
+
+    Used at task.yaml load time to refuse editable_files / data_files /
+    ref_file entries that point outside the task_dir. Without this, a
+    hand-edited (or hostile) task.yaml could list `../../secret.txt`
+    and package_builder would read + tar the file before the remote
+    worker's safe_extract had a chance to reject it on extraction —
+    the bytes would already have left the client.
+    """
+    if not path:
+        return False
+    # Reject any drive letter (Windows) or POSIX absolute path. Also
+    # reject leading `/` or `\` on Windows: os.path.isabs returns
+    # False for `/foo/bar` on Windows because it lacks a drive letter,
+    # so without this extra check a task.yaml shipped from a POSIX dev
+    # box could pass containment on a Windows worker (or vice-versa).
+    if (os.path.isabs(path)
+            or (len(path) >= 2 and path[1] == ":")
+            or path.startswith(("/", "\\"))):
+        return False
+    # Reject any `..` segment, on either separator.
+    normalised = path.replace("\\", "/")
+    parts = [p for p in normalised.split("/") if p and p != "."]
+    if any(p == ".." for p in parts):
+        return False
+    return True
+
+
+def _filter_contained(paths: list, field_name: str) -> list:
+    """Drop entries that fail `_is_contained` and emit a stderr warning
+    naming each rejection — silent drops would have the operator
+    chasing 'why is data_files smaller than my task.yaml'."""
+    import sys as _sys
+    safe: list = []
+    for p in paths:
+        if _is_contained(str(p)):
+            safe.append(p)
+        else:
+            print(f"[loader] WARNING: dropping {field_name} entry "
+                  f"{p!r}: path escapes task_dir (absolute, drive "
+                  f"letter, or contains `..`).", file=_sys.stderr)
+    return safe
+
+
 # ---------------------------------------------------------------------------
 # Data class
 # ---------------------------------------------------------------------------
@@ -190,12 +238,29 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
     else:
         data_files = []
 
+    # Refuse path-escaping entries before they reach package_builder /
+    # eval_runner. The package builder reads the file off disk
+    # (task_dir + name); without containment a `../../secret` in
+    # task.yaml would be slurped into the tar and shipped to the
+    # remote worker even though the worker's safe_extract would reject
+    # it on the other side — the bytes have already left.
+    raw_editable = raw.get("editable_files") or []
+    editable_files = _filter_contained(list(raw_editable), "editable_files")
+    data_files = _filter_contained(data_files, "data_files")
+    raw_ref = agent_block.get("ref_file") or REF_FILE_DEFAULT
+    if not _is_contained(str(raw_ref)):
+        import sys as _sys
+        print(f"[loader] WARNING: ref_file {raw_ref!r} escapes task_dir; "
+              f"falling back to {REF_FILE_DEFAULT}. Hand-edit task.yaml "
+              f"if this isn't what you intended.", file=_sys.stderr)
+        raw_ref = REF_FILE_DEFAULT
+
     config = TaskConfig(
         name=name,
         description=raw.get("description", ""),
         arch=raw.get("arch"),
-        editable_files=raw.get("editable_files", []),
-        ref_file=agent_block.get("ref_file") or REF_FILE_DEFAULT,
+        editable_files=editable_files,
+        ref_file=raw_ref,
         data_files=data_files,
         eval_timeout=eval_block.get("timeout", default_eval_timeout()),
         num_cases=int(eval_block.get("num_cases", 0) or 0),

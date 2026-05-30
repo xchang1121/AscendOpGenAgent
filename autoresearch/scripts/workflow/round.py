@@ -167,6 +167,16 @@ def record_round(task_dir: str, eval_data: dict,
         "eval_rounds": round_num,
         "max_rounds": progress.max_rounds or config.max_rounds,
         "consecutive_failures": progress.consecutive_failures,
+        # Identity fields — let pipeline.py's replay verify it's
+        # settling the same plan item that record_round saw, not the
+        # next ACTIVE one after a partial settle. Without these, a
+        # SIGKILL after PlanStore.settle_active() committed plan.md
+        # but before _clear_pending_settle() caused replay to settle
+        # the NEXT (ACTIVE) item against the same kd_json — plan.md
+        # ended up with two extra settled rows for one round.
+        "plan_item": plan_item,
+        "plan_version": progress.plan_version,
+        "round": round_num,
     }
 
     # Persist the kd_json as the pending-settle sentinel BEFORE
