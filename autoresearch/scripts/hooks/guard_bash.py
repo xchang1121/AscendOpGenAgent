@@ -38,7 +38,7 @@ from utils.settings import hallucinated_scripts
 _BLESSED_SCRIPTS = {
     "quick_check.py",
     "scaffold.py", "baseline.py", "dashboard.py",
-    "create_plan.py", "settle.py", "pipeline.py", "resume.py",
+    "create_plan.py", "pipeline.py", "resume.py",
     "parse_args.py",
 }
 
@@ -91,7 +91,15 @@ def _script_name_check(command: str):
                    f"Use: python scripts/{real}")
         if script_name in _LIBRARY_NOT_CLI:
             block_decision(f"[AR] {_LIBRARY_NOT_CLI[script_name]}")
-        if "autoresearch/scripts/" in script_path and script_name not in _BLESSED_SCRIPTS:
+        # parse_script_names returns paths shaped as `scripts/<sub>`
+        # (b83010f dropped the `autoresearch/` prefix). The old
+        # `"autoresearch/scripts/" in script_path` guard was always
+        # False, so unknown script names fell through to the generic
+        # canonical-form rejection and the user lost the targeted
+        # "Valid scripts: …" hint. parse_script_names already filters
+        # to real `scripts/` invocations, so the only thing this last
+        # check needs is the blessed-table comparison.
+        if script_name not in _BLESSED_SCRIPTS:
             block_decision(f"[AR] Unknown script '{script_name}'. "
                    f"Valid scripts: {sorted(_BLESSED_SCRIPTS)}")
 

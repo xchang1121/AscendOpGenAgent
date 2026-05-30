@@ -39,14 +39,14 @@ def _run_settle(task_dir: str, kd_json: dict) -> tuple:
     """Settle the active plan item in-process. Returns
     ``(ok: bool, error_tail: str, settle_json: dict | None)``.
 
-    Previously this subprocessed `settle.py` and parsed its stdout. Same
-    Python tree as pipeline.py and the rest of the engine, no subprocess
-    / rc-decoding / stdout-tail ceremony. `settle.py` itself stays as a
-    standalone CLI for manual replay; this in-process path duplicates
-    its body verbatim, so behaviour is identical. settle_json carries
-    the `settled_item` id, which the caller needs for the status report
-    — `get_active_item()` AFTER settle points at the NEXT ACTIVE item,
-    not the one we just settled.
+    Used to subprocess `engine/settle.py` and parse its stdout; now
+    inlined here (`engine/settle.py` was deleted). For manual recovery
+    after a failed settle, the operator re-runs pipeline.py — the
+    `.pending_settle.json` sentinel makes the re-run skip quick_check
+    / eval / record_round and replay this function only. The `settle_
+    json` returned here carries the `settled_item` id, which the caller
+    needs for the status report — `get_active_item()` AFTER settle
+    points at the NEXT ACTIVE item, not the one we just settled.
     """
     try:
         decision = kd_json.get("decision", "FAIL")

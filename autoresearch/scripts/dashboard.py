@@ -12,6 +12,7 @@ import phase_machine as _pm
 from task_config.metric_policy import STUCK_BASELINE_OUTCOMES
 from utils.json_io import load_jsonl as _shared_load_jsonl
 from utils.json_io import _read_whole_file as _shared_read_whole_file
+from utils.settings import default_max_rounds as _default_max_rounds
 
 # ---------------------------------------------------------------------------
 # Non-blocking keyboard input (cross-platform)
@@ -170,7 +171,14 @@ def render(task_dir, history_offset=0, history_window=None):
 
     task = progress.get("task", "?")
     rounds = progress.get("eval_rounds", 0)
-    max_rounds = progress.get("max_rounds", 20)
+    # Was a hardcoded 20 that drifted from the rest of the framework
+    # after e4aa13e + 71b968a moved max_rounds to single-source in
+    # config.yaml. Tasks scaffolded after those commits pin the value in
+    # progress.json, so this fallback only fires on legacy progress.json
+    # files lacking the field — defer to settings so a missing field
+    # still displays a sane number consistent with what the scheduler
+    # actually uses.
+    max_rounds = progress.get("max_rounds", _default_max_rounds())
     best = progress.get("best_metric")
     baseline = progress.get("baseline_metric")
     best_commit = progress.get("best_commit", "?")

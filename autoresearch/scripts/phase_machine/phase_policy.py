@@ -404,7 +404,12 @@ def is_single_foreground_ar_invocation(command: str, *, script: str) -> tuple:
 # that mention the name in args, not invocations).
 _SUBPROCESS_ONLY_AR_SCRIPTS = {
     "quick_check.py":  "subprocess-only (invoked by pipeline.py)",
-    "settle.py":       "subprocess-only (invoked by pipeline.py)",
+    # settle.py was removed: pipeline.py inlines its body (_run_settle)
+    # and the "manual replay" path is documented inside pipeline.py
+    # itself (re-run pipeline.py; the .pending_settle.json sentinel
+    # makes it skip quick_check/eval/record_round). The old standalone
+    # CLI was guarded out by this very table — keeping both was a
+    # contradiction the operator could not resolve.
 }
 
 # Per-phase: which AR script names may run.

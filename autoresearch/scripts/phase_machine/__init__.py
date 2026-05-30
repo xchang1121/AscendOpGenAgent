@@ -46,7 +46,15 @@ from .state_store import (
     task_dir_pointer_path, write_task_dir_pointer, read_task_dir_pointer,
 )
 from .validators import (
-    validate_kernel, validate_plan, validate_diagnose,
+    # validate_kernel + validate_diagnose were re-exported here for a
+    # symmetry that no in-tree caller actually used (a `git grep` from
+    # outside this package found zero call sites for either name).
+    # quick_check.py drives the Triton-impl AST check directly via
+    # utils.validate_triton_impl, and DIAGNOSE artifact validation
+    # runs through diagnose_state below — drop the facades so a
+    # maintainer doesn't waste time looking for "where else this
+    # phase-machine surface fires from".
+    validate_plan,
     DiagnoseState, diagnose_state,
     DIAGNOSE_NEED_DIAGNOSIS, DIAGNOSE_READY, DIAGNOSE_MANUAL_FALLBACK,
     get_plan_items, parse_plan_text, has_pending_items, get_active_item,

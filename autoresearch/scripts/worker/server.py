@@ -82,6 +82,41 @@ def _safe_extract_tar(tar_bytes: bytes, dest_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Startup janitor — clean leftover /tmp/ar_run_* dirs
+# ---------------------------------------------------------------------------
+# `_run_eval_async` uses TemporaryDirectory(prefix="ar_run_…"), which
+# auto-cleans on the context manager exit. But the worker process
+# itself can be SIGKILLed (OOM-killer, hung NPU, operator -9), and
+# then every in-flight eval's tmp dir leaks under /tmp/ until disk
+# pressure forces investigation. The packages there include the task
+# source the user shipped, so unbounded retention is also a
+# data-hygiene problem.
+#
+# Run on startup: a freshly started worker has zero in-flight evals
+# by definition, so any pre-existing /tmp/ar_run_* dir came from a
+# previous (crashed) worker and is safe to remove. Best-effort —
+# per-dir errors are logged and skipped so a single permissions issue
+# doesn't keep the worker from coming up.
+
+def _janitor_clean_stale_tmp_dirs() -> int:
+    """Remove every `/tmp/ar_run_*` dir left behind by a previous
+    worker that didn't clean up. Returns the count removed."""
+    import glob
+    import shutil
+    tmp_root = tempfile.gettempdir()
+    cleaned = 0
+    for path in glob.glob(os.path.join(tmp_root, "ar_run_*")):
+        if not os.path.isdir(path):
+            continue
+        try:
+            shutil.rmtree(path)
+            cleaned += 1
+        except OSError as e:
+            logger.warning("janitor: could not remove %s: %s", path, e)
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
 # Source-drift detection
 # ---------------------------------------------------------------------------
 # Daemon-style workers keep `utils.eval_runner` (and friends) cached in
@@ -150,11 +185,13 @@ async def lifespan(app: FastAPI):
     for d in devices:
         q.put_nowait(d)
     snap = _snapshot_python_files(_SCRIPTS_DIR)
+    cleaned = _janitor_clean_stale_tmp_dirs()
     _state.update(backend=backend, arch=arch, devices=devices, queue=q,
                   source_snapshot=snap)
     logger.info("worker ready: backend=%s arch=%s devices=%s "
-                "source_snapshot=%d files under %s",
-                backend, arch, devices, len(snap), _SCRIPTS_DIR)
+                "source_snapshot=%d files under %s "
+                "janitor_cleaned=%d stale tmp dirs",
+                backend, arch, devices, len(snap), _SCRIPTS_DIR, cleaned)
     yield
     logger.info("worker shutting down")
 

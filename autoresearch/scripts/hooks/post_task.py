@@ -27,7 +27,7 @@ from hooks.utils import read_hook_input, emit_status
 from phase_machine import (
     DIAGNOSE, DIAGNOSE_ATTEMPTS_CAP, diagnose_artifact_path,
     diagnose_marker, diagnose_state, get_task_dir, read_phase,
-    update_progress,
+    touch_heartbeat, update_progress,
     DIAGNOSE_READY,
 )
 
@@ -97,6 +97,12 @@ def main():
     task_dir = get_task_dir()
     if not task_dir:
         sys.exit(0)
+    # Mirror the other PostToolUse hooks — DIAGNOSE Task subagents can
+    # run minutes longer than heartbeat_fresh_seconds. Without this
+    # touch, a concurrent resume.py looks at the stale .heartbeat and
+    # claims the task as orphaned, then both sessions write .active_task
+    # / .phase / progress.json in parallel.
+    touch_heartbeat(task_dir)
     if read_phase(task_dir) != DIAGNOSE:
         sys.exit(0)
 
