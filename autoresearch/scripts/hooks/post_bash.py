@@ -107,17 +107,23 @@ def _handle_activation(new_task_dir: str):
     pc = PhaseController(new_task_dir)
     if has_phase:
         phase = read_phase(new_task_dir)
-        # Stale-planning recovery: phase file says PLAN / DIAGNOSE /
-        # REPLAN but the on-disk plan.md + progress.json show a
-        # validated plan with an active item. This is the state left
-        # by a create_plan.py that finished both disk writes (plan +
-        # progress) but crashed before PostToolUse advanced .phase to
-        # EDIT. Without recovery, the agent would re-run create_plan
-        # and bump to vN+1, losing the pending items of vN.
-        # compute_resume_phase already returns EDIT for this shape;
-        # call on_activation_resume to apply it via the same atomic
-        # phase-write path.
-        if phase in (PLAN, DIAGNOSE, REPLAN):
+        # Stale-planning recovery: phase file says PLAN or REPLAN but
+        # plan.md + progress.json show a validated plan with an active
+        # item. This is the state left by a create_plan.py that finished
+        # both disk writes but crashed before PostToolUse advanced
+        # .phase to EDIT. Without recovery, the agent re-runs
+        # create_plan, bumps to vN+1, and loses the pending items of vN.
+        #
+        # DIAGNOSE is deliberately NOT in this list: it has its own
+        # gate (diagnose_state.action requires the subagent's
+        # diagnose_v<N>.md artifact). compute_resume_phase doesn't
+        # model that gate — it would happily return EDIT for a DIAGNOSE
+        # task whose plan still carries the pre-DIAGNOSE active item,
+        # skipping the diagnosis the agent was about to do. Leave
+        # DIAGNOSE to the normal PostToolUse(Task) flow; if the
+        # operator's session died mid-DIAGNOSE the agent just continues
+        # the artifact loop on resume.
+        if phase in (PLAN, REPLAN):
             recomputed = pc.on_activation_resume()
             if recomputed != phase:
                 emit_status(

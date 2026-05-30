@@ -22,6 +22,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import manifest as mf
@@ -269,7 +270,8 @@ def env_with_no_proxy() -> dict[str, str]:
 
 
 def run_one(batch_dir: Path, case: dict,
-            args: argparse.Namespace, hw_arg: str, log_fp) -> int:
+            args: argparse.Namespace, hw_arg: str, log_fp,
+            prev_task_dir: Optional[str] = None) -> int:
     op = case["op_name"]
     repo_root = mf.repo_root()
     prompt = build_prompt(case, hw_arg,
@@ -308,8 +310,17 @@ def run_one(batch_dir: Path, case: dict,
     # still clears fine; only a truly-live concurrent session causes
     # a refuse, in which case the op aborts loudly instead of
     # cross-writing state.
+    # Pass our just-finished task_dir as `expected_task_dir` so the
+    # ownership branch fires instead of the heartbeat-fresh defence.
+    # Between batch ops the previous op's last hook touched heartbeat
+    # seconds ago; a heartbeat-only check would refuse every legitimate
+    # transition. With the expected pointer matching, clear_active_task
+    # treats it as "mine" and clears regardless of warmth. First op
+    # of the run (prev_task_dir is None) falls through to the heartbeat
+    # defence, which correctly protects against a manual Claude session
+    # already running on this checkout.
     from phase_machine import clear_active_task
-    if not clear_active_task():
+    if not clear_active_task(expected_task_dir=prev_task_dir):
         sys.stdout.write(f"[run] op={op}: refusing to start — another "
                          f"session is active on this checkout. Stop it "
                          f"or rm autoresearch/.active_task to take over.\n")
@@ -645,6 +656,12 @@ def main() -> int:
         succeeded = failed = skipped = 0
         total_started = time.time()
         rc_final = 0
+        # Carry the previous op's task_dir into the next iteration so
+        # run_one can pass it as expected_task_dir to clear_active_task
+        # — the only signal we have that .active_task's current pointer
+        # belongs to us (a batch op we ourselves drove) versus to an
+        # unrelated concurrent session.
+        prev_task_dir: Optional[str] = None
         try:
             for i, case in enumerate(queue, 1):
                 op = case["op_name"]
@@ -658,7 +675,18 @@ def main() -> int:
                       f"elapsed_total={(time.time()-total_started)/60:.1f}min")
 
                 try:
-                    rc = run_one(batch_dir, case, args, hw_arg, log_fp)
+                    rc = run_one(batch_dir, case, args, hw_arg, log_fp,
+                                 prev_task_dir=prev_task_dir)
+                    # Refresh prev_task_dir from whatever update_case
+                    # eventually wrote (run_one resolves the task_dir
+                    # mid-run via scaffold markers). On run_one abort
+                    # without ever binding a task_dir, the field stays
+                    # None and the next clear() will fall through to
+                    # the heartbeat defence — which is what we want.
+                    settled = mf.load_progress(batch_dir).get(
+                        "cases", {}).get(op, {}).get("task_dir")
+                    if settled:
+                        prev_task_dir = settled
                 except KeyboardInterrupt:
                     print("\n[batch] Ctrl-C — current op recorded, stopping.")
                     rc_final = 130

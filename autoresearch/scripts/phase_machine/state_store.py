@@ -152,24 +152,36 @@ def get_task_dir() -> str:
     return os.environ.get("AR_TASK_DIR", "")
 
 
-def clear_active_task(*, force: bool = False) -> bool:
+def clear_active_task(expected_task_dir: Optional[str] = None,
+                      *, force: bool = False) -> bool:
     """Remove the repo-wide .active_task pointer if it's safe to do so.
     Returns True when the pointer is gone after the call (deleted or
     already absent), False when refused.
 
-    "Safe" means: the pointer is missing, dangling (points at a deleted
-    dir), or its task_dir's heartbeat is older than
-    heartbeat_fresh_seconds. A fresh heartbeat means another live
-    session (manual Claude, another batch) is actively writing the
-    task — silently unlinking would let our caller create its own
-    activation and the two sessions would then cross-write state.
-    Pass force=True to override.
+    Ownership semantics (the structural piece that the earlier
+    heartbeat-only check kept conflating): `.active_task` is repo-wide
+    and unscoped, so "is this pointer mine?" is the question that
+    actually decides safety, not "is its task warm?". Callers that
+    just finished a task they themselves drove pass the task_dir they
+    were running as `expected_task_dir`:
 
-    Used by batch/run.py between ops (where the prior op's pointer is
-    expected to be stale) and any other "supervisor" that knows it
-    owns the activation lifecycle. Hooks should keep using
-    set_task_dir (which calls into the same heartbeat check on the
-    write path).
+      - pointer absent                            → True (nothing to do)
+      - force=True                                → unlink, True
+      - pointer points at `expected_task_dir`     → unlink, True
+        (it IS the one I just finished, regardless of how warm the
+        heartbeat is — between batch ops the prior op's last hook
+        touched heartbeat seconds ago, so a heartbeat-only check
+        would block every legitimate transition)
+      - pointer points at a now-deleted dir       → unlink, True
+        (dangling)
+      - heartbeat is older than the configured
+        fresh window                              → unlink, True
+        (truly stale, prior owner died)
+      - everything else (different task_dir, fresh heartbeat)
+                                                  → refuse, False
+        (another live session looks active; silent unlink would let
+        the caller create its own activation and the two sessions
+        would then cross-write state)
     """
     if not os.path.exists(_ACTIVE_TASK_FILE):
         return True
@@ -178,14 +190,38 @@ def clear_active_task(*, force: bool = False) -> bool:
             pointed = f.read().strip()
     except OSError:
         pointed = ""
-    if not force and pointed and os.path.isdir(pointed):
+
+    if force:
+        _try_unlink_active()
+        return True
+
+    # "Mine" branch: caller asserts they own the task this pointer
+    # describes. Skip the heartbeat check entirely.
+    if (expected_task_dir
+            and pointed
+            and os.path.abspath(pointed) == os.path.abspath(expected_task_dir)):
+        _try_unlink_active()
+        return True
+
+    # Dangling pointer: nothing live can be writing it.
+    if pointed and not os.path.isdir(pointed):
+        _try_unlink_active()
+        return True
+
+    # Different pointer or no expected_task_dir given: fall through to
+    # the heartbeat-fresh defence (guards against a concurrent manual
+    # Claude session on the same checkout).
+    if pointed:
         try:
             _scripts = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             if _scripts not in sys.path:
                 sys.path.insert(0, _scripts)
             from utils.settings import heartbeat_fresh_seconds as _hb
             fresh_window = _hb()
-        except Exception:
+        except Exception as _e:
+            print(f"[state_store] WARNING: heartbeat_fresh_seconds() "
+                  f"unavailable ({_e}); falling back to 180s.",
+                  file=sys.stderr)
             fresh_window = 180
         import time as _time
         hb_path = state_path(pointed, HEARTBEAT_FILE)
@@ -195,17 +231,22 @@ def clear_active_task(*, force: bool = False) -> bool:
             age = float("inf")
         if age < fresh_window:
             print(f"[state_store] WARNING: refusing to clear .active_task "
-                  f"— currently points at {pointed} with a fresh heartbeat "
-                  f"({age:.0f}s ago, window={fresh_window}s). Another "
-                  f"Claude or batch session looks active. Pass "
-                  f"force=True only if you've verified that session is "
-                  f"truly done.", file=sys.stderr)
+                  f"— points at {pointed} with a fresh heartbeat "
+                  f"({age:.0f}s ago, window={fresh_window}s) and the "
+                  f"caller didn't claim ownership (expected_task_dir="
+                  f"{expected_task_dir!r}). Pass force=True only if "
+                  f"you've verified that session is truly done.",
+                  file=sys.stderr)
             return False
+    _try_unlink_active()
+    return True
+
+
+def _try_unlink_active() -> None:
     try:
         os.remove(_ACTIVE_TASK_FILE)
     except OSError:
         pass
-    return True
 
 
 def set_task_dir(task_dir: str, *, force: bool = False) -> bool:
