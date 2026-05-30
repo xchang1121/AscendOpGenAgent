@@ -17,6 +17,29 @@ import yaml
 
 
 # ---------------------------------------------------------------------------
+# File-name constants + helpers
+# ---------------------------------------------------------------------------
+# `reference.py` was hardcoded in six unrelated files (scaffold, loader,
+# package_builder x2, eval_client, worker.server) and the inverse
+# stem/basename conversion was implemented twice as inline
+# `.replace(".py", "")` plus once as `+ ".py"`. A renamed default or a
+# new caller forgetting one of the conversions silently produced
+# `reference.py.py` or "no such file". Funnel through these constants
+# + helpers so the contract has a single owner.
+
+REF_FILE_DEFAULT = "reference.py"
+
+
+def py_stem(name: str) -> str:
+    """Strip a trailing `.py` extension. Idempotent: passing in a stem
+    returns it unchanged. Used at the eval_kernel / worker / eval_client
+    boundary because eval_kernel's CLI takes `--ref-file <stem>` (no
+    extension) while TaskConfig.ref_file carries the basename WITH `.py`.
+    """
+    return name[:-3] if name.endswith(".py") else name
+
+
+# ---------------------------------------------------------------------------
 # Data class
 # ---------------------------------------------------------------------------
 
@@ -37,7 +60,7 @@ class TaskConfig:
 
     # Files
     editable_files: list = field(default_factory=list)
-    ref_file: str = "reference.py"
+    ref_file: str = REF_FILE_DEFAULT
 
     # Sibling files the ref module reads at runtime (NPUKernelBench-style
     # `<op>.json` shape lists, sglang-style `ref.pt` output caches,
@@ -172,7 +195,7 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
         description=raw.get("description", ""),
         arch=raw.get("arch"),
         editable_files=raw.get("editable_files", []),
-        ref_file=agent_block.get("ref_file") or "reference.py",
+        ref_file=agent_block.get("ref_file") or REF_FILE_DEFAULT,
         data_files=data_files,
         eval_timeout=eval_block.get("timeout", default_eval_timeout()),
         num_cases=int(eval_block.get("num_cases", 0) or 0),

@@ -26,7 +26,7 @@ import os
 import tarfile
 from typing import Iterable
 
-from .loader import TaskConfig
+from .loader import TaskConfig, REF_FILE_DEFAULT
 
 
 def _add_file(tar: tarfile.TarFile, task_dir: str, name: str,
@@ -61,7 +61,7 @@ def build_package(task_dir: str, config: TaskConfig,
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         _add_file(tar, task_dir, "task.yaml", seen)
-        _add_file(tar, task_dir, config.ref_file or "reference.py", seen)
+        _add_file(tar, task_dir, config.ref_file or REF_FILE_DEFAULT, seen)
         for ef in config.editable_files or []:
             _add_file(tar, task_dir, ef, seen)
         for df in config.data_files or []:

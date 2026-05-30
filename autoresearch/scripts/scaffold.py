@@ -47,6 +47,7 @@ from utils.settings import (  # noqa: E402
     default_max_rounds, default_eval_timeout, default_metric,
     default_code_checker_enabled,
 )
+from task_config import REF_FILE_DEFAULT  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +88,7 @@ def scaffold_task_dir(
     os.makedirs(task_dir)
 
     # Write reference.py and the seed kernel.py from the user's files.
-    _write(task_dir, "reference.py", ref_code)
+    _write(task_dir, REF_FILE_DEFAULT, ref_code)
     _write(task_dir, editable_filename, kernel_code)
 
     # NPUKernelBench-style refs read shape lists from a sibling JSON via
@@ -138,7 +139,7 @@ def scaffold_task_dir(
     # failure (no torch/CANN here) just omits the field; eval_request then
     # falls back to its own probe / fingerprint reuse as before.
     eval_block = {"timeout": eval_timeout}
-    num_cases = _probe_num_cases(task_dir, "reference.py")
+    num_cases = _probe_num_cases(task_dir, REF_FILE_DEFAULT)
     if num_cases and num_cases > 1:
         eval_block["num_cases"] = num_cases
 
@@ -157,7 +158,7 @@ def scaffold_task_dir(
             "improvement_threshold": default_metric()["improvement_threshold"],
         },
         "agent": {
-            "ref_file": "reference.py",
+            "ref_file": REF_FILE_DEFAULT,
             "max_rounds": max_rounds,
         },
     }
