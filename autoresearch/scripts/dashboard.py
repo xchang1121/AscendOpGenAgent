@@ -9,7 +9,6 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import phase_machine as _pm
-from task_config.metric_policy import STUCK_BASELINE_OUTCOMES
 from utils.json_io import load_jsonl as _shared_load_jsonl
 from utils.json_io import _read_whole_file as _shared_read_whole_file
 from utils.settings import default_max_rounds as _default_max_rounds
@@ -227,18 +226,10 @@ def render(task_dir, history_offset=0, history_window=None):
         improv_pct = (baseline - best) / abs(baseline) * 100
         speedup = baseline / best
         color = GREEN if improv_pct > 0 else RED
-        # Label the anchor so the speedup number is honest about what it
-        # compares against: "ref" = PyTorch baseline measured cleanly;
-        # "seed_fallback" = ref couldn't be measured (e.g. seed crash
-        # masked it), so the ratio is vs the seed kernel itself — useful
-        # for tracking improvement but NOT a true speedup.
+        # Anchor is always "ref" for committed tasks (the baseline gate
+        # refuses to commit without a valid PyTorch reference).
         src = progress.get("baseline_source")
-        if src == "ref":
-            anchor_label = "vs ref"
-        elif src == "seed_fallback":
-            anchor_label = "vs seed (no ref measured)"
-        else:
-            anchor_label = "vs baseline"
+        anchor_label = "vs ref" if src == "ref" else "vs baseline"
         improv_str = f"{color}{speedup:.2f}x {anchor_label} ({improv_pct:+.1f}%){RESET}"
     else:
         improv_str = f"{DIM}N/A{RESET}"
@@ -276,11 +267,10 @@ def render(task_dir, history_offset=0, history_window=None):
     lines.append("")
     lines.append(f"  {BOLD}Budget:{RESET}   {budget_color}{budget_bar} {rounds}/{max_rounds}{RESET}")
 
-    # Baseline (PyTorch reference timing). Can be missing when the eval
-    # eval pipeline broke (infra_fail) — either ref invalid or env down.
+    # Baseline (PyTorch reference timing). Always present on committed
+    # tasks — the gate refuses to commit without a valid ref.
     baseline_tags = {
         "ref": f"{DIM}(PyTorch reference){RESET}",
-        "seed_fallback": f"{YELLOW}(fallback: seed — ref profile failed){RESET}",
     }
     if baseline is None:
         lines.append(f"  {BOLD}Baseline:{RESET} {DIM}— (not measured){RESET}")
@@ -289,18 +279,14 @@ def render(task_dir, history_offset=0, history_window=None):
                                           f"{DIM}(source unknown){RESET}")
         lines.append(f"  {BOLD}Baseline:{RESET} {baseline}  {baseline_tag}")
 
-    # Seed (initial kernel timing). Task-level INFRA_FAIL aborts surface
-    # in the banner above; here they collapse to "not measured".
+    # Seed (initial kernel timing).
     seed = progress.get("seed_metric")
     if seed is not None:
         if seed != baseline:
             lines.append(f"  {BOLD}Seed:{RESET}     {seed}  {DIM}(initial kernel){RESET}")
-        # else: redundant with Baseline line (seed_fallback path), suppress
     elif outcome == "kernel_fail":
         lines.append(f"  {BOLD}Seed:{RESET}     {RED}FAILED{RESET}  "
                      f"{DIM}(kernel verify or profile failed; timing dropped){RESET}")
-    elif outcome in STUCK_BASELINE_OUTCOMES:
-        lines.append(f"  {BOLD}Seed:{RESET}     {DIM}— (not measured; see ABORTED above){RESET}")
     else:
         lines.append(f"  {BOLD}Seed:{RESET}     {DIM}— (no timing recorded){RESET}")
     lines.append(f"  {BOLD}Best:{RESET}     {GREEN}{best}{RESET}  ({improv_str})")

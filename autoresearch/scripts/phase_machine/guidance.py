@@ -468,7 +468,8 @@ def get_guidance(task_dir: str) -> str:
         seed_failed_section = ""
         target_file = editable[0] if editable else "kernel.py"
         # SEED FAILED fires for kernel-side baseline failures (kernel_fail);
-        # STUCK_BASELINE_OUTCOMES (infra_fail) never reach PLAN.
+        # infra_fail never reaches PLAN: the ref-baseline gate parks
+        # such tasks at BASELINE with no committed progress.
         outcome = progress.get("baseline_outcome") if progress else None
         seed_failed = bool(progress) and (
             progress.get("seed_metric") is None

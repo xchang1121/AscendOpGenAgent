@@ -36,9 +36,18 @@ def _validate_resumable(t) -> tuple[bool, str]:
     try:
         progress = t.progress
     except TaskNotInitialized:
-        return False, ("No measured progress yet (baseline never "
-                       "committed). Run /autoresearch without "
-                       "--resume to start a fresh task.")
+        # Resumability is keyed on PHASE, not progress presence. A task
+        # parked at BASELINE with no committed baseline is the legitimate
+        # "baseline pending" state (the gate refused to commit because no
+        # valid ref baseline) — resume re-runs baseline.py after the env/
+        # ref/worker is fixed. Any other phase with no progress is a task
+        # that was never initialised.
+        from phase_machine import read_phase, BASELINE
+        if read_phase(t.task_dir) == BASELINE:
+            return True, ""
+        return False, ("Baseline never committed and phase is not "
+                       "BASELINE — task was never initialised. Run "
+                       "/autoresearch without --resume to start fresh.")
     required_fields = {"task", "eval_rounds", "max_rounds"}
     missing = required_fields - set(progress.keys())
     if missing:

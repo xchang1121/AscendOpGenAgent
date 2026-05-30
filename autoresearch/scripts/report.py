@@ -302,12 +302,7 @@ def render_report(task_dir: str) -> str:
     ref_val: Optional[float] = (raw_ref if isinstance(raw_ref, (int, float))
                                 and raw_ref > 0 else None)
     baseline_source = progress.get("baseline_source", "")
-    if baseline_source == "ref":
-        ref_label = "PyTorch ref"
-    elif baseline_source == "seed_fallback":
-        ref_label = "seed baseline"
-    else:
-        ref_label = "baseline"
+    ref_label = "PyTorch ref" if baseline_source == "ref" else "baseline"
 
     total_rounds = len(history)
     n_keep = sum(1 for r in history if r.get("decision") in ("KEEP", "SEED"))

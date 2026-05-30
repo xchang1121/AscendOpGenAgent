@@ -13,10 +13,12 @@ from typing import NamedTuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from phase_machine import (  # noqa: E402
-    Progress, append_history, load_progress, load_state, save_state,
-    history_path, write_intent, clear_intent, replay_intent,
+    BASELINE, Progress, append_history, load_progress, load_state,
+    save_state, history_path, write_intent, clear_intent, replay_intent,
+    write_phase,
 )
 from task_config import EvalOutcome, load_task_config  # noqa: E402
+from utils.baseline_anchor import valid_metric  # noqa: E402
 from utils.git_utils import current_head_short  # noqa: E402
 
 from .progress_reducer import reduce_baseline_init
@@ -208,6 +210,22 @@ def run_baseline_init(task_dir: str, eval_data: dict) -> int:
         print("[baseline] ERROR: task.yaml not found", file=sys.stderr)
         return 1
 
+    # Single hard gate: a baseline EXISTS iff the PyTorch reference was
+    # measured. Without a valid ref latency there is nothing to optimise
+    # against (speedup / KEEP-DISCARD are meaningless), so commit nothing
+    # — no Progress, no SEED row, progress_initialized stays False — and
+    # park the task at BASELINE so a retry after the env/ref/worker is
+    # fixed re-evaluates cleanly. Seed timing is NOT a substitute.
+    metrics = eval_data.get("metrics") or {}
+    if not valid_metric(metrics.get("ref_latency_us")):
+        write_phase(task_dir, BASELINE)
+        clear_intent(task_dir)
+        print(f"[baseline] no valid ref baseline "
+              f"({eval_data.get('error') or 'ref_latency_us missing'}) — "
+              f"baseline pending; fix env/ref/worker and re-run.",
+              file=sys.stderr)
+        return _EXIT_FOR[EvalOutcome.INFRA_FAIL]
+
     existing = load_progress(task_dir) or Progress()
     head_commit = current_head_short(task_dir) or "unknown"
     reduction = reduce_baseline_init(
@@ -268,8 +286,10 @@ def run_baseline_init(task_dir: str, eval_data: dict) -> int:
     # ---- Journal clear ----
     clear_intent(task_dir)
 
-    # Phase transition (PLAN for kernel_fail, untouched for infra_fail)
-    # is owned by on_baseline_settled.
+    # Phase transition is owned by on_baseline_settled. Only KERNEL_FAIL
+    # reaches here now (OK falls through below; INFRA_FAIL was gated out
+    # above before any commit): kernel_fail commits the ref baseline and
+    # routes to PLAN so the main loop rewrites the broken seed.
     if reduction.outcome != EvalOutcome.OK:
         PhaseController(task_dir).on_baseline_settled()
         print(f"[baseline] {reduction.outcome.value}: "

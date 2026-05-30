@@ -15,10 +15,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from phase_machine import (  # noqa: E402
     BASELINE, EDIT, FINISH, PLAN,
-    compute_next_phase, compute_resume_phase, load_progress, read_phase,
+    compute_next_phase, compute_resume_phase, load_progress,
     write_phase,
 )
-from task_config.metric_policy import STUCK_BASELINE_OUTCOMES  # noqa: E402
 
 
 class PhaseController:
@@ -33,15 +32,13 @@ class PhaseController:
         return self._write(BASELINE)
 
     def on_baseline_settled(self) -> str:
-        """ok / kernel_fail → PLAN; STUCK_BASELINE_OUTCOMES (infra_fail)
-        → leave phase as-is. Missing outcome (legacy progress) treated
-        as kernel_fail."""
+        """Committed baseline (progress present) → PLAN. No progress means
+        the baseline gate refused to commit (no valid ref baseline), so
+        park the task at BASELINE for a retry after env/ref/worker is
+        fixed."""
         progress = load_progress(self.task_dir)
         if progress is None:
-            return read_phase(self.task_dir)
-        outcome = progress.baseline_outcome or "kernel_fail"
-        if outcome in STUCK_BASELINE_OUTCOMES:
-            return read_phase(self.task_dir)
+            return self._write(BASELINE)
         return self._write(PLAN)
 
     def on_plan_validated(self) -> str:

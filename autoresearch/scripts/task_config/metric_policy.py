@@ -36,16 +36,6 @@ class EvalOutcome(str, Enum):
     INFRA_FAIL = "infra_fail"
 
 
-# Baseline outcomes the agent CANNOT recover from inside the EDIT loop.
-# Single source of truth for the "stuck" carve-out used by
-# PhaseController.on_baseline_settled, compute_resume_phase,
-# hooks/stop_save (early-Stop carve-out), hooks/post_bash (message
-# selection), and dashboard.py (banner choice).
-STUCK_BASELINE_OUTCOMES = frozenset({
-    EvalOutcome.INFRA_FAIL.value,
-})
-
-
 @dataclass
 class EvalResult:
     outcome: EvalOutcome = EvalOutcome.INFRA_FAIL

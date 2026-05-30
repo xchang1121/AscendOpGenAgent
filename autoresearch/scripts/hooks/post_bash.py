@@ -9,7 +9,8 @@ directly via the Bash tool:
                                 reference.py and kernel.py are guaranteed
                                 present because /autoresearch requires both)
   - `baseline.py`             → PLAN on success or on kernel_fail;
-                                infra_fail leaves phase untouched
+                                infra_fail (no valid ref) parks at
+                                BASELINE with no committed progress
   - `pipeline.py`             → whatever phase pipeline.py itself wrote
   - `create_plan.py`          → EDIT on plan validation pass
                                 (called from PLAN / DIAGNOSE / REPLAN)
@@ -153,15 +154,10 @@ def _fresh_start(task_dir: str):
 
 
 def _baseline_message(outcome, new_phase, progress, guidance):
-    if outcome == "infra_fail":
-        if getattr(progress, "baseline_error_source", None) == "ref":
-            return ("[AR] Baseline INFRA_FAIL (ref): reference.py is broken. "
-                    "Fix the source file passed via --ref and re-run "
-                    "/autoresearch from scratch — reference.py is not "
-                    "editable from EDIT. Phase stays at BASELINE.")
-        return ("[AR] Baseline INFRA_FAIL: eval pipeline broken (no per-shape "
-                "data). Do NOT edit kernel.py. Fix env / device / eval.timeout "
-                "and re-run baseline.py.")
+    # infra_fail never reaches this function: the ref-baseline gate
+    # refuses to commit progress in that case, so the caller hits the
+    # "no progress" branch and emits the baseline-pending message
+    # instead. Only OK / KERNEL_FAIL outcomes are reachable here.
     if outcome != "ok":
         reason = ("seed kernel produced no timing"
                   if progress.seed_metric is None
@@ -209,7 +205,13 @@ def main():
     if invoked == "baseline.py" and phase == BASELINE:
         progress = load_progress(task_dir)
         if not progress:
-            emit_status("[AR] Baseline failed (no progress.json). Retry.")
+            # No committed progress at BASELINE = ref-baseline gate
+            # refused to commit (no valid PyTorch reference). The
+            # specific cause (env/ref/worker) isn't recorded; stop_save
+            # surfaces the recovery path on Stop.
+            emit_status("[AR] Baseline pending: no valid PyTorch reference "
+                        "(env/ref/worker). Fix the cause and re-run "
+                        "baseline.py.")
         else:
             # baseline.py / workflow.run_baseline_init already advanced the
             # phase via PhaseController.on_baseline_settled before exiting.

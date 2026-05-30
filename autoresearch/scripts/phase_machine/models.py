@@ -40,7 +40,7 @@ class Progress:
     # Sticky pytorch baseline (anchors speedup display; pinned by the first
     # baseline_init that captured ref_latency_us, see workflow/seed.py).
     baseline_metric: Optional[float] = None
-    baseline_source: Optional[str] = None      # "ref" | "seed_fallback"
+    baseline_source: Optional[str] = None      # "ref" (only committed value)
     baseline_outcome: Optional[str] = None     # task_config.EvalOutcome value
     # error_source: "ref" | "kernel" | None. Set by run_verify's tagged
     # try/excepts. "ref" => scaffold rejects + user must fix --ref source.

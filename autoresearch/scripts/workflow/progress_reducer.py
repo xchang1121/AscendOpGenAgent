@@ -69,8 +69,7 @@ def reduce_baseline_init(existing: Progress, config: Any, eval_data: dict,
         dropped_seed_metric = seed_metric
         seed_metric = None
 
-    anchor = resolve_baseline_init_anchor(
-        existing, metrics, seed_metric=seed_metric)
+    anchor = resolve_baseline_init_anchor(existing, metrics)
 
     n_cases = metrics.get("num_cases")
     descs = metrics.get("per_shape_descs")

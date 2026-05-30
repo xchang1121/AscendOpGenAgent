@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Stop hook: allow Stop at FINISH or when the task is structurally stuck.
+"""Stop hook: allow Stop at FINISH or when baseline can't be established.
 
 Default behaviour blocks Stop in every non-FINISH phase so the agent
-can't bail out of the optimisation loop. One outcome breaks that rule:
-baseline_outcome == "infra_fail" — the eval pipeline is broken in a way
-the agent can't fix (reference.py invalid, env/runtime missing, worker
-disconnect). on_baseline_settled refuses to advance past BASELINE in
-that case; without this carve-out the agent would loop forever because
-guard_edit blocks any attempt to "fix" ref / external files. The emitted
-status text tells the user what to fix and how to resume.
+can't bail out of the optimisation loop. One state breaks that rule:
+the task is parked at BASELINE with NO committed progress — the ref-
+baseline gate (workflow.baseline) refused to commit because no valid
+PyTorch reference was measured (reference.py invalid, env/runtime
+missing, worker disconnect). The agent can't fix any of those, and
+guard_edit blocks "fixes" to ref / external files, so without this
+carve-out the agent would loop forever. The emitted status text tells
+the user what to fix and how to resume.
 """
 import json
 import os
@@ -21,7 +22,6 @@ from phase_machine import (
     BASELINE, FINISH, get_guidance, get_task_dir,
     load_progress, read_phase, update_progress,
 )
-from task_config.metric_policy import STUCK_BASELINE_OUTCOMES
 
 
 def _block_stop_with_reason(reason: str) -> None:
@@ -30,14 +30,14 @@ def _block_stop_with_reason(reason: str) -> None:
 
 
 def _is_stuck(phase: str, progress) -> bool:
-    """True iff the task can't be advanced from inside the agent loop.
-    Triggers at BASELINE when baseline produced an INFRA_FAIL — pipeline
-    is broken in a way that no kernel rewrite can fix. PLAN/EDIT etc.
-    are not "stuck" even if eval is failing; max_rounds routes them to
-    FINISH."""
-    if phase != BASELINE:
-        return False
-    return progress.get("baseline_outcome") in STUCK_BASELINE_OUTCOMES
+    """True when the task is parked at BASELINE with no committed
+    progress — the baseline gate refused to commit because no valid
+    PyTorch reference was measured (env / ref / worker broken). A
+    kernel rewrite cannot fix any of those, so the agent must be allowed
+    to Stop and the banner must point at the real cause. PLAN/EDIT etc.
+    are not "stuck" even if eval fails (max_rounds routes them to
+    FINISH)."""
+    return phase == BASELINE and progress is None
 
 
 def main():
@@ -48,43 +48,39 @@ def main():
         sys.exit(0)
 
     progress = load_progress(task_dir)
-    if progress is None:
-        sys.exit(0)
-
     phase = read_phase(task_dir)
     stuck = _is_stuck(phase, progress)
+
     if phase != FINISH and not stuck:
         _block_stop_with_reason(
             f"[AR] Cannot Stop at phase={phase}. Continue the loop:\n\n"
             f"{get_guidance(task_dir)}"
         )
 
+    if stuck:
+        # Baseline pending (no committed progress at BASELINE) — the ref-
+        # baseline gate refused to commit because no valid PyTorch ref
+        # was measured. There's no progress record to update; emit the
+        # recovery banner and exit. The specific cause (ref vs env vs
+        # worker) isn't recorded — they all converge here.
+        emit_status(
+            "\n[AR] Task aborted at BASELINE: no valid PyTorch reference "
+            "(env / ref / worker)."
+        )
+        emit_status(
+            f"[AR] Fix the cause and `/autoresearch --resume {task_dir}` "
+            f"to retry baseline, or re-scaffold from a fixed --ref."
+        )
+        return
+
+    if progress is None:
+        sys.exit(0)
+
     update_progress(
         task_dir,
         last_stop_reason=stop_reason,
         last_stop_time=datetime.now(timezone.utc).isoformat(),
     )
-
-    if stuck:
-        if progress.get("baseline_error_source") == "ref":
-            emit_status(
-                "\n[AR] Task aborted at BASELINE: reference.py is broken."
-            )
-            emit_status(
-                "[AR] Fix the SOURCE file you passed via --ref and re-run "
-                "/autoresearch from scratch (do NOT --resume; reference.py "
-                "isn't editable from EDIT)."
-            )
-        else:
-            emit_status(
-                "\n[AR] Task aborted at BASELINE: eval pipeline broken "
-                "(no per-shape data)."
-            )
-            emit_status(
-                f"[AR] Check device / env / worker / eval.timeout, then "
-                f"/autoresearch --resume {task_dir} to retry."
-            )
-        return
 
     rounds = progress.get("eval_rounds", 0)
     max_rounds = progress.get("max_rounds", 0)

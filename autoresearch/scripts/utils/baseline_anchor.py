@@ -136,7 +136,6 @@ def _per_shape_from_metrics(metrics: dict[str, Any]) -> Optional[list[float]]:
 
 
 def resolve_baseline_init_anchor(progress: Any, metrics: dict[str, Any],
-                                 seed_metric: Optional[float],
                                  ) -> AnchorDecision:
     """Choose the anchor written by round-0 baseline initialization."""
     ref_metric = _ref_from_metrics(metrics)
@@ -196,15 +195,18 @@ def resolve_baseline_init_anchor(progress: Any, metrics: dict[str, Any],
             message=f"baseline = ref_latency_us = {ref_metric} (PyTorch reference)",
         )
 
-    fallback = float(seed_metric) if valid_metric(seed_metric) else None
+    # No valid PyTorch reference latency → no baseline. Seed timing is
+    # NOT a substitute (optimising against the seed's own time is
+    # meaningless), so return an empty anchor; run_baseline_init's gate
+    # refuses to commit and parks the task at BASELINE for retry.
     return AnchorDecision(
-        metric=fallback,
-        source="seed_fallback",
+        metric=None,
+        source="none",
         per_shape_us=None,
         fingerprint=None,
         reused_existing=False,
         changed=True,
-        message="WARNING: ref_latency_us missing - baseline falls back to seed metric",
+        message="no valid ref_latency_us; baseline unmeasured (not committed)",
     )
 
 

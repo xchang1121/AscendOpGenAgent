@@ -629,12 +629,11 @@ def compute_next_phase(task_dir: str) -> str:
 def compute_resume_phase(task_dir: str) -> str:
     """Determine phase for resuming after interruption.
 
-    Mirrors PhaseController.on_baseline_settled for outcomes the live
-    hook never advanced past BASELINE — INFRA_FAIL keeps the task pinned
-    at BASELINE so stop_save can let the agent exit with a clear "fix
-    --ref" / "fix env" message. Without that parity, resuming a stuck
-    task would land in PLAN and the agent would burn max_rounds trying
-    to plan around it."""
+    No committed progress → BASELINE: either never baselined, or the
+    baseline gate refused to commit (no valid ref baseline). Either way
+    the agent re-runs baseline.py; if the env/ref is still broken it
+    parks at BASELINE again and stop_save lets the agent exit with a
+    clear 'fix env/ref' message."""
     progress = load_progress(task_dir)
     if not progress:
         return BASELINE
@@ -644,18 +643,6 @@ def compute_resume_phase(task_dir: str) -> str:
 
     if eval_rounds >= max_rounds:
         return FINISH
-
-    # Stuck states from a previous baseline: keep at BASELINE so
-    # stop_save._is_stuck fires and the agent can Stop. The carve-out
-    # MUST match on_baseline_settled exactly — both import the same
-    # STUCK_BASELINE_OUTCOMES set so they cannot drift.
-    import sys as _sys, os as _os
-    _scripts_dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-    if _scripts_dir not in _sys.path:
-        _sys.path.insert(0, _scripts_dir)
-    from task_config.metric_policy import STUCK_BASELINE_OUTCOMES
-    if progress.get("baseline_outcome") in STUCK_BASELINE_OUTCOMES:
-        return BASELINE
 
     # Kernel-side baseline failure: route to PLAN. seed_metric=None (no
     # timing) and baseline_outcome != "ok" (kernel_fail) both mean the

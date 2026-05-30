@@ -134,7 +134,7 @@ def record_round(task_dir: str, eval_data: dict,
               file=sys.stderr)
 
     # Keep baseline ownership centralized with baseline_init. This covers
-    # missing anchors, seed_fallback upgrades, and fingerprint re-anchors.
+    # missing anchors and fingerprint re-anchors.
     reduction = reduce_round_progress(
         progress, eval_result, round_num,
         consecutive_failures=new_failures,
