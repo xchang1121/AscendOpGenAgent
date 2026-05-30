@@ -152,12 +152,56 @@ def get_task_dir() -> str:
     return os.environ.get("AR_TASK_DIR", "")
 
 
-def set_task_dir(task_dir: str):
-    """Write active task_dir to autoresearch/.active_task."""
+def set_task_dir(task_dir: str, *, force: bool = False) -> bool:
+    """Write active task_dir to autoresearch/.active_task. Returns True
+    on success, False when the pointer is refused (see below).
+
+    The .active_task pointer is repo-wide and unscoped — two Claude or
+    batch sessions sharing the same checkout used to silently clobber
+    each other's pointer, and the loser's hooks would then read the
+    wrong task_dir and gate / edit against unrelated files. Without
+    Claude Code passing a session id to hooks we can't fix the surface
+    fully, so the next-best guard: refuse to overwrite when the
+    EXISTING pointer's task_dir still has a fresh heartbeat (= some
+    other process is actively writing it). Pass force=True to override
+    when the caller explicitly knows it's taking over (batch/run.py
+    unlinks the pointer first and re-acquires).
+    """
+    import time as _time
+    new_abs = os.path.abspath(task_dir)
+    if not force and os.path.exists(_ACTIVE_TASK_FILE):
+        try:
+            with open(_ACTIVE_TASK_FILE, "r") as f:
+                existing = f.read().strip()
+        except OSError:
+            existing = ""
+        if (existing and existing != new_abs and os.path.isdir(existing)):
+            try:
+                from .settings import heartbeat_fresh_seconds as _hb
+                fresh_window = _hb()
+            except Exception:
+                fresh_window = 180
+            hb_path = state_path(existing, HEARTBEAT_FILE)
+            try:
+                age = _time.time() - os.path.getmtime(hb_path)
+            except OSError:
+                age = float("inf")
+            if age < fresh_window:
+                import sys as _sys
+                print(f"[state_store] WARNING: refusing to overwrite "
+                      f".active_task — currently points at {existing} "
+                      f"with a fresh heartbeat ({age:.0f}s ago, "
+                      f"window={fresh_window}s). Another Claude or batch "
+                      f"session looks active on that task. To take over "
+                      f"explicitly, delete {_ACTIVE_TASK_FILE} first, or "
+                      f"call set_task_dir(..., force=True).",
+                      file=_sys.stderr)
+                return False
     os.makedirs(os.path.dirname(_ACTIVE_TASK_FILE), exist_ok=True)
     with open(_ACTIVE_TASK_FILE, "w") as f:
-        f.write(os.path.abspath(task_dir))
+        f.write(new_abs)
     touch_heartbeat(task_dir)
+    return True
 
 
 def find_active_task_dir() -> Optional[str]:

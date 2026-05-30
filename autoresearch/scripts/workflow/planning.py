@@ -119,9 +119,31 @@ class PlanStore:
 
     def write(self, version: int, item_ids: list, items: list,
               settled_rows: str) -> None:
+        """Atomic write (tmp + os.replace). A SIGKILL mid-write used to
+        leave plan.md half-truncated; downstream readers then saw a
+        plan with no header / no items and refused to advance."""
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as f:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(self.render(version, item_ids, items, settled_rows))
+        os.replace(tmp, self.path)
+
+    def parse_version_on_disk(self) -> Optional[int]:
+        """Return the integer N from a `# Plan vN` header, or None when
+        the file is missing or doesn't start with that header. Used by
+        post_bash to cross-check plan_version consistency after
+        create_plan.py wrote plan.md but crashed before save_progress
+        bumped progress.plan_version (or vice-versa)."""
+        if not self.exists():
+            return None
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                first = f.readline().strip()
+        except OSError:
+            return None
+        import re as _re
+        m = _re.match(r"^#\s*Plan\s+v(\d+)\b", first)
+        return int(m.group(1)) if m else None
 
     # ---- settlement -----------------------------------------------------
     def settle_active(self, decision: str,

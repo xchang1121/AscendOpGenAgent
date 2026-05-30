@@ -212,7 +212,34 @@ def main():
                         "pending settle recovery state; nothing to do.")
             sys.exit(0)
         ok, err = validate_plan(task_dir)
+        # Cross-check: plan.md's `# Plan vN` header must match
+        # progress.plan_version. If create_plan.py crashed between
+        # writing plan.md and save_progress (or vice-versa), the two
+        # disagree — advancing here would let the agent run rounds
+        # against plan vN+1 items with progress thinking it's still vN,
+        # so diagnose_v<N>.md / next_pid get allocated against the
+        # wrong version. Refuse advance until the operator re-runs
+        # create_plan.py (idempotent: re-running drives both files to
+        # the same target version).
         if ok:
+            from workflow.planning import PlanStore as _PS
+            try:
+                disk_v = _PS(task_dir).parse_version_on_disk()
+            except Exception:
+                disk_v = None
+            prog = load_progress(task_dir)
+            prog_v = (prog.plan_version if prog else None)
+            if (disk_v is not None and prog_v is not None
+                    and disk_v != prog_v):
+                emit_status(
+                    f"[AR] plan.md and progress.json are out of sync "
+                    f"(plan.md=v{disk_v}, progress.plan_version=v{prog_v}). "
+                    f"create_plan.py was likely interrupted between the "
+                    f"two writes. Re-run `python scripts/engine/"
+                    f"create_plan.py {task_dir}` with the same XML — "
+                    f"the two files will reconverge."
+                )
+                sys.exit(0)
             _reset_failures_for_diagnose(task_dir, phase)
             PhaseController(task_dir).on_plan_validated()
             if phase == EDIT:
