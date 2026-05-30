@@ -103,12 +103,13 @@ class PlanStore:
     # ---- rendering ------------------------------------------------------
     @staticmethod
     def render(version: int, item_ids: list, items: list,
-               settled_rows: str, *, txn_id: int) -> str:
-        # The txn marker rides on the same first line as the version
-        # header so a single readline() can extract both — no separate
-        # parse pass. Required: PlanStore.write is the only writer of
-        # plan.md and it always sits inside a coordinated txn.
-        header = f"# Plan v{version}  <!-- txn: {int(txn_id)} -->"
+               settled_rows: str) -> str:
+        # plan.md's version header is the artifact's only structural
+        # marker. Cross-file consistency with state.json is checked by
+        # comparing this version to state.expected_plan_version
+        # (state_store.check_state_consistency); we don't need to
+        # embed any other marker in the body.
+        header = f"# Plan v{version}"
         lines = [header, "", "## Active Items"]
         for i, (item, pid) in enumerate(zip(items, item_ids)):
             marker = " (ACTIVE)" if i == 0 else ""
@@ -123,20 +124,17 @@ class PlanStore:
         return "\n".join(lines) + "\n"
 
     def write(self, version: int, item_ids: list, items: list,
-              settled_rows: str, *, txn_id: int) -> None:
-        """Atomic write (tmp + os.replace). A SIGKILL mid-write used to
-        leave plan.md half-truncated; downstream readers then saw a
-        plan with no header / no items and refused to advance.
-
-        `txn_id` lands as an HTML-comment marker on the version header
-        line, where check_txn_consistency extracts it without
-        re-parsing the plan body. Required — every plan.md write must
-        be part of a transaction."""
+              settled_rows: str) -> None:
+        """Atomic write (tmp + os.replace). A SIGKILL mid-write used
+        to leave plan.md half-truncated; downstream readers then saw
+        a plan with no header / no items and refused to advance.
+        Cross-file consistency with state.json is the caller's
+        responsibility — call save_state with the matching
+        `expected_plan_version` after this returns."""
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(self.render(version, item_ids, items, settled_rows,
-                                txn_id=txn_id))
+            f.write(self.render(version, item_ids, items, settled_rows))
         os.replace(tmp, self.path)
 
     def parse_version_on_disk(self) -> Optional[int]:
@@ -158,15 +156,14 @@ class PlanStore:
 
     # ---- settlement -----------------------------------------------------
     def settle_active(self, decision: str,
-                      metric: Optional[float], *, txn_id: int) -> tuple:
-        """Mark the (ACTIVE) item as settled, advance ACTIVE to next pending,
-        and append a row to the Settled History table. Rewrites plan.md
-        atomically (tmp + os.replace) with the new txn marker on the
-        header line.
+                      metric: Optional[float]) -> tuple:
+        """Mark the (ACTIVE) item as settled, advance ACTIVE to next
+        pending, and append a row to the Settled History table.
+        Rewrites plan.md atomically.
 
-        Returns (settled_item_id, settled_item_desc). Raises RuntimeError
-        when no (ACTIVE) item is present (caller should treat this as a
-        plan-corruption signal, same shape as before this refactor)."""
+        Returns (settled_item_id, settled_item_desc). Raises
+        RuntimeError when no (ACTIVE) item is present (caller treats
+        this as plan-corruption — same shape as before)."""
         if not self.exists():
             raise RuntimeError("plan.md not found")
 
@@ -228,18 +225,10 @@ class PlanStore:
         if table_end is not None:
             lines.insert(table_end, history_line)
 
-        # Refresh the txn marker on the header line so check_txn_
-        # consistency sees the post-settle write as belonging to the
-        # current transaction.
-        if lines:
-            import re as _re
-            m = _re.match(r"^(#\s*Plan\s+v\d+)(\s*<!--\s*txn:\s*\d+\s*-->)?",
-                          lines[0])
-            if m:
-                lines[0] = f"{m.group(1)}  <!-- txn: {int(txn_id)} -->"
-
         # Atomic write so a SIGKILL mid-settle can't leave plan.md
-        # truncated.
+        # truncated. Header line is preserved as-is — plan_version
+        # doesn't change on settle, so the artifact's marker stays
+        # consistent with state.expected_plan_version.
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))

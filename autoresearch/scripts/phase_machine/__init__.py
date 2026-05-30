@@ -5,21 +5,13 @@ Dependency direction (top depends on lower):
         → validators
             → state_store
 
-This `__init__.py` re-exports only the names imported from outside the
-package. Internal helpers (phase tables, regex constants, prompt
-templates) stay private to their submodules. Code that needs an
-internal can import directly from the submodule
-(`from phase_machine.phase_policy import _AR_ALLOWED_BY_PHASE`).
-
-Previously this file re-exported ~30 underscore-prefixed helpers "in
-case something needs them"; that turned the facade into a flat
-namespace and meant any submodule rename rippled here. The audit that
-produced this trim found that most of those re-exports had no external
-caller at all.
-
-auto_rollback historically lived here and now sits in utils.git_utils;
-the re-export is preserved because too many hook sites import it from
-phase_machine.
+Public surface centers on a single per-task state record
+(<task_dir>/.ar_state/state.json). The retired sidecars
+(.phase / progress.json / .pending_settle.json / .heartbeat / .txn /
+autoresearch/.active_task) are gone — every piece of control state
+lives in state.json, atomic write of state.json IS the transaction
+commit, and cross-file consistency with the two durable artifacts
+(plan.md, history.jsonl) is checked via state.expected_* fields.
 """
 # fmt: off
 from .models import Progress
@@ -28,46 +20,31 @@ from .state_store import (
     INIT, BASELINE, PLAN, EDIT,
     DIAGNOSE, REPLAN, FINISH, ALL_PHASES,
     # File constants
-    PHASE_FILE, PROGRESS_FILE, HISTORY_FILE, PLAN_FILE, PLAN_ITEMS_FILE,
-    EDIT_MARKER_FILE, PENDING_SETTLE_FILE, HEARTBEAT_FILE, ACTIVE_TASK_FILE,
+    STATE_FILE, HISTORY_FILE, PLAN_FILE, PLAN_ITEMS_FILE, EDIT_MARKER_FILE,
     DIAGNOSE_ARTIFACT_TEMPLATE, DIAGNOSE_MARKER_TEMPLATE, DIAGNOSE_ATTEMPTS_CAP,
     # Path builders
-    state_path, plan_path, progress_path, history_path, edit_marker_path,
-    pending_settle_path,
+    state_path, state_record_path, plan_path, history_path, edit_marker_path,
     diagnose_artifact_path, diagnose_marker,
-    # Phase I/O
+    # State record I/O — single source of truth
+    load_state, save_state, update_state,
+    # Typed views over state.json
     read_phase, write_phase,
-    # Progress + history I/O
     load_progress, save_progress, append_history, update_progress,
-    # Active-task pointer
+    # Ownership (was repo-level .active_task; now per-task owner field)
     get_task_dir, set_task_dir, clear_active_task, touch_heartbeat,
     find_active_task_dir,
     # Per-op task_dir pointer (scaffold -> batch.run.py handoff)
     task_dir_pointer_path, write_task_dir_pointer, read_task_dir_pointer,
-    # Transaction marker — coordinates multi-file .ar_state writes so
-    # crash mid-transaction is detectable (check_txn_consistency reports
-    # `stale` / `extra` files) instead of silently corrupting state.
-    TXN_FILE,
-    begin_txn, commit_txn, read_txn, check_txn_consistency,
-    format_inconsistency_message, require_consistent_state,
+    # Cross-file consistency gate
+    check_state_consistency, format_state_inconsistency,
+    require_state_consistency,
 )
 from .validators import (
-    # validate_kernel + validate_diagnose were re-exported here for a
-    # symmetry that no in-tree caller actually used (a `git grep` from
-    # outside this package found zero call sites for either name).
-    # quick_check.py drives the Triton-impl AST check directly via
-    # utils.validate_triton_impl, and DIAGNOSE artifact validation
-    # runs through diagnose_state below — drop the facades so a
-    # maintainer doesn't waste time looking for "where else this
-    # phase-machine surface fires from".
     validate_plan,
     DiagnoseState, diagnose_state,
     DIAGNOSE_NEED_DIAGNOSIS, DIAGNOSE_READY, DIAGNOSE_MANUAL_FALLBACK,
     get_plan_items, parse_plan_text, has_pending_items, get_active_item,
     is_settled_table_header,
-    # workflow.planning is the one external user of the plan-line regex.
-    # Underscore is kept to flag "not a stable public name; use a higher
-    # level helper if you can".
     _PLAN_ITEM_RE,
 )
 from .phase_policy import (

@@ -22,8 +22,13 @@ from hooks.utils import (read_hook_input, block_decision, block_with_guidance,
 from phase_machine import (
     read_phase, get_task_dir, touch_heartbeat,
     edit_marker_path, check_edit, EDIT, DIAGNOSE,
-    diagnose_state, pending_settle_path,
+    diagnose_state, load_state,
 )
+
+
+def _has_pending_settle(task_dir: str) -> bool:
+    state = load_state(task_dir)
+    return bool(state and state.get("pending_settle"))
 
 
 def _rel_to_task(file_path: str, task_dir: str):
@@ -150,8 +155,7 @@ def main():
     # check_edit can apply the rules.
     diag_action = (diagnose_state(task_dir).action
                    if phase == DIAGNOSE else None)
-    pending = (phase == EDIT
-               and os.path.isfile(pending_settle_path(task_dir)))
+    pending = (phase == EDIT and _has_pending_settle(task_dir))
     ok, reason = check_edit(phase, rel, editable_files,
                             diagnose_action=diag_action,
                             pending_settle=pending)

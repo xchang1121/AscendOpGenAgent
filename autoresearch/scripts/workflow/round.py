@@ -11,11 +11,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from phase_machine import (  # noqa: E402
     Progress, append_history, auto_rollback, load_progress,
-    pending_settle_path, save_progress,
+    load_state, save_state,
 )
-# Type alias for clarity in record_round's signature: txn_id is an
-# int chosen by the round transaction's outer caller (pipeline.py
-# via begin_txn). All disk writes inside record_round carry it.
+# save_progress not imported — record_round writes progress fields
+# directly into state.json as part of one atomic save_state, so it
+# can also bundle in pending_settle + expected_history_round.
 from task_config import (  # noqa: E402
     EvalOutcome, EvalResult, check_constraints, is_improvement,
     load_task_config,
@@ -27,16 +27,17 @@ from .progress_reducer import eval_result_from_data, reduce_round_progress
 
 def record_round(task_dir: str, eval_data: dict,
                  description: str = "optimization round",
-                 plan_item: Optional[str] = None,
-                 *, txn_id: int) -> dict:
+                 plan_item: Optional[str] = None) -> dict:
     """Single library entry point for one round of EDIT settlement.
-    `txn_id` is allocated by the caller (pipeline.py begin_txn) and
-    tags every disk write made here (progress.json, history.jsonl,
-    .pending_settle.json) so check_txn_consistency can verify the
-    body files belong to the same transaction.
 
-    Decision flow: correctness gate -> constraint gate -> primary-metric
-    presence -> improvement check."""
+    Atomically commits three things via a single save_state at the
+    end: progress fields (eval_rounds, best_metric, ...), the
+    pending-settle sentinel (state.pending_settle = kd_json), and
+    the expected_history_round marker (so cross-file consistency
+    check matches the history.jsonl row this function appends).
+
+    Decision flow: correctness gate → constraint gate → primary-metric
+    presence → improvement check."""
     config = load_task_config(task_dir)
     if config is None:
         return {"decision": "ERROR", "error": "task.yaml not found"}
@@ -144,8 +145,10 @@ def record_round(task_dir: str, eval_data: dict,
               file=sys.stderr)
 
     progress = reduction.progress
-    save_progress(task_dir, progress, txn_id=txn_id)
 
+    # Append the history row FIRST (append-only artifact). Cross-file
+    # consistency with state.json's expected_history_round is set when
+    # we commit the state record below.
     hist: dict[str, Any] = {
         "round": round_num,
         "plan_item": plan_item,
@@ -156,8 +159,7 @@ def record_round(task_dir: str, eval_data: dict,
         "error": eval_result.error,
         "commit": commit_hash,
     }
-    # Only FAIL rows carry the failure_signals + raw tail; KEEP/DISCARD
-    # already passed correctness, attaching them is noise.
+    # Only FAIL rows carry the failure_signals + raw tail.
     if decision == "FAIL":
         sig = eval_data.get("failure_signals")
         if isinstance(sig, dict) and (sig.get("primary")
@@ -167,7 +169,7 @@ def record_round(task_dir: str, eval_data: dict,
         tail = (eval_data.get("raw_output_tail") or "").strip()
         if tail:
             hist["raw_output_tail"] = tail[-1500:]
-    append_history(task_dir, hist, txn_id=txn_id)
+    append_history(task_dir, hist)
 
     kd_json = {
         "decision": decision,
@@ -175,32 +177,26 @@ def record_round(task_dir: str, eval_data: dict,
         "eval_rounds": round_num,
         "max_rounds": progress.max_rounds or config.max_rounds,
         "consecutive_failures": progress.consecutive_failures,
-        # Identity fields — let pipeline.py's replay verify it's
-        # settling the same plan item that record_round saw, not the
-        # next ACTIVE one after a partial settle.
+        # Identity fields — pipeline.py's replay verifies it's settling
+        # the same plan item record_round saw, not the next ACTIVE one
+        # after a partial settle.
         "plan_item": plan_item,
         "plan_version": progress.plan_version,
         "round": round_num,
-        # Transaction marker for cross-file consistency checks.
-        "_txn_id": int(txn_id),
     }
 
-    # Persist the kd_json as the pending-settle sentinel BEFORE
-    # returning. Closes the previously-open crash window between this
-    # function returning and pipeline.py's settle call: if SIGKILL
-    # hits there, history.jsonl + progress.json are already advanced
-    # but plan.md is not — without a sentinel the next pipeline.py
-    # run re-evaluates the same plan item, duplicating the history
-    # row and over-bumping eval_rounds. With the sentinel + txn_id,
-    # pipeline.py's replay-only branch deterministically retries
-    # settle alone and check_txn_consistency can verify the sentinel
-    # belongs to the in-flight transaction.
-    import json as _json
-    pending = pending_settle_path(task_dir)
-    os.makedirs(os.path.dirname(pending), exist_ok=True)
-    tmp = pending + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        _json.dump(kd_json, f)
-    os.replace(tmp, pending)
+    # Single atomic commit: merge new progress + pending_settle +
+    # expected_history_round into state.json. A SIGKILL before this
+    # write leaves history.jsonl ahead of state.expected_history_round
+    # — check_state_consistency detects it; the recovery path is
+    # pipeline.py's replay branch (which keys off state.pending_settle
+    # being non-None).
+    state = load_state(task_dir) or {}
+    progress_fields = progress.to_dict()
+    for k, v in progress_fields.items():
+        state[k] = v
+    state["pending_settle"] = kd_json
+    state["expected_history_round"] = round_num
+    save_state(task_dir, state)
 
     return kd_json

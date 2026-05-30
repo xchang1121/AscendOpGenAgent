@@ -30,34 +30,18 @@ from utils.json_io import sanitize_floats
 from workflow import PhaseController, PlanStore, record_round
 from phase_machine import (
     get_active_item,
-    get_guidance, auto_rollback, load_progress, edit_marker_path,
-    pending_settle_path, FINISH,
-    begin_txn, commit_txn,
+    get_guidance, auto_rollback, load_progress, load_state, save_state,
+    edit_marker_path, FINISH,
 )
 
 
-def _run_settle(task_dir: str, kd_json: dict, *, txn_id: int) -> tuple:
+def _run_settle(task_dir: str, kd_json: dict) -> tuple:
     """Settle the active plan item in-process. Returns
     ``(ok: bool, error_tail: str, settle_json: dict | None)``.
 
-    Idempotent w.r.t. plan_item: when kd_json carries `plan_item`
-    (populated by record_round since the round-transaction fix), this
-    function verifies the current (ACTIVE) item matches the expected
-    one. If it doesn't — i.e. PlanStore.settle_active() ran in a prior
-    invocation, committed plan.md, but the worker died before the
-    sentinel could be cleared — the replay returns a synthetic
-    success rather than wrongly settling the NEXT ACTIVE item against
-    the same kd_json. Without this check, plan.md ended up with two
-    settled rows for a single history-round.
-
-    Used to subprocess `engine/settle.py` and parse its stdout; now
-    inlined here (`engine/settle.py` was deleted). For manual recovery
-    after a failed settle, the operator re-runs pipeline.py — the
-    `.pending_settle.json` sentinel makes the re-run skip quick_check
-    / eval / record_round and replay this function only. The `settle_
-    json` returned here carries the `settled_item` id, which the caller
-    needs for the status report — `get_active_item()` AFTER settle
-    points at the NEXT ACTIVE item, not the one we just settled.
+    Idempotent w.r.t. plan_item: when kd_json's `plan_item` already
+    appears in plan.md's Settled History table, settle is considered
+    already-done (replay-safe). Otherwise it actually runs.
     """
     try:
         decision = kd_json.get("decision", "FAIL")
@@ -74,27 +58,11 @@ def _run_settle(task_dir: str, kd_json: dict, *, txn_id: int) -> tuple:
             current_active = get_active_item(task_dir)
             current_id = (current_active or {}).get("id")
             if current_id != expected_item:
-                # Plan has moved past expected_item. Three sub-cases,
-                # only ONE of which is a safe replay:
-                #   A. PlanStore.settle_active() ran in the prior
-                #      crashed pipeline; ACTIVE is now the next pid
-                #      AND expected_item shows up as a settled row
-                #      in plan.md's Settled History table. This is
-                #      the legitimate idempotent replay — settle is
-                #      already done.
-                #   B. plan.md was rewritten by a manual create_plan
-                #      between the crash and this replay; expected
-                #      pid no longer exists in the new plan at all.
-                #      Pretending settle is done would clear the
-                #      sentinel and orphan the kd_json against a
-                #      plan version it has nothing to do with.
-                #   C. plan.md is empty / malformed / missing ACTIVE
-                #      for any other reason. Same risk as B.
-                # Distinguish: only when expected_item appears in
-                # parse_settled_history do we treat it as case A.
-                # Otherwise fail loud — keep pending_settle.json on
-                # disk so the operator can investigate without losing
-                # the kd_json.
+                # Plan moved past expected_item. Only safe when
+                # expected_item is in Settled History (legitimate
+                # replay of a prior successful settle); otherwise
+                # plan.md is malformed / rewritten and we must NOT
+                # clear the sentinel.
                 settled_rows = store.parse_settled_history() or ""
                 if f"| {expected_item} |" in settled_rows:
                     return True, "", {
@@ -107,16 +75,14 @@ def _run_settle(task_dir: str, kd_json: dict, *, txn_id: int) -> tuple:
                     f"plan.md ACTIVE is {current_id!r}, kd_json "
                     f"expected {expected_item!r}, and {expected_item} "
                     f"does NOT appear in Settled History. Plan is "
-                    f"either malformed (empty / missing ACTIVE) or "
-                    f"was rewritten by an unrelated create_plan — "
-                    f"pretending settle succeeded would clear the "
-                    f"sentinel and lose this round's kd_json. "
-                    f"Refusing; pending_settle.json retained for "
+                    f"either malformed or was rewritten by an "
+                    f"unrelated create_plan — pretending settle "
+                    f"succeeded would lose this round's kd_json. "
+                    f"Refusing; state.pending_settle retained for "
                     f"manual inspection."
                 ), None
 
-        settled_id, _ = store.settle_active(decision, metric_val,
-                                            txn_id=txn_id)
+        settled_id, _ = store.settle_active(decision, metric_val)
         return True, "", {
             "settled_item": settled_id,
             "decision": decision,
@@ -127,44 +93,44 @@ def _run_settle(task_dir: str, kd_json: dict, *, txn_id: int) -> tuple:
 
 
 def _clear_pending_settle(task_dir: str) -> None:
-    path = pending_settle_path(task_dir)
-    if os.path.exists(path):
-        os.remove(path)
+    """Atomic state-write that nulls the pending_settle field. The
+    sentinel used to be a separate .pending_settle.json file; it now
+    lives in state.pending_settle so the clear is one save_state."""
+    state = load_state(task_dir)
+    if state is None or state.get("pending_settle") is None:
+        return
+    state["pending_settle"] = None
+    save_state(task_dir, state)
 
 
 def _emit_settle_failure(task_dir: str, error_tail: str) -> None:
     print(f"[PIPELINE] SETTLE FAILED. plan.md was NOT updated. "
-          f"progress.json + history.jsonl already moved during this round; "
-          f"re-running this script will RETRY SETTLE ONLY (kd_json was "
-          f"persisted to .ar_state/.pending_settle.json) — it will NOT "
-          f"re-run quick_check/eval/record_round.\n"
+          f"history.jsonl + state.json already moved during this "
+          f"round; re-running this script will RETRY SETTLE ONLY "
+          f"(kd_json was persisted to state.pending_settle) — it "
+          f"will NOT re-run quick_check/eval/record_round.\n"
           f"\n"
           f"Recovery options (do NOT hand-edit plan.md):\n"
           f"  1. Fix the underlying cause from the error tail below, "
-          f"then re-run pipeline.py — the replay-only path will retry "
-          f"settle on the same kd_json.\n"
-          f"  2. If the failure is structural (plan.md malformed, no "
-          f"(ACTIVE) item, etc.) and settle cannot recover, run "
+          f"then re-run pipeline.py — the replay-only path will "
+          f"retry settle on the same kd_json.\n"
+          f"  2. If the failure is structural (plan.md malformed, "
+          f"no (ACTIVE) item, etc.) and settle cannot recover, run "
           f"create_plan.py to write a fresh plan.md. While "
-          f"pending_settle.json exists, hooks/guard_bash allows "
-          f"create_plan.py in EDIT phase as a recovery path; on "
-          f"successful create_plan validation hooks/post_bash clears "
-          f"pending_settle.json. The orphan history.jsonl row stays "
-          f"(audit trail) but no longer corresponds to any plan item.\n"
+          f"state.pending_settle is non-null, hooks/guard_bash "
+          f"allows create_plan.py in EDIT phase as a recovery path; "
+          f"on successful create_plan validation hooks/post_bash "
+          f"clears state.pending_settle. The orphan history.jsonl "
+          f"row stays (audit trail).\n"
           f"\n"
           f"error: {error_tail}", file=sys.stderr)
 
 
-def _post_settle(task_dir: str, decision: str, settled_id: str,
-                 *, txn_id: int) -> None:
+def _post_settle(task_dir: str, decision: str, settled_id: str) -> None:
     """Common path after a successful settle: advance phase, clear
     edit marker, print status. Runs whether settle succeeded the
-    first time or on the replay-only retry. `txn_id` is the outer
-    round transaction's id — passed into PhaseController so the phase
-    write tags .phase with the same id (rather than allocating a
-    second micro-txn that would land .phase ahead of the round
-    commit)."""
-    next_phase = PhaseController(task_dir, txn_id=txn_id).on_round_settled()
+    first time or on the replay-only retry."""
+    next_phase = PhaseController(task_dir).on_round_settled()
     marker = edit_marker_path(task_dir)
     if os.path.exists(marker):
         os.remove(marker)
@@ -218,49 +184,28 @@ def main():
 
     # === Replay-only settle ===
     # If a previous pipeline.py invocation got past record_round but
-    # settle.py failed, the kd_json was persisted to .pending_settle.json.
-    # Re-running pipeline.py from scratch would re-eval and double-write
-    # progress/history; instead, we ONLY retry settle here. Fix the
-    # underlying cause (the agent saw the failure reason in stderr), then
-    # invoke pipeline.py — same command, no flags — and this branch handles
-    # the retry deterministically. Lives BEFORE task.yaml load so retry
-    # works even if task config has drifted (settle only touches .ar_state).
-    pending_path = pending_settle_path(task_dir)
-    if os.path.exists(pending_path):
-        try:
-            with open(pending_path, "r", encoding="utf-8") as f:
-                kd_json = json.load(f)
-        except Exception as e:
-            print(f"[PIPELINE] pending settle file unreadable ({e}). "
-                  f"Removing it and bailing — please re-run pipeline.py "
-                  f"to start a fresh round.", file=sys.stderr)
-            _clear_pending_settle(task_dir)
-            sys.exit(1)
-        print(f"[PIPELINE] Retrying settle from {os.path.basename(pending_path)} "
+    # settle failed (or was killed before _post_settle / _clear_pending_
+    # settle ran), record_round persisted the kd_json into
+    # state.pending_settle. Re-running pipeline.py from scratch would
+    # re-eval and double-write history; instead, we ONLY retry settle.
+    # Lives BEFORE task.yaml load so retry works even if task config
+    # has drifted (settle only touches .ar_state).
+    pending_state = load_state(task_dir)
+    kd_json = (pending_state or {}).get("pending_settle")
+    if kd_json:
+        print(f"[PIPELINE] Retrying settle from state.pending_settle "
               f"(skipping quick_check/eval/record_round).", flush=True)
-        # Reuse the txn id record_round assigned to the original
-        # round. Settle was the last write of that txn; if it
-        # completed this time, commit lands and check_txn_consistency
-        # sees a clean state.
-        replay_txn = int(kd_json.get("_txn_id") or begin_txn(task_dir))
-        ok, error_tail, settle_json = _run_settle(task_dir, kd_json,
-                                                  txn_id=replay_txn)
+        ok, error_tail, settle_json = _run_settle(task_dir, kd_json)
         if not ok:
             _emit_settle_failure(task_dir, error_tail)
             sys.exit(1)
-        # Order: settle wrote plan.md → _post_settle writes .phase
-        # → commit_txn lands .txn → _clear_pending_settle removes
-        # the sentinel LAST. This way a crash anywhere before the
-        # clear leaves pending_settle.json on disk and the next
-        # pipeline.py run re-enters this replay branch idempotently.
-        # If clear ran before commit (the previous ordering) a crash
-        # between them left no sentinel + an incomplete commit, and
-        # the activation-time consistency gate would block recovery
-        # with no concrete next step.
+        # Order: settle wrote plan.md → _post_settle writes phase →
+        # _clear_pending_settle removes the sentinel LAST. A crash
+        # before the clear leaves state.pending_settle non-null and
+        # the next pipeline.py invocation re-enters this branch
+        # idempotently.
         settled_id = (settle_json or {}).get("settled_item") or "?"
-        _post_settle(task_dir, kd_json.get("decision", "?"), settled_id,
-                     txn_id=replay_txn)
-        commit_txn(task_dir, replay_txn, by="pipeline.replay_settle")
+        _post_settle(task_dir, kd_json.get("decision", "?"), settled_id)
         _clear_pending_settle(task_dir)
         return
 
@@ -372,18 +317,12 @@ def main():
     # === Round transaction begins ===
     # Allocate a single txn id; every body file written below
     # (progress.json + history.jsonl + .pending_settle.json + plan.md
-    # + .phase) carries it. commit_txn lands LAST, so a crash mid-
-    # round leaves the body files "extra" (ahead of committed marker)
-    # and check_txn_consistency surfaces the partial state instead of
-    # the agent silently continuing on inconsistent .ar_state.
-    txn_id = begin_txn(task_dir)
-
     # === Step 3: Keep or discard ===
-    # Direct library call (was a subprocess + last-line-JSON parse
-    # before the deleted keep_or_discard.py shell wrapper was removed).
+    # record_round writes history.jsonl + state.json (incl. pending_
+    # settle = kd_json) in one atomic save_state. Returns the kd_json
+    # we then hand to _run_settle.
     kd_json = record_round(task_dir, eval_json,
-                           description=desc, plan_item=plan_item,
-                           txn_id=txn_id)
+                           description=desc, plan_item=plan_item)
     if kd_json.get("decision") == "ERROR":
         print(f"[PIPELINE] KEEP/DISCARD ERROR: {kd_json.get('error')}")
         sys.exit(1)
@@ -391,32 +330,24 @@ def main():
     decision = kd_json.get("decision", "FAIL")
 
     # === Step 4: Settle (update plan.md) ===
-    # progress.json + history.jsonl were already mutated by
-    # record_round, which also wrote .pending_settle.json (the
-    # kd_json sentinel) as its last act — so any crash between here
-    # and commit_txn is recoverable via pipeline.py's replay-only
-    # top-of-main branch (re-run pipeline.py, no quick_check / eval /
-    # record_round redo). plan.md is the only state piece settle owns.
-    ok, error_tail, _settle_json = _run_settle(task_dir, kd_json,
-                                               txn_id=txn_id)
+    # state.json + history.jsonl already moved during record_round and
+    # state.pending_settle holds the sentinel. A crash between here
+    # and _clear_pending_settle is recoverable via the replay branch
+    # at top-of-main.
+    ok, error_tail, _settle_json = _run_settle(task_dir, kd_json)
     if not ok:
         _emit_settle_failure(task_dir, error_tail)
         sys.exit(1)
 
-    # === Step 5+6: Advance phase + commit + clear sentinel ===
-    # Order matters for crash recovery: plan.md is already written
-    # (_run_settle), .phase lands next (_post_settle), then .txn
-    # commit, then the sentinel goes. A crash anywhere between
-    # _post_settle and the sentinel clear leaves pending_settle.json
-    # on disk pointing at THIS round's kd_json — pipeline.py's
-    # replay branch then re-enters _run_settle (now sees the next
-    # ACTIVE != expected, returns synthetic already_settled), re-
-    # runs _post_settle (PhaseController is idempotent on same
-    # phase), commits, and clears. Net: any partial completion of
-    # this trailer converges on re-run.
+    # === Step 5+6: Advance phase + clear sentinel ===
+    # Order: plan.md is already written (_run_settle), .phase lands
+    # next (_post_settle), sentinel clear LAST. Any crash before the
+    # clear leaves state.pending_settle non-null; pipeline.py's
+    # replay branch re-enters _run_settle (sees expected_item in
+    # Settled History → already_settled), re-runs _post_settle
+    # (idempotent on same phase), clears.
     settled_id = active["id"] if active else "?"
-    _post_settle(task_dir, decision, settled_id, txn_id=txn_id)
-    commit_txn(task_dir, txn_id, by="pipeline.round")
+    _post_settle(task_dir, decision, settled_id)
     _clear_pending_settle(task_dir)
 
 

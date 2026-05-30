@@ -65,8 +65,8 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from workflow import PlanStore
 from phase_machine import (
-    begin_txn, commit_txn,
-    load_progress, save_progress, plan_path, progress_path, PLAN_ITEMS_FILE,
+    load_progress, load_state, save_state,
+    plan_path, state_record_path, PLAN_ITEMS_FILE,
 )
 
 
@@ -303,23 +303,23 @@ def main():
         "path": ps.path,
     })
 
-    # Plan transaction: both writes tag with the same txn id; commit
-    # lands after. A SIGKILL between ps.write and save_progress used
-    # to leave plan.md at v(N+1) but progress.plan_version at vN —
-    # post_bash's structural cross-check then refuses to advance and
-    # the operator re-runs to reconverge. With the txn marker,
-    # check_txn_consistency can also surface the partial state ahead
-    # of the post-hook ever firing.
-    txn_id = begin_txn(task_dir)
-    ps.write(version, item_ids, items, settled_rows, txn_id=txn_id)
-    if progress is not None and os.path.exists(progress_path(task_dir)):
-        save_progress(
-            task_dir,
-            progress.apply(next_pid=new_next_pid, plan_version=version),
-            stamp=False,
-            txn_id=txn_id,
-        )
-    commit_txn(task_dir, txn_id, by="create_plan")
+    # Plan transaction: write plan.md (the durable artifact) first,
+    # then atomic save_state with the matching expected_plan_version
+    # so check_state_consistency sees both at the same version. A
+    # SIGKILL between ps.write and save_state leaves plan.md ahead
+    # of state.expected_plan_version; check_state_consistency
+    # detects it, and the recovery path is to re-run create_plan.py
+    # with the same XML (idempotent: same input → same item_ids →
+    # same plan.md content).
+    ps.write(version, item_ids, items, settled_rows)
+    if progress is not None and os.path.exists(state_record_path(task_dir)):
+        new_progress = progress.apply(next_pid=new_next_pid,
+                                      plan_version=version)
+        state = load_state(task_dir) or {}
+        for k, v in new_progress.to_dict().items():
+            state[k] = v
+        state["expected_plan_version"] = version
+        save_state(task_dir, state)
 
     print(report)
 

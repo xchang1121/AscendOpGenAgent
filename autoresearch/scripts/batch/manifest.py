@@ -403,16 +403,16 @@ def find_running_case_task_dir(batch_dir: Path) -> Path | None:
     running.sort(key=lambda kv: kv[1].get("started_at", ""), reverse=True)
     op, case = running[0]
 
-    # Route through phase_machine.get_task_dir — the .active_task
-    # format owner (today JSON ownership record, formerly bare
-    # path text). Reading the file raw would treat the JSON as a
-    # path and fail; same bypass class as the .phase regression.
+    # phase_machine.find_active_task_dir scans ar_tasks/ for state.json
+    # owned by the current session (or, failing that, the most-recently
+    # touched). Repo-level .active_task is gone; ownership lives in
+    # each task's state.json.owner field.
     import sys as _sys, os as _os
     _scripts = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     if _scripts not in _sys.path:
         _sys.path.insert(0, _scripts)
-    from phase_machine import get_task_dir as _pm_get_task_dir
-    pointed = _pm_get_task_dir()
+    from phase_machine import find_active_task_dir as _pm_find_active
+    pointed = _pm_find_active()
     if pointed:
         td = Path(pointed)
         if td.is_dir() and task_dir_belongs_to_op(td.name, op):

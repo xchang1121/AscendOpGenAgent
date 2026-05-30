@@ -32,8 +32,7 @@ from phase_machine import (
     get_task_dir, set_task_dir, get_active_item, touch_heartbeat,
     load_progress, update_progress,
     parse_invoked_ar_script,
-    progress_path, history_path, plan_path, edit_marker_path, state_path,
-    PHASE_FILE,
+    history_path, plan_path, edit_marker_path, state_record_path,
     BASELINE, PLAN, EDIT, DIAGNOSE, REPLAN,
 )
 
@@ -101,39 +100,28 @@ def _handle_activation(new_task_dir: str):
         return
     _clean_stale_edit_marker(new_task_dir)
 
-    has_phase = os.path.exists(state_path(new_task_dir, PHASE_FILE))
-    has_progress = os.path.exists(progress_path(new_task_dir))
+    # state.json is the single source of truth — its existence is
+    # the new "has progress / has phase" signal.
+    has_state = os.path.exists(state_record_path(new_task_dir))
 
     pc = PhaseController(new_task_dir)
-    if has_phase:
-        # Cross-file txn consistency gate. If the previous writer
-        # landed body bytes but commit_txn() never ran, ANY downstream
-        # logic from here on (compute_resume_phase, guidance,
-        # PhaseController transitions) is computed from inconsistent
-        # state. We previously only warned and advanced anyway —
-        # that was detect-not-enforce. Now: refuse to advance, hand
-        # the operator a concrete recovery message, exit.
-        #
-        # The .pending_settle.json branch in pipeline.py's top-of-
-        # main handles ITS specific crash window automatically (next
-        # pipeline.py invocation replays settle); for that case we
-        # don't want to block here, because the pending sentinel IS
-        # the recovery mechanism. So treat "only .pending_settle.json
-        # is extra" as an allowed pending-replay state.
+    if has_state:
+        # Cross-file consistency gate. plan.md / history.jsonl ahead
+        # of state.expected_* means a writer landed body bytes but
+        # never committed state.json — every downstream computation
+        # would be based on inconsistent state. Refuse to advance,
+        # hand the operator the recovery message, exit.
         from phase_machine import (
-            require_consistent_state as _require,
-            format_inconsistency_message as _fmt_inconsistency,
+            require_state_consistency as _require,
+            format_state_inconsistency as _fmt_inconsistency,
         )
         try:
             rep = _require(new_task_dir, on_inconsistent="report")
         except Exception:
             rep = None
         if rep is not None and not rep["consistent"]:
-            extras = set(rep["extra"])
-            pending_only = extras == {".pending_settle.json"}
-            if not pending_only:
-                emit_status("[AR] " + _fmt_inconsistency(rep))
-                return
+            emit_status("[AR] " + _fmt_inconsistency(rep))
+            return
         phase = read_phase(new_task_dir)
         # Stale-planning recovery: phase file says PLAN or REPLAN but
         # plan.md + progress.json show a validated plan with an active
@@ -163,12 +151,10 @@ def _handle_activation(new_task_dir: str):
         emit_status(f"[AR] Resuming. Phase: {phase}.")
         _print_resume_context(new_task_dir)
         emit_status(get_guidance(new_task_dir))
-    elif has_progress:
-        phase = pc.on_activation_resume()
-        emit_status(f"[AR] Resuming from progress. Phase -> {phase}.")
-        _print_resume_context(new_task_dir)
-        emit_status(get_guidance(new_task_dir))
     else:
+        # No state.json yet → fresh-scaffolded task. Initial phase
+        # transition lands inside _fresh_start (which calls
+        # PhaseController.on_activation_ready).
         _fresh_start(new_task_dir)
 
 
@@ -258,65 +244,46 @@ def main():
         emit_todowrite_context(task_dir, f"[AR] Round settled. Phase -> {new_phase}.")
 
     elif invoked == "create_plan.py" and phase in (PLAN, DIAGNOSE, REPLAN, EDIT):
-        from phase_machine import validate_plan, pending_settle_path
+        from phase_machine import (
+            validate_plan, load_state, save_state,
+            check_state_consistency,
+        )
         # PLAN/DIAGNOSE/REPLAN: normal plan-creation flow.
-        # EDIT: only legal as a recovery path when settle.py kept failing
-        # on a malformed plan.md (gated in hooks/guard_bash by the
-        # presence of .pending_settle.json). The new plan retires the
-        # broken plan_version, so the orphan kd_json is no longer
-        # actionable; clear the sidecar.
-        #
-        # NOTE: do NOT re-validate the diagnose artifact here. PreToolUse
-        # (hooks/guard_bash) already enforced the artifact gate against the
-        # plan_version that existed BEFORE create_plan.py ran. By the time
-        # this PostToolUse fires, create_plan.py has bumped plan_version
-        # from N to N+1 — re-running diagnose_state would look for
-        # diagnose_v(N+1).md (not yet created) and falsely reject.
-        if phase == EDIT and not os.path.exists(pending_settle_path(task_dir)):
-            # Defense-in-depth: hooks/guard_bash should have blocked this,
-            # but if it slipped through somehow, refuse to advance state.
+        # EDIT: only legal as a recovery path when settle kept failing
+        # on a malformed plan.md (gated in hooks/guard_bash by
+        # state.pending_settle being non-null). The new plan retires
+        # the broken plan_version, so the orphan kd_json is no longer
+        # actionable; clear it as part of the post-create_plan
+        # transition.
+        state = load_state(task_dir) or {}
+        pending = state.get("pending_settle")
+        if phase == EDIT and not pending:
+            # Defense-in-depth: guard_bash should have blocked this,
+            # but if it slipped through, refuse to advance state.
             emit_status("[AR] create_plan.py in EDIT phase requires a "
                         "pending settle recovery state; nothing to do.")
             sys.exit(0)
         ok, err = validate_plan(task_dir)
-        # Cross-check: plan.md's `# Plan vN` header must match
-        # progress.plan_version. If create_plan.py crashed between
-        # writing plan.md and save_progress (or vice-versa), the two
-        # disagree — advancing here would let the agent run rounds
-        # against plan vN+1 items with progress thinking it's still vN,
-        # so diagnose_v<N>.md / next_pid get allocated against the
-        # wrong version. Refuse advance until the operator re-runs
-        # create_plan.py (idempotent: re-running drives both files to
-        # the same target version).
+        # Cross-file consistency: plan.md version vs
+        # state.expected_plan_version. create_plan.py is the only
+        # writer that should bump both; if they disagree, the
+        # operator should re-run create_plan with the same XML.
         if ok:
-            from workflow.planning import PlanStore as _PS
-            try:
-                disk_v = _PS(task_dir).parse_version_on_disk()
-            except Exception:
-                disk_v = None
-            prog = load_progress(task_dir)
-            prog_v = (prog.plan_version if prog else None)
-            if (disk_v is not None and prog_v is not None
-                    and disk_v != prog_v):
+            rep = check_state_consistency(task_dir)
+            if not rep["consistent"]:
                 emit_status(
-                    f"[AR] plan.md and progress.json are out of sync "
-                    f"(plan.md=v{disk_v}, progress.plan_version=v{prog_v}). "
-                    f"create_plan.py was likely interrupted between the "
-                    f"two writes. Re-run `python scripts/engine/"
-                    f"create_plan.py {task_dir}` with the same XML — "
-                    f"the two files will reconverge."
-                )
+                    f"[AR] state.json and plan.md/history.jsonl are "
+                    f"out of sync. Issues: {rep['issues']}. Re-run "
+                    f"create_plan.py with the same XML — both files "
+                    f"will reconverge.")
                 sys.exit(0)
             _reset_failures_for_diagnose(task_dir, phase)
             PhaseController(task_dir).on_plan_validated()
             if phase == EDIT:
-                # Recovery completed: discard the orphan kd_json. The new
-                # plan_version starts fresh; the round whose decision was
-                # waiting in pending_settle is recorded in history.jsonl
-                # but no longer corresponds to any plan item.
-                ps = pending_settle_path(task_dir)
-                if os.path.exists(ps):
-                    os.remove(ps)
+                # Recovery completed: discard the orphan kd_json.
+                state = load_state(task_dir) or {}
+                state["pending_settle"] = None
+                save_state(task_dir, state)
                 emit_status(f"[AR] Pending settle abandoned; new plan "
                             f"installed. Phase -> EDIT. {get_guidance(task_dir)}")
             else:

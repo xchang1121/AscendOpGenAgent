@@ -67,20 +67,17 @@ def _validate(task_dir: str) -> tuple[bool, str]:
         if not ok:
             return False, f"plan.md invalid: {err}"
 
-    # Cross-file txn consistency gate — see post_bash._handle_activation
-    # for the rationale. resume must NOT attach to a task with an
-    # in-flight transaction (extra body files not yet committed); the
-    # operator needs to re-run the original writer to converge first.
-    # Pending-settle-only inconsistency is allowed: pipeline.py's
-    # replay branch is the convergence path.
+    # Cross-file consistency: plan.md / history.jsonl vs state.json's
+    # expected_*. Refuse to attach if the previous writer landed body
+    # bytes but state.json wasn't committed — operator re-runs the
+    # original writer first.
     from phase_machine import (
-        require_consistent_state as _require,
-        format_inconsistency_message as _fmt_inconsistency,
+        require_state_consistency as _require,
+        format_state_inconsistency as _fmt_inconsistency,
     )
     rep = _require(task_dir, on_inconsistent="report")
     if not rep["consistent"]:
-        if set(rep["extra"]) != {".pending_settle.json"}:
-            return False, _fmt_inconsistency(rep)
+        return False, _fmt_inconsistency(rep)
 
     return True, ""
 

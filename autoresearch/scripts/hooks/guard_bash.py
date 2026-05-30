@@ -25,10 +25,19 @@ from hooks.utils import read_hook_input, block_decision, block_with_guidance
 from phase_machine import (
     DIAGNOSE, DIAGNOSE_ATTEMPTS_CAP, EDIT, REPLAN, read_phase,
     get_task_dir, touch_heartbeat, check_bash, parse_script_names,
-    diagnose_state, parse_invoked_ar_script, pending_settle_path,
+    diagnose_state, parse_invoked_ar_script, load_state,
     is_single_foreground_ar_invocation,
     DIAGNOSE_NEED_DIAGNOSIS,
 )
+
+
+def _has_pending_settle(task_dir: str) -> bool:
+    """state.pending_settle is the new home of the kd_json sentinel
+    that used to live in .pending_settle.json. Used by guard_bash /
+    guard_edit to recognise the create_plan.py-in-EDIT recovery
+    branch."""
+    state = load_state(task_dir)
+    return bool(state and state.get("pending_settle"))
 from utils.settings import hallucinated_scripts
 
 # Real CLI scripts under autoresearch/scripts/. Anything not listed
@@ -150,7 +159,7 @@ def main():
     # grammar and pass naturally. The follow-up check_bash(REPLAN) is
     # defense-in-depth for the global subprocess-script bans.
     if phase == EDIT and invoked == "create_plan.py" \
-            and os.path.exists(pending_settle_path(task_dir)):
+            and _has_pending_settle(task_dir):
         ok, reason = is_single_foreground_ar_invocation(
             command, script="create_plan.py")
         if not ok:

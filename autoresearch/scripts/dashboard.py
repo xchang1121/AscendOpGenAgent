@@ -145,7 +145,12 @@ def render(task_dir, history_offset=0, history_window=None):
     history_offset: how many rounds to skip from the END (0 = latest).
     history_window: how many rounds to show (None = auto based on terminal height).
     """
-    progress = load_json(_pm.progress_path(task_dir))
+    # Progress fields now live in state.json (single per-task record).
+    # load_state returns the same dict the old progress.json carried,
+    # plus the new control fields (owner / phase / pending_settle).
+    # The dashboard only reads progress-related keys, so this swap is
+    # one-line.
+    progress = _pm.load_state(task_dir)
     history_all = load_jsonl(_pm.history_path(task_dir))
     plan_text, plan_mtime = load_plan(_pm.plan_path(task_dir))
 
@@ -165,7 +170,8 @@ def render(task_dir, history_offset=0, history_window=None):
     lines.append(f"{BOLD}{CYAN}╚══════════════════════════════════════════════════════════════╝{RESET}")
 
     if progress is None:
-        lines.append(f"\n  {RED}No progress.json found at {_pm.progress_path(task_dir)}{RESET}")
+        lines.append(f"\n  {RED}No state.json found at "
+                     f"{_pm.state_record_path(task_dir)}{RESET}")
         lines.append(f"  Run /autoresearch --ref ... --op-name ... first.")
         return "\n".join(lines)
 
