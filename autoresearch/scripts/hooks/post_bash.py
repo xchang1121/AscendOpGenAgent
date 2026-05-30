@@ -83,79 +83,63 @@ def _handle_activation(new_task_dir: str):
         emit_status(f"[AR] ERROR: task_dir not found: {new_task_dir}")
         return
 
-    # set_task_dir returns False when refusing to overwrite a
-    # heartbeat-fresh pointer (= another live Claude/batch session
-    # owns the active task). Without checking the return value, the
-    # transcript here would claim B is now activated while .active_task
-    # still points at A — guard_bash then evaluates phase against A
-    # while B's commands name B's task_dir, and the two sessions
-    # cross-write each other's state. Bail loudly.
-    if not set_task_dir(new_task_dir):
-        emit_status(
-            f"[AR] ERROR: refused to activate {new_task_dir} — another "
-            f"session is active on a different task (heartbeat fresh). "
-            f"Stop the other session, or rm autoresearch/.active_task to "
-            f"force takeover."
-        )
-        return
-    _clean_stale_edit_marker(new_task_dir)
-
-    # state.json is the single source of truth — its existence is
-    # the new "has progress / has phase" signal.
+    # state.json existence pre-check: it's the fresh-vs-resume
+    # discriminator below. open_task heals + checks; we need to know
+    # the pre-replay shape to decide which activation event to fire
+    # (on_activation_ready for fresh, on_activation_resume for resume).
     has_state = os.path.exists(state_record_path(new_task_dir))
 
-    pc = PhaseController(new_task_dir)
-    if has_state:
-        # Cross-file consistency gate. plan.md / history.jsonl ahead
-        # of state.expected_* means a writer landed body bytes but
-        # never committed state.json — every downstream computation
-        # would be based on inconsistent state. Refuse to advance,
-        # hand the operator the recovery message, exit.
-        from phase_machine import (
-            require_state_consistency as _require,
-            format_state_inconsistency as _fmt_inconsistency,
+    from task_handle import (
+        open_task as _open_task, Role as _Role,
+        TaskOwnershipError as _Ownership,
+        TaskConsistencyError as _Consistency,
+    )
+    try:
+        with _open_task(new_task_dir, role=_Role.AGENT) as t:
+            _clean_stale_edit_marker(new_task_dir)
+            if not has_state:
+                # Fresh-scaffolded task. Initial phase transition →
+                # BASELINE.
+                t.advance_on_activation_fresh()
+                emit_status(f"[AR] Fresh start. Phase -> BASELINE. "
+                            f"{get_guidance(new_task_dir)}")
+                return
+
+            phase = t.phase
+            # Stale-planning recovery: phase says PLAN or REPLAN but
+            # plan.md + progress show a validated plan with an active
+            # item — state left by a create_plan.py that finished
+            # disk writes but crashed before PostToolUse advanced to
+            # EDIT. Without recovery, the agent re-runs create_plan,
+            # bumps to vN+1, and loses the pending items of vN.
+            #
+            # DIAGNOSE deliberately NOT in this list: it has its own
+            # gate (diagnose_state.action requires the subagent's
+            # diagnose_v<N>.md artifact). compute_resume_phase
+            # doesn't model that gate — leave DIAGNOSE to the normal
+            # PostToolUse(Task) flow.
+            if phase in (PLAN, REPLAN):
+                recomputed = t.advance_on_activation_resume()
+                if recomputed != phase:
+                    emit_status(
+                        f"[AR] Phase file was {phase} but plan.md + "
+                        f"state show round-ready — advancing to "
+                        f"{recomputed} (create_plan.py likely "
+                        f"crashed before PostToolUse could advance).")
+                    phase = recomputed
+            emit_status(f"[AR] Resuming. Phase: {phase}.")
+            _print_resume_context(new_task_dir)
+            emit_status(get_guidance(new_task_dir))
+    except _Consistency as e:
+        # Replay couldn't heal — off-flow corruption. Surface the
+        # recovery message verbatim.
+        emit_status(f"[AR] {e}")
+    except _Ownership as e:
+        # Refused to claim: another live session owns the task.
+        emit_status(
+            f"[AR] ERROR: refused to activate {new_task_dir} — {e} "
+            f"Stop the other session before retrying."
         )
-        try:
-            rep = _require(new_task_dir, on_inconsistent="report")
-        except Exception:
-            rep = None
-        if rep is not None and not rep["consistent"]:
-            emit_status("[AR] " + _fmt_inconsistency(rep))
-            return
-        phase = read_phase(new_task_dir)
-        # Stale-planning recovery: phase file says PLAN or REPLAN but
-        # plan.md + progress.json show a validated plan with an active
-        # item. This is the state left by a create_plan.py that finished
-        # both disk writes but crashed before PostToolUse advanced
-        # .phase to EDIT. Without recovery, the agent re-runs
-        # create_plan, bumps to vN+1, and loses the pending items of vN.
-        #
-        # DIAGNOSE is deliberately NOT in this list: it has its own
-        # gate (diagnose_state.action requires the subagent's
-        # diagnose_v<N>.md artifact). compute_resume_phase doesn't
-        # model that gate — it would happily return EDIT for a DIAGNOSE
-        # task whose plan still carries the pre-DIAGNOSE active item,
-        # skipping the diagnosis the agent was about to do. Leave
-        # DIAGNOSE to the normal PostToolUse(Task) flow; if the
-        # operator's session died mid-DIAGNOSE the agent just continues
-        # the artifact loop on resume.
-        if phase in (PLAN, REPLAN):
-            recomputed = pc.on_activation_resume()
-            if recomputed != phase:
-                emit_status(
-                    f"[AR] Phase file was {phase} but plan.md + "
-                    f"progress.json show round-ready state — "
-                    f"advancing to {recomputed} (create_plan.py "
-                    f"likely crashed before PostToolUse could advance).")
-                phase = recomputed
-        emit_status(f"[AR] Resuming. Phase: {phase}.")
-        _print_resume_context(new_task_dir)
-        emit_status(get_guidance(new_task_dir))
-    else:
-        # No state.json yet → fresh-scaffolded task. Initial phase
-        # transition lands inside _fresh_start (which calls
-        # PhaseController.on_activation_ready).
-        _fresh_start(new_task_dir)
 
 
 def _fresh_start(task_dir: str):
@@ -244,10 +228,6 @@ def main():
         emit_todowrite_context(task_dir, f"[AR] Round settled. Phase -> {new_phase}.")
 
     elif invoked == "create_plan.py" and phase in (PLAN, DIAGNOSE, REPLAN, EDIT):
-        from phase_machine import (
-            validate_plan, load_state, save_state,
-            check_state_consistency,
-        )
         # PLAN/DIAGNOSE/REPLAN: normal plan-creation flow.
         # EDIT: only legal as a recovery path when settle kept failing
         # on a malformed plan.md (gated in hooks/guard_bash by
@@ -255,42 +235,47 @@ def main():
         # the broken plan_version, so the orphan kd_json is no longer
         # actionable; clear it as part of the post-create_plan
         # transition.
-        state = load_state(task_dir) or {}
-        pending = state.get("pending_settle")
-        if phase == EDIT and not pending:
-            # Defense-in-depth: guard_bash should have blocked this,
-            # but if it slipped through, refuse to advance state.
-            emit_status("[AR] create_plan.py in EDIT phase requires a "
-                        "pending settle recovery state; nothing to do.")
-            sys.exit(0)
-        ok, err = validate_plan(task_dir)
-        # Cross-file consistency: plan.md version vs
-        # state.expected_plan_version. create_plan.py is the only
-        # writer that should bump both; if they disagree, the
-        # operator should re-run create_plan with the same XML.
-        if ok:
-            rep = check_state_consistency(task_dir)
-            if not rep["consistent"]:
-                emit_status(
-                    f"[AR] state.json and plan.md/history.jsonl are "
-                    f"out of sync. Issues: {rep['issues']}. Re-run "
-                    f"create_plan.py with the same XML — both files "
-                    f"will reconverge.")
-                sys.exit(0)
-            _reset_failures_for_diagnose(task_dir, phase)
-            PhaseController(task_dir).on_plan_validated()
-            if phase == EDIT:
-                # Recovery completed: discard the orphan kd_json.
-                state = load_state(task_dir) or {}
-                state["pending_settle"] = None
-                save_state(task_dir, state)
-                emit_status(f"[AR] Pending settle abandoned; new plan "
-                            f"installed. Phase -> EDIT. {get_guidance(task_dir)}")
-            else:
-                emit_status(f"[AR] Plan validated. Phase -> EDIT. {get_guidance(task_dir)}")
-            emit_todowrite_context(task_dir, "[AR] Plan validated. Phase -> EDIT.")
-        else:
-            emit_status(f"[AR] Plan not valid yet: {err}")
+        from phase_machine import validate_plan
+        from task_handle import (
+            open_task as _open_task, Role as _Role,
+            TaskConsistencyError as _Consistency,
+            TaskOwnershipError as _Ownership,
+        )
+        try:
+            with _open_task(task_dir, role=_Role.AGENT) as t:
+                pending = t.pending_settle
+                if phase == EDIT and not pending:
+                    # Defense-in-depth: guard_bash should have blocked
+                    # this, but if it slipped through, refuse.
+                    emit_status("[AR] create_plan.py in EDIT phase "
+                                "requires a pending settle recovery "
+                                "state; nothing to do.")
+                    sys.exit(0)
+                ok, err = validate_plan(task_dir)
+                if not ok:
+                    emit_status(f"[AR] Plan not valid yet: {err}")
+                    sys.exit(0)
+                _reset_failures_for_diagnose(task_dir, phase)
+                t.advance_on_plan_validated()
+                if phase == EDIT:
+                    # Recovery completed: discard the orphan kd_json.
+                    t.clear_pending_settle()
+                    emit_status(f"[AR] Pending settle abandoned; new "
+                                f"plan installed. Phase -> EDIT. "
+                                f"{get_guidance(task_dir)}")
+                else:
+                    emit_status(f"[AR] Plan validated. Phase -> EDIT. "
+                                f"{get_guidance(task_dir)}")
+                emit_todowrite_context(
+                    task_dir, "[AR] Plan validated. Phase -> EDIT.")
+        except _Consistency as e:
+            emit_status(
+                f"[AR] state.json and plan.md/history.jsonl are out "
+                f"of sync: {e}. Re-run create_plan.py with the same "
+                f"XML — replay_intent at the next open_task will "
+                f"reconcile.")
+        except _Ownership as e:
+            emit_status(f"[AR] post_bash: cannot advance — {e}")
 
     sys.exit(0)
 

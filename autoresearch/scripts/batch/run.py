@@ -426,16 +426,38 @@ def run_one(batch_dir: Path, case: dict,
                             + ("; interrupted" if interrupted else ""))
         return 130 if interrupted else 2
     task_dir = td
-    phase = mf.read_phase(td)
 
+    # Post-op heal + read. The supervisor never owned this task —
+    # the claude --print process did, via post_bash activation. But a
+    # crash inside claude can leave an in-flight journal that this
+    # supervisor's `read_phase` / `read_task_state` would observe as
+    # stale fields. Open a Task as SUPERVISOR (heal + check, no
+    # claim) so the reads below see the post-replay state.
+    import sys as _sys
+    _scripts = str(Path(__file__).resolve().parent.parent)
+    if _scripts not in _sys.path:
+        _sys.path.insert(0, _scripts)
+    from task_handle import (open_task as _open_task,
+                              Role as _Role,
+                              TaskConsistencyError as _Consistency)
+    consistency_note = ""
+    try:
+        with _open_task(str(task_dir), role=_Role.SUPERVISOR):
+            pass  # __enter__ ran replay + check
+    except _Consistency as e:
+        consistency_note = f"; post-run heal refused: {e}"
+
+    phase = mf.read_phase(td)
     result = mf.read_task_state(task_dir)
     final_status = ("done" if phase == "FINISH" and not interrupted
-                    else "error")
+                    and not consistency_note else "error")
     note = ""
     if final_status == "error":
         note = f"phase={phase} rc={proc.returncode}"
         if interrupted:
             note += "; interrupted"
+        if consistency_note:
+            note += consistency_note
 
     mf.update_case(batch_dir, op,
                    status=final_status,

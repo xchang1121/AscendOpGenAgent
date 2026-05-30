@@ -1,103 +1,58 @@
 #!/usr/bin/env python3
-"""
-Resume an existing autoresearch task.
+"""Resume an existing autoresearch task.
 
 Usage:
-    python scripts/resume.py [task_dir]
+    python scripts/resume.py [task_dir] [--force]
 
-If task_dir is omitted, auto-detects the most recently active task.
-Validates state files. Prints the task_dir on success, exits with error if incompatible.
+If task_dir is omitted, auto-detects the most recently active task
+(prefers the current session's task via the session index).
+
+Opens a Task with role="agent" — heal + consistency check + claim
+ownership happen in one place. Refusal to claim a fresh-but-foreign
+task is the TaskOwnershipError path; --force takes over via Task's
+force flag. The journal handles the partial-baseline crash window
+(SEED row landed, state didn't commit progress_initialized=True)
+transparently: replay_intent inside open_task rebuilds state before
+this script reads anything.
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from phase_machine import (
-    load_progress, plan_path, edit_marker_path,
-    has_pending_items, find_active_task_dir,
-    is_task_active, task_summary,
+    plan_path, edit_marker_path, has_pending_items,
+    find_active_task_dir,
+)
+from task_handle import (
+    open_task, Role,
+    TaskOwnershipError, TaskConsistencyError, TaskNotInitialized,
 )
 
 
-def _validate(task_dir: str) -> tuple[bool, str]:
-    """Check task state is resumable. Returns (ok, error_message)."""
-    if not os.path.isdir(task_dir):
-        return False, f"Not a directory: {task_dir}"
-
-    # Required files
-    for rel in ("task.yaml",):
-        if not os.path.exists(os.path.join(task_dir, rel)):
-            return False, f"Missing required file: {rel}"
-
-    # Heal + check FIRST, before load_progress / plan validation.
-    # require_state_consistency runs replay_intent (auto_replay=True)
-    # at entry; this is the single recovery path through which a
-    # crash that left intent.json + bodies-without-state gets healed
-    # back into a readable state.json. If we read progress before
-    # this, a baseline crash window (SEED row written, progress_
-    # initialized still False) would fail us out at "No measured
-    # progress yet" — the user would be told to start fresh while the
-    # journal had everything needed to recover.
-    from phase_machine import (
-        require_state_consistency as _require,
-        format_state_inconsistency as _fmt_inconsistency,
-    )
-    rep = _require(task_dir, on_inconsistent="report")
-    if not rep["consistent"]:
-        return False, _fmt_inconsistency(rep)
-
-    progress = load_progress(task_dir)
-    if progress is None:
-        # State is consistent (replay either reconciled or had nothing
-        # to do) and baseline still hasn't committed → genuinely
-        # nothing to resume. Start fresh.
-        return False, ("No measured progress yet (state.json missing or "
-                       "baseline never committed). Run /autoresearch "
-                       "without --resume to start a fresh task.")
-
+def _validate_resumable(t) -> tuple[bool, str]:
+    """Post-open validation. open_task already did heal + consistency +
+    claim; here we only check resume-specific shape (progress
+    initialised, plan.md still valid if non-empty)."""
+    try:
+        progress = t.progress
+    except TaskNotInitialized:
+        return False, ("No measured progress yet (baseline never "
+                       "committed). Run /autoresearch without "
+                       "--resume to start a fresh task.")
     required_fields = {"task", "eval_rounds", "max_rounds"}
     missing = required_fields - set(progress.keys())
     if missing:
         return False, f"state.json progress fields missing: {missing}"
-
-    # Validate plan.md if present. A fully-consumed plan (0 pending) is legal —
-    # compute_resume_phase routes it to REPLAN. validate_plan would reject it
-    # for lacking an ACTIVE item, so only validate when pending items exist.
-    if os.path.exists(plan_path(task_dir)) and has_pending_items(task_dir):
+    # plan.md present + has pending items → must be structurally valid.
+    # A fully-consumed plan (0 pending) is legal (compute_resume_phase
+    # routes it to REPLAN). validate_plan rejects 0-pending plans for
+    # lack of an ACTIVE item, so only validate when items exist.
+    if os.path.exists(plan_path(t.task_dir)) and has_pending_items(t.task_dir):
         from phase_machine import validate_plan
-        ok, err = validate_plan(task_dir)
+        ok, err = validate_plan(t.task_dir)
         if not ok:
             return False, f"plan.md invalid: {err}"
-
     return True, ""
-
-
-def _check_active_lock(task_dir: str, force: bool) -> None:
-    """Refuse to attach when another Claude Code session is actively
-    driving this task. "Active" = owner is set AND state.last_touched
-    is within `heartbeat_fresh_seconds` — gated on is_task_active
-    rather than is_task_fresh so that a supervisor-released task
-    (owner cleared, but save_state bumped last_touched on the way out)
-    doesn't show up as "active" for the next heartbeat window."""
-    if not is_task_active(task_dir):
-        return
-    if force:
-        print(f"[resume] WARNING: Task is active (owner present, "
-              f"state.last_touched within the heartbeat window). "
-              f"Forcing takeover (--force).", file=sys.stderr)
-        return
-    summary = task_summary(task_dir) or {}
-    owner = summary.get("owner") or {}
-    print(f"[resume] ERROR: Task is currently active "
-          f"(owner.session_id={owner.get('session_id') or '<none>'}, "
-          f"last_touched={summary.get('last_touched')}).",
-          file=sys.stderr)
-    print(f"[resume] Another Claude Code session may be running it.",
-          file=sys.stderr)
-    print(f"[resume] If you're sure no other session is running, add --force:",
-          file=sys.stderr)
-    print(f"[resume]   /autoresearch --resume --force", file=sys.stderr)
-    sys.exit(1)
 
 
 def main():
@@ -109,44 +64,69 @@ def main():
     if task_dir:
         task_dir = os.path.abspath(task_dir)
     else:
+        # find_active_task_dir prefers current_session_task_dir
+        # (index-first), so external --output-dir tasks are visible.
         task_dir = find_active_task_dir() or ""
         if not task_dir:
-            print("[resume] ERROR: No existing task found in ar_tasks/", file=sys.stderr)
+            print("[resume] ERROR: No existing task found in ar_tasks/",
+                  file=sys.stderr)
             sys.exit(1)
 
-    ok, err = _validate(task_dir)
-    if not ok:
-        print(f"[resume] ERROR: Cannot resume {task_dir}", file=sys.stderr)
-        print(f"[resume] {err}", file=sys.stderr)
-        print("[resume] This task may be from an incompatible version. Start fresh.", file=sys.stderr)
+    if not os.path.isdir(task_dir):
+        print(f"[resume] ERROR: Not a directory: {task_dir}",
+              file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(os.path.join(task_dir, "task.yaml")):
+        print(f"[resume] ERROR: Missing task.yaml in {task_dir}",
+              file=sys.stderr)
         sys.exit(1)
 
-    _check_active_lock(task_dir, force)
+    try:
+        with open_task(task_dir, role=Role.AGENT, force=force) as t:
+            ok, err = _validate_resumable(t)
+            if not ok:
+                print(f"[resume] ERROR: Cannot resume {task_dir}",
+                      file=sys.stderr)
+                print(f"[resume] {err}", file=sys.stderr)
+                sys.exit(1)
 
-    # Clean stale edit marker (git clean means marker is stale)
-    marker = edit_marker_path(task_dir)
-    if os.path.exists(marker):
-        from utils.git_utils import is_working_tree_clean
-        if is_working_tree_clean(task_dir):
-            try:
-                os.remove(marker)
-                print("[resume] Cleaned stale edit marker.", file=sys.stderr)
-            except OSError:
-                pass
+            # Clean stale edit marker (git clean means marker is stale).
+            marker = edit_marker_path(task_dir)
+            if os.path.exists(marker):
+                from utils.git_utils import is_working_tree_clean
+                if is_working_tree_clean(task_dir):
+                    try:
+                        os.remove(marker)
+                        print("[resume] Cleaned stale edit marker.",
+                              file=sys.stderr)
+                    except OSError:
+                        pass
 
-    # task_summary is the only thing this script needs from the state
-    # store — it's the single shape callers should agree on after the
-    # state.json unification. Reaching into individual fields used to
-    # be the source of resume vs dashboard skew on schema changes.
-    summary = task_summary(task_dir) or {}
-    print(f"[resume] Task: {summary.get('task')}")
-    print(f"[resume] Round: {summary.get('eval_rounds')}/{summary.get('max_rounds')}")
-    print(f"[resume] Best: {summary.get('best_metric')} | "
-          f"Baseline: {summary.get('baseline_metric')}")
-    print(f"[resume] Phase: {summary.get('phase')}")
-
-    # Print task_dir on last line (for easy parsing)
-    print(task_dir)
+            # Status line from the summary facade. Bundled view so
+            # adding/renaming fields touches one place.
+            summary = t.summary or {}
+            print(f"[resume] Task: {summary.get('task')}")
+            print(f"[resume] Round: {summary.get('eval_rounds')}/"
+                  f"{summary.get('max_rounds')}")
+            print(f"[resume] Best: {summary.get('best_metric')} | "
+                  f"Baseline: {summary.get('baseline_metric')}")
+            print(f"[resume] Phase: {summary.get('phase')}")
+            # Print task_dir on last line (for easy parsing by callers)
+            print(task_dir)
+    except TaskConsistencyError as e:
+        print(f"[resume] ERROR: state inconsistent for {task_dir}",
+              file=sys.stderr)
+        print(f"[resume] {e}", file=sys.stderr)
+        sys.exit(1)
+    except TaskOwnershipError as e:
+        print(f"[resume] ERROR: {e}", file=sys.stderr)
+        print(f"[resume] Another Claude Code session may be running it.",
+              file=sys.stderr)
+        print(f"[resume] If you're sure no other session is running, "
+              f"add --force:", file=sys.stderr)
+        print(f"[resume]   /autoresearch --resume --force",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -987,6 +987,7 @@ def format_state_inconsistency(report: dict) -> str:
 
 _INTENT_KIND_ROUND = "round"
 _INTENT_KIND_BASELINE = "baseline"
+_INTENT_KIND_PLAN = "plan"
 
 
 def write_intent(task_dir: str, intent: dict) -> None:
@@ -1058,6 +1059,8 @@ def replay_intent(task_dir: str) -> Optional[dict]:
         return _replay_round_intent(task_dir, intent)
     if kind == _INTENT_KIND_BASELINE:
         return _replay_baseline_intent(task_dir, intent)
+    if kind == _INTENT_KIND_PLAN:
+        return _replay_plan_intent(task_dir, intent)
     print(f"[state_store] WARNING: intent.json has unknown kind "
           f"{kind!r}; leaving in place. Inspect "
           f"{intent_path(task_dir)} and rm if safe to discard.",
@@ -1153,6 +1156,49 @@ def _replay_baseline_intent(task_dir: str, intent: dict) -> dict:
     clear_intent(task_dir)
     return {"kind": "baseline", "action": "discarded",
             "detail": "no SEED row on disk; intent dropped"}
+
+
+def _replay_plan_intent(task_dir: str, intent: dict) -> dict:
+    """Plan intent payload:
+        {"kind":"plan", "version":N, "progress_fields":{...}}
+
+    create_plan writes plan.md (the body) first, then save_state with
+    expected_plan_version=N. The window: SIGKILL after ps.write,
+    before save_state, leaves plan.md at vN but state still at vN-1.
+    Three disk shapes:
+      (a) state already at vN: intent leftover; clear it.
+      (b) plan.md vN on disk, state at vN-1: rebuild state from the
+          intent so consistency gate passes and downstream readers
+          see the new plan_version + next_pid.
+      (c) plan.md not at vN (still vN-1 because ps.write never
+          flushed): discard the intent so the next create_plan starts
+          from a clean slate.
+    """
+    target_version = int(intent.get("version") or 0)
+    state = load_state(task_dir) or {}
+
+    if int(state.get("expected_plan_version") or 0) == target_version:
+        clear_intent(task_dir)
+        return {"kind": "plan", "action": "cleared",
+                "detail": f"state.expected_plan_version already {target_version}"}
+
+    plan_on_disk = _read_plan_version_from_disk(task_dir)
+    if plan_on_disk == target_version:
+        for k, v in (intent.get("progress_fields") or {}).items():
+            if k in _PROGRESS_FIELD_NAMES:
+                state[k] = v
+        state["expected_plan_version"] = target_version
+        save_state(task_dir, state)
+        clear_intent(task_dir)
+        return {"kind": "plan", "action": "rebuilt",
+                "detail": f"reconstructed plan_version + next_pid for "
+                          f"v{target_version} from journal"}
+
+    clear_intent(task_dir)
+    return {"kind": "plan", "action": "discarded",
+            "detail": f"plan.md on disk is at v{plan_on_disk} != "
+                      f"intent.version={target_version} "
+                      f"(body never landed)"}
 
 
 def require_state_consistency(task_dir: str,

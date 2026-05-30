@@ -21,16 +21,14 @@ sys.path.insert(0, SCRIPTS_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
 from task_config import load_task_config, run_eval
 from utils.failure_extractor import extract_failure_signals, format_for_stdout
-from workflow import run_baseline_init
-from workflow.baseline import (
-    precheck_baseline, BaselinePrecheckOutcome, baseline_exit_code,
+from task_handle import (
+    open_task, Role,
+    TaskCorrupted, TaskConsistencyError, TaskOwnershipError,
 )
-from workflow.transition import PhaseController
 
 
 def _eval_result_to_dict(result) -> dict:
-    """Match the dict shape `run_baseline_init` consumes (was the JSON
-    `eval_wrapper.py` used to print as its last stdout line)."""
+    """Match the dict shape `Task.record_baseline` consumes."""
     eval_data = {
         "outcome": result.outcome.value,
         "correctness": result.correctness,
@@ -57,82 +55,82 @@ def main():
     task_dir = os.path.abspath(args.task_dir)
     os.makedirs(os.path.join(task_dir, ".ar_state"), exist_ok=True)
 
-    config = load_task_config(task_dir)
-    if config is None:
+    # Validate task.yaml is loadable up front. open_task's heal+check
+    # gate doesn't read task.yaml, so we surface a missing config here
+    # before claiming ownership.
+    if load_task_config(task_dir) is None:
         print("[baseline] ERROR: task.yaml not found in task_dir",
               file=sys.stderr)
         sys.exit(1)
-
-    # Retry guard. The baseline transaction journals its intent before
-    # appending the SEED history row; replay_intent (run inside the
-    # precheck) heals a partial commit when intent.json is still on
-    # disk. After healing, the precheck refuses to re-run eval when
-    # the state is already initialised, and fails loud when a SEED row
-    # exists with no journal to reconstruct from — re-evaluating in
-    # that case would silently overwrite state.baseline_metric with a
-    # fresh measurement while the SEED row keeps the original (the
-    # exact divergence dashboards / report / consistency check can't
-    # detect because expected_history_round still matches).
-    pre = precheck_baseline(task_dir)
-    if pre.outcome == BaselinePrecheckOutcome.ALREADY_DONE:
-        # State and SEED row agree. Make sure the phase advanced — a
-        # crash right after save_state but before
-        # PhaseController.on_baseline_settled would leave phase=BASELINE
-        # forever. on_baseline_settled is idempotent.
-        PhaseController(task_dir).on_baseline_settled()
-        # Exit code must mirror what run_baseline_init would have
-        # returned for the COMMITTED outcome, not a flat 0. A retried
-        # baseline on a prior INFRA_FAIL commit (state was written but
-        # the process was killed before the rc landed) must still
-        # signal rc=4 — scaffold and batch supervisors key off rc==4
-        # to refuse activation, and a silent 0 here would advance them
-        # past a broken ref/env with no human in the loop.
-        rc = baseline_exit_code(task_dir)
-        print(f"[baseline] {pre.detail} (committed outcome → exit={rc})",
-              file=sys.stderr)
-        sys.exit(rc)
-    if pre.outcome == BaselinePrecheckOutcome.ORPHAN_SEED:
-        print(f"[baseline] FATAL: {pre.detail}", file=sys.stderr)
-        sys.exit(4)
 
     worker_urls = None
     if args.worker_url:
         worker_urls = [u.strip() for u in args.worker_url.split(",") if u.strip()]
 
-    print("[baseline] Running baseline eval...", flush=True)
+    # open_task heals (replay_intent) + consistency check + claims
+    # ownership. The retry guard (ALREADY_DONE / ORPHAN_SEED / PROCEED)
+    # lives inside Task.record_baseline; this keeps the precheck's
+    # "don't re-eval; map prior outcome to rc" path single-owner.
     try:
-        result = run_eval(task_dir, config,
-                          device_id=args.device_id,
-                          worker_urls=worker_urls)
-    except Exception as e:
-        # run_eval is expected to convert its own internal failures to
-        # EvalResult(INFRA_FAIL, ...); reaching this branch means it
-        # raised instead — log and exit 4 (the INFRA_FAIL exit code
-        # workflow.baseline._EXIT_FOR would have used).
-        print(f"[baseline] run_eval raised {type(e).__name__}: {e}",
-              file=sys.stderr)
+        with open_task(task_dir, role=Role.AGENT) as t:
+            # ALREADY_DONE returns the committed outcome's exit code
+            # without running eval; ORPHAN_SEED raises TaskCorrupted.
+            # PROCEED runs the eval + record_baseline transaction.
+            if t.progress_initialized:
+                # Idempotent fast-path — Task.record_baseline will
+                # also detect ALREADY_DONE, but checking here lets us
+                # skip run_eval entirely without re-loading state.
+                rc = t.record_baseline({})
+                print(f"[baseline] already committed; exit={rc}",
+                      file=sys.stderr)
+                sys.exit(rc)
+
+            print("[baseline] Running baseline eval...", flush=True)
+            try:
+                result = run_eval(task_dir, t.config,
+                                  device_id=args.device_id,
+                                  worker_urls=worker_urls)
+            except Exception as e:
+                # run_eval is expected to convert its own internal
+                # failures to EvalResult(INFRA_FAIL, ...); reaching
+                # this branch means it raised instead.
+                print(f"[baseline] run_eval raised "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+                sys.exit(4)
+
+            eval_data = _eval_result_to_dict(result)
+
+            # Pretty-print structured failure signals (UB overflow,
+            # aivec trap, OOM, correctness mismatch, ...) — mirrors
+            # pipeline.py so the seed-failure → PLAN flow surfaces
+            # the same actionable summary the EDIT loop does.
+            if not eval_data.get("correctness", False) or eval_data.get("error"):
+                if eval_data.get("error"):
+                    print(f"[baseline] Error: {eval_data['error']}",
+                          flush=True)
+                pretty = format_for_stdout(
+                    eval_data.get("failure_signals") or {})
+                if pretty:
+                    print(pretty, flush=True)
+                elif eval_data.get("raw_output_tail"):
+                    print("[baseline] Eval log tail (no structured "
+                          "signals matched):", flush=True)
+                    print(eval_data["raw_output_tail"], flush=True)
+
+            rc = t.record_baseline(eval_data)
+            sys.exit(rc)
+    except TaskCorrupted as e:
+        # ORPHAN_SEED is the main case here: history.jsonl carries a
+        # SEED row but state.progress_initialized is False AND no
+        # journal — would silently overwrite metrics if we re-evaluated.
+        print(f"[baseline] FATAL: {e}", file=sys.stderr)
         sys.exit(4)
-
-    eval_data = _eval_result_to_dict(result)
-
-    # Pretty-print structured failure signals (UB overflow, aivec trap,
-    # OOM, correctness mismatch, ...) — mirrors pipeline.py so the
-    # seed-failure → PLAN flow surfaces the same actionable summary the
-    # EDIT loop does.
-    if not eval_data.get("correctness", False) or eval_data.get("error"):
-        if eval_data.get("error"):
-            print(f"[baseline] Error: {eval_data['error']}", flush=True)
-        pretty = format_for_stdout(eval_data.get("failure_signals") or {})
-        if pretty:
-            print(pretty, flush=True)
-        elif eval_data.get("raw_output_tail"):
-            print("[baseline] Eval log tail (no structured signals matched):",
-                  flush=True)
-            print(eval_data["raw_output_tail"], flush=True)
-
-    # workflow.run_baseline_init owns progress.json / history.jsonl /
-    # phase writes; its int return becomes this script's exit code.
-    sys.exit(run_baseline_init(task_dir, eval_data))
+    except TaskConsistencyError as e:
+        print(f"[baseline] state inconsistent: {e}", file=sys.stderr)
+        sys.exit(4)
+    except TaskOwnershipError as e:
+        print(f"[baseline] cannot run: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

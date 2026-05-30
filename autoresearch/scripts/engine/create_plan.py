@@ -63,10 +63,10 @@ import sys
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from workflow import PlanStore
-from phase_machine import (
-    load_progress, load_state, save_state,
-    plan_path, state_record_path, PLAN_ITEMS_FILE,
+from phase_machine import PLAN_ITEMS_FILE
+from task_handle import (
+    open_task, Role,
+    TaskOwnershipError, TaskConsistencyError,
 )
 
 
@@ -274,54 +274,31 @@ def main():
     _validate_items(items)
     _check_diversity(items)
 
-    progress = load_progress(task_dir)
-    version = (progress.plan_version if progress else 0) + 1
-    ps = PlanStore(task_dir)
-    next_pid = ps.compute_next_pid(progress.next_pid if progress else None)
+    # Plan transaction is now journaled + committed atomically inside
+    # Task.commit_plan (intent → plan.md → state.json → clear). A
+    # SIGKILL between the body and the state write is healed by
+    # replay_intent at the next open_task; no manual recovery
+    # required. XML parsing / validation stays in this script — the
+    # diversity rules + XML schema enforcement are LLM-prompt-shaped
+    # and belong with the CLI entry, not the Task primitive.
+    try:
+        with open_task(task_dir, role=Role.AGENT) as t:
+            result = t.commit_plan(items)
+    except TaskConsistencyError as e:
+        _fail(f"state inconsistent on entry: {e}")
+        return
+    except TaskOwnershipError as e:
+        _fail(f"cannot run: {e}")
+        return
 
-    # Carry the existing Settled History table forward verbatim. Old
-    # pending items (still-unrun pids from the previous plan) are silently
-    # dropped: no fake DISCARD row, no history.jsonl entry. Their pids
-    # remain consumed (next_pid does not regress) so the audit chain is
-    # plan_version + history.jsonl absence — see module docstring.
-    settled_rows = ps.parse_settled_history()
-    dropped_pids = [it["id"] for it in ps.parse_pending()]
-
-    item_ids, new_next_pid = PlanStore.allocate_ids(len(items), next_pid)
-
-    # Build the report line FIRST, then commit state. Earlier the order
-    # was reversed and an unrelated NameError on the report line (a
-    # leftover `ppath` reference from the pre-PlanStore code) crashed
-    # the script after plan.md + progress.json had already been written
-    # - half-success state that hooks/post_bash happily advanced past.
-    report = json.dumps({
-        "ok": True,
-        "version": version,
-        "items": item_ids,
-        "active": item_ids[0],
-        "dropped": dropped_pids,
-        "path": ps.path,
-    })
-
-    # Plan transaction: write plan.md (the durable artifact) first,
-    # then atomic save_state with the matching expected_plan_version
-    # so check_state_consistency sees both at the same version. A
-    # SIGKILL between ps.write and save_state leaves plan.md ahead
-    # of state.expected_plan_version; check_state_consistency
-    # detects it, and the recovery path is to re-run create_plan.py
-    # with the same XML (idempotent: same input → same item_ids →
-    # same plan.md content).
-    ps.write(version, item_ids, items, settled_rows)
-    if progress is not None and os.path.exists(state_record_path(task_dir)):
-        new_progress = progress.apply(next_pid=new_next_pid,
-                                      plan_version=version)
-        state = load_state(task_dir) or {}
-        for k, v in new_progress.to_dict().items():
-            state[k] = v
-        state["expected_plan_version"] = version
-        save_state(task_dir, state)
-
-    print(report)
+    print(json.dumps({
+        "ok":      True,
+        "version": result["version"],
+        "items":   result["item_ids"],
+        "active":  result["active"],
+        "dropped": result["dropped"],
+        "path":    result["path"],
+    }))
 
 
 if __name__ == "__main__":
