@@ -1156,14 +1156,31 @@ def _replay_baseline_intent(task_dir: str, intent: dict) -> dict:
 
 
 def require_state_consistency(task_dir: str,
-                              *, on_inconsistent: str = "raise") -> dict:
-    """Cross-file consistency gate for activation hooks / resume. On
-    inconsistency:
+                              *, on_inconsistent: str = "raise",
+                              auto_replay: bool = True) -> dict:
+    """Single "I'm about to act on this task" gate for activation
+    hooks / resume / pipeline. Heals first, then checks.
+
+    Healing: replay_intent runs at entry by default. The journal owns
+    the "bodies-without-state" crash window — replay turns intent +
+    leftover artifacts into a consistent state.json (or discards an
+    orphan intent). Folding it here means every caller that asks
+    "is this task safe to act on" implicitly heals in-flight
+    transactions, instead of each caller remembering to call
+    replay_intent before this. Set auto_replay=False for read-only
+    callers (dashboards, debug tools) that must NOT touch disk.
+
+    On the post-replay inconsistency:
       - on_inconsistent="raise" (default): RuntimeError with the
         recovery message. Pipelines fail loud.
       - on_inconsistent="report": return the report; caller surfaces
         the message its own way.
     """
+    if auto_replay:
+        replay = replay_intent(task_dir)
+        if replay is not None:
+            print(f"[state_store] replay_intent {replay['action']}: "
+                  f"{replay['detail']}", file=sys.stderr)
     report = check_state_consistency(task_dir)
     if report["consistent"]:
         return report

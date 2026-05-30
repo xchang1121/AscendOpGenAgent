@@ -7,18 +7,102 @@ from __future__ import annotations
 
 import os
 import sys
+from enum import Enum
+from typing import NamedTuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from phase_machine import (  # noqa: E402
     Progress, append_history, load_progress, load_state, save_state,
-    history_path, write_intent, clear_intent,
+    history_path, write_intent, clear_intent, replay_intent,
 )
 from task_config import EvalOutcome, load_task_config  # noqa: E402
 from utils.git_utils import current_head_short  # noqa: E402
 
 from .progress_reducer import reduce_baseline_init
 from .transition import PhaseController
+
+
+# ---------------------------------------------------------------------------
+# Baseline retry precheck
+# ---------------------------------------------------------------------------
+# The baseline transaction owns the SEED history.jsonl row + the
+# progress fields in state.json. A crash between the SEED append and
+# the state save leaves an orphan SEED row that a retried baseline
+# would happily overwrite the state metrics for — without touching the
+# row itself, since _existing_seed_row() de-duplicates the append.
+# Result: SEED row carries the OLD eval's metrics, state carries the
+# NEW eval's metrics, and consistency check can't see the divergence
+# because expected_history_round=0 matches the orphan row.
+#
+# precheck_baseline runs at engine/baseline.py entry, BEFORE
+# run_eval, and decides whether to skip eval entirely (already
+# committed, or rebuilt from journal), refuse (orphan SEED with no
+# journal), or proceed. Skipping is what closes the
+# silently-divergent-metrics window — the second eval never runs
+# when the first one's row is already on disk.
+
+class BaselinePrecheckOutcome(Enum):
+    PROCEED      = "proceed"
+    ALREADY_DONE = "already_done"
+    ORPHAN_SEED  = "orphan_seed"
+
+
+class BaselinePrecheck(NamedTuple):
+    outcome: BaselinePrecheckOutcome
+    detail:  str
+
+
+def precheck_baseline(task_dir: str) -> BaselinePrecheck:
+    """Decide whether engine/baseline.py needs to run a fresh eval.
+
+    Always runs replay_intent first so any in-flight baseline
+    transaction is healed before we read state. After replay:
+
+      - state.progress_initialized AND a SEED row on disk →
+        ALREADY_DONE. Caller advances the phase (idempotent
+        on_baseline_settled) and exits 0 without re-evaluating.
+      - SEED row on disk but state.progress_initialized=False AND
+        no intent.json (replay had nothing to replay) → ORPHAN_SEED.
+        Caller fails loud — re-running eval here would overwrite
+        state.baseline_metric with a fresh measurement while the
+        SEED row still carries the original.
+      - Otherwise → PROCEED. No SEED row, normal first run; or replay
+        moved us forward and we still need to (re)initialize.
+    """
+    # Heal first. replay rebuilds state from journal when the SEED
+    # row landed but state didn't; discards the journal when the
+    # SEED row never landed; clears it when state already caught up.
+    replay = replay_intent(task_dir)
+    if replay is not None:
+        print(f"[baseline] replay_intent {replay['action']}: "
+              f"{replay['detail']}", file=sys.stderr)
+
+    state = load_state(task_dir) or {}
+    seed_on_disk = _existing_seed_row(task_dir)
+    progress_done = bool(state.get("progress_initialized"))
+
+    if progress_done and seed_on_disk:
+        return BaselinePrecheck(
+            BaselinePrecheckOutcome.ALREADY_DONE,
+            "baseline already committed (state.progress_initialized "
+            "and SEED row on disk); skipping re-eval.")
+
+    if seed_on_disk and not progress_done:
+        return BaselinePrecheck(
+            BaselinePrecheckOutcome.ORPHAN_SEED,
+            "history.jsonl carries a SEED row but state.progress_"
+            "initialized is False and no intent.json journal is "
+            "present. A retry that runs run_eval here would write the "
+            "new measurement into state.baseline_metric while the "
+            "orphan SEED row keeps the prior measurement, silently "
+            "divorcing dashboards/report from sticky baseline. "
+            "Recover by either (a) hand-setting state.baseline_metric "
+            "/ state.seed_metric / state.progress_initialized to "
+            "match the SEED row, or (b) deleting the SEED row from "
+            "history.jsonl to start fresh.")
+
+    return BaselinePrecheck(BaselinePrecheckOutcome.PROCEED, "")
 
 
 def _existing_seed_row(task_dir: str) -> bool:

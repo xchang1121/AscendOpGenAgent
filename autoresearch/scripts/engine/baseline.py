@@ -22,6 +22,10 @@ sys.path.insert(0, SCRIPT_DIR)
 from task_config import load_task_config, run_eval
 from utils.failure_extractor import extract_failure_signals, format_for_stdout
 from workflow import run_baseline_init
+from workflow.baseline import (
+    precheck_baseline, BaselinePrecheckOutcome,
+)
+from workflow.transition import PhaseController
 
 
 def _eval_result_to_dict(result) -> dict:
@@ -58,6 +62,29 @@ def main():
         print("[baseline] ERROR: task.yaml not found in task_dir",
               file=sys.stderr)
         sys.exit(1)
+
+    # Retry guard. The baseline transaction journals its intent before
+    # appending the SEED history row; replay_intent (run inside the
+    # precheck) heals a partial commit when intent.json is still on
+    # disk. After healing, the precheck refuses to re-run eval when
+    # the state is already initialised, and fails loud when a SEED row
+    # exists with no journal to reconstruct from — re-evaluating in
+    # that case would silently overwrite state.baseline_metric with a
+    # fresh measurement while the SEED row keeps the original (the
+    # exact divergence dashboards / report / consistency check can't
+    # detect because expected_history_round still matches).
+    pre = precheck_baseline(task_dir)
+    if pre.outcome == BaselinePrecheckOutcome.ALREADY_DONE:
+        # State and SEED row agree. Make sure the phase advanced — a
+        # crash right after save_state but before
+        # PhaseController.on_baseline_settled would leave phase=BASELINE
+        # forever. on_baseline_settled is idempotent.
+        PhaseController(task_dir).on_baseline_settled()
+        print(f"[baseline] {pre.detail}", file=sys.stderr)
+        sys.exit(0)
+    if pre.outcome == BaselinePrecheckOutcome.ORPHAN_SEED:
+        print(f"[baseline] FATAL: {pre.detail}", file=sys.stderr)
+        sys.exit(4)
 
     worker_urls = None
     if args.worker_url:
