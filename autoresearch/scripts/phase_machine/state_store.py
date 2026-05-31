@@ -639,28 +639,17 @@ def touch_heartbeat(task_dir: str):
 # state.json fields directly — leading to the regression class where
 # adding a field or changing semantics broke a different file's poke.
 
-def is_task_fresh(task_dir: str) -> bool:
-    """True iff state.last_touched is within heartbeat_fresh_seconds.
-    Pure time signal — does NOT require an owner. Use is_task_active
-    for "is somebody currently driving this", which is what resume /
-    batch supervisors usually want."""
-    state = load_state(task_dir)
-    if state is None:
-        return False
-    return _heartbeat_fresh(state)
-
-
 def is_task_active(task_dir: str) -> bool:
     """True iff someone currently OWNS the task AND has touched it
     recently. The conjunction matters:
 
       - clear_active_task / save_state bumps last_touched every time,
-        so is_task_fresh stays True for heartbeat_fresh_seconds after
+        so freshness stays True for heartbeat_fresh_seconds after
         the supervisor explicitly released the task — long enough
         for a batch restart to see "fresh, refuse takeover" and pin a
         no-owner task.
       - A crashed agent leaves state.owner non-None but stops bumping
-        last_touched; is_task_fresh goes False after the window and
+        last_touched; freshness goes False after the window and
         recovery callers can take over safely.
 
     Resume's "another session is running this" gate and batch's

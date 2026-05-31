@@ -41,7 +41,7 @@ from .state_store import (
     require_state_consistency,
     # Outward-facing facade — preferred over direct state.json reads in
     # batch / resume / dashboard / scaffold.
-    task_summary, is_task_fresh, is_task_active, task_owner_info,
+    task_summary, is_task_active, task_owner_info,
 )
 from .validators import (
     validate_plan,

@@ -107,8 +107,8 @@ from phase_machine import (  # noqa: E402
     BASELINE, EDIT, FINISH, PLAN, REPLAN, DIAGNOSE, INIT,
     # Reads
     load_state, load_progress, read_phase, task_summary,
-    is_task_active, is_task_fresh, task_owner_info,
-    get_active_item, has_pending_items, diagnose_state,
+    task_owner_info,
+    get_active_item, diagnose_state,
     # Writes / lifecycle
     save_state, write_phase, update_progress,
     set_task_dir, clear_active_task, touch_heartbeat,
@@ -265,9 +265,9 @@ class Task:
 
     @property
     def state(self) -> dict:
-        """Raw state.json dict (empty when missing). Prefer typed
-        accessors below; use .state only when you need a key these
-        don't expose."""
+        """Raw state.json dict (empty when missing). Internal helper for
+        the other accessors; external callers should prefer the typed
+        properties below."""
         return load_state(self.task_dir) or {}
 
     @property
@@ -308,14 +308,6 @@ class Task:
         return self.state.get("owner")
 
     @property
-    def is_fresh(self) -> bool:
-        return is_task_fresh(self.task_dir)
-
-    @property
-    def is_active(self) -> bool:
-        return is_task_active(self.task_dir)
-
-    @property
     def pending_settle(self) -> Optional[dict]:
         return self.state.get("pending_settle")
 
@@ -330,9 +322,6 @@ class Task:
 
     def active_plan_item(self) -> Optional[dict]:
         return get_active_item(self.task_dir)
-
-    def has_pending_plan_items(self) -> bool:
-        return has_pending_items(self.task_dir)
 
     def diagnose_state(self):
         """DiagnoseState NamedTuple (action / attempts / artifact_reason).
