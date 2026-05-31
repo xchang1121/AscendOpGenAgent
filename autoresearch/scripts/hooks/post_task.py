@@ -99,9 +99,9 @@ def main():
         sys.exit(0)
     # Mirror the other PostToolUse hooks — DIAGNOSE Task subagents can
     # run minutes longer than heartbeat_fresh_seconds. Without this
-    # touch, a concurrent resume.py looks at the stale .heartbeat and
-    # claims the task as orphaned, then both sessions write .active_task
-    # / .phase / progress.json in parallel.
+    # touch, a concurrent resume.py looks at the stale state.last_touched
+    # and claims the task as orphaned, then both sessions write state.json
+    # in parallel.
     touch_heartbeat(task_dir)
     if read_phase(task_dir) != DIAGNOSE:
         sys.exit(0)

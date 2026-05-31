@@ -101,7 +101,7 @@ def record_round(task_dir: str, eval_data: dict,
         if not ok:
             # Couldn't preserve kernel state. Earlier we still wrote
             # best_metric=<this round's value> and best_commit=None,
-            # which left progress.json pointing at a kernel that no
+            # which left state.json pointing at a kernel that no
             # commit captured - rollback / resume / report all became
             # unreliable. Demote to FAIL: roll the working tree back,
             # bump consecutive_failures, leave best_* untouched.

@@ -20,6 +20,7 @@ SCRIPTS_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, SCRIPTS_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
 from task_config import load_task_config, run_eval
+from task_config.metric_policy import EvalOutcome, EvalResult
 from utils.failure_extractor import extract_failure_signals, format_for_stdout
 from task_handle import (
     open_task, Role,
@@ -138,13 +139,20 @@ def _run_baseline(task_dir: str, t, args, worker_urls) -> int:
                           device_id=args.device_id,
                           worker_urls=worker_urls)
     except Exception as e:
-        # run_eval is expected to convert internal failures to
+        # run_eval normally converts internal failures to
         # EvalResult(INFRA_FAIL, ...); reaching here means it raised.
-        # Not Task-body failure per se (env / device issue) — return
-        # rc=4 so the agent session can retry baseline. Keep claim.
+        # Funnel the exception through the same path as a normal
+        # INFRA_FAIL so the ref-baseline gate inside run_baseline_init
+        # owns parking the task at BASELINE with no committed progress.
+        # Single owner of the baseline-pending invariant — no duplicate
+        # write_phase / clear_intent here.
         print(f"[baseline] run_eval raised "
               f"{type(e).__name__}: {e}", file=sys.stderr)
-        return 4
+        result = EvalResult(
+            outcome=EvalOutcome.INFRA_FAIL,
+            error=f"run_eval raised {type(e).__name__}: {e}",
+            error_source="infra",
+        )
 
     eval_data = _eval_result_to_dict(result)
 

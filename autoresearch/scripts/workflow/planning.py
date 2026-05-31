@@ -3,14 +3,14 @@
 Before this module, plan.md was touched from two scripts that didn't
 share code:
 
-  - create_plan.py  : parse XML input, validate, allocate pids, render
-                      a fresh plan.md preserving the Settled History
-                      table.
-  - settle.py       : find (ACTIVE) item, mark [x] with KEEP/DISCARD/
-                      FAIL tag, advance ACTIVE marker, append to the
-                      Settled History table.
+  - create_plan.py        : parse XML input, validate, allocate pids,
+                            render a fresh plan.md preserving the
+                            Settled History table.
+  - pipeline.py (settle)  : find (ACTIVE) item, mark [x] with KEEP/
+                            DISCARD/FAIL tag, advance ACTIVE marker,
+                            append to the Settled History table.
 
-Each file had its own line-walker. The render format and the parse
+Each owner had its own line-walker. The render format and the parse
 format had to agree by convention; any drift was a silent bug class.
 PlanStore puts both behind one type:
 

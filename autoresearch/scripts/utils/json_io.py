@@ -13,8 +13,8 @@ slip through, so the sanitiser is the canonical safety net.
 Every JSON write boundary that can carry profiler output goes
 through here:
 
-  - phase_machine.state_store: progress.json / history.jsonl
-  - engine.pipeline: settle CLI arg + .pending_settle.json
+  - phase_machine.state_store: state.json (single source of truth)
+                                + history.jsonl (append-only round log)
   - engine.eval_kernel: .eval_result*.json sidecar
   - utils.eval_runner: profile-block artifact JSONs
   - worker.server: /api/v1/run response (FastAPI 500 path)

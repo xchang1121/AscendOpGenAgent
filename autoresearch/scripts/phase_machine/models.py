@@ -1,4 +1,4 @@
-"""Authoritative schema for .ar_state/progress.json.
+"""Authoritative schema for the Progress view of state.json.
 
 Single dataclass owns the field set. Every writer constructs a complete
 `Progress` (or applies field deltas via `.apply(**fields)`) so that:
@@ -23,7 +23,7 @@ class Progress:
 
     # Round counters
     eval_rounds: int = 0
-    # max_rounds defaults HIGH (not 0) so a legacy progress.json missing
+    # max_rounds defaults HIGH (not 0) so a state.json missing
     # this field doesn't trip `eval_rounds >= max_rounds` -> FINISH on the
     # first lookup. Real writers (_baseline_init via workflow.baseline)
     # always set the actual config value; the default only fires for
@@ -135,7 +135,7 @@ class Progress:
         return cls(**kept)
 
 
-# Field names that older Progress versions wrote to progress.json and we
+# Field names that older Progress versions wrote and we
 # no longer carry on the dataclass. Drop them silently — surfacing them
 # every load only pollutes stderr for tasks created before the schema
 # change.

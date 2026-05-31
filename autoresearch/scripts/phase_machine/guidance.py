@@ -272,7 +272,7 @@ def _multi_shape_plan_note(progress: Optional[dict],
     just a loader; the actual shape list lives in the JSON.
 
     Returns "" for single-shape ops (progress.num_cases <= 1) and when
-    progress.json hasn't been written yet (pre-BASELINE).
+    progress isn't initialized yet (pre-BASELINE).
     """
     if not progress:
         return ""

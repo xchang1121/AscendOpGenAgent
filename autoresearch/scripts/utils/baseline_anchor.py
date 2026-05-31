@@ -41,9 +41,9 @@ def fingerprint_mismatch(stored: Any,
                          current: dict[str, int]) -> Optional[dict[str, Any]]:
     """Return changed keys, or None when sticky reuse is allowed.
 
-    Missing/empty fingerprints are tolerated for sticky override so legacy
-    progress.json files keep working. Callers that have a fresh ref can
-    still re-anchor and write a modern fingerprint.
+    Missing/empty fingerprints are tolerated for sticky override (a fresh
+    task carries no fingerprint until the first ref is measured). Callers
+    that have a fresh ref can still re-anchor and write a new fingerprint.
     """
     if not isinstance(stored, dict) or not stored:
         return None

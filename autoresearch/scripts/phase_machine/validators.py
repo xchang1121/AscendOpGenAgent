@@ -16,8 +16,8 @@ scaffold's `--run-baseline` (run_verify in eval_kernel.py tags
 
 Plan.md parsing (`parse_plan_text`, `get_plan_items`, `has_pending_items`,
 `get_active_item`, `is_settled_table_header`) is the single source of
-truth for plan-file structure; phase_policy, guidance, settle.py and
-create_plan.py all consume it from here.
+truth for plan-file structure; phase_policy, guidance, create_plan.py
+and pipeline.py's inlined settle step all consume it from here.
 """
 import os
 import re
@@ -105,9 +105,10 @@ _PLAN_TAG_RE = re.compile(r'^\[([^\]]*)\]:?\s*(.*)')
 def is_settled_table_header(line: str) -> bool:
     """True iff `line` is the Settled-History markdown table header.
 
-    Both create_plan.py and settle.py find the same row to either append a
-    new settled entry (settle) or carry forward existing rows (create_plan).
-    Centralising the predicate keeps the table format defined in one place.
+    Both create_plan.py and pipeline.py's inlined settle step find the
+    same row to either append a new settled entry (settle) or carry
+    forward existing rows (create_plan). Centralising the predicate
+    keeps the table format defined in one place.
     """
     s = line.strip()
     return s.startswith("|") and "Item" in s and "Outcome" in s

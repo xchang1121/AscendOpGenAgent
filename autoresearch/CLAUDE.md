@@ -53,15 +53,16 @@ filename in plan rationales.
 ## Invariants (hook-driven flow)
 
 1. **`.ar_state/plan.md` is the source of truth.** Only `create_plan.py`
-   and `settle.py` write it (both via `workflow.PlanStore`). Never
-   hand-edit. TodoWrite is a UI mirror, not a substitute.
+   and `pipeline.py`'s inlined settle step write it (both via
+   `workflow.PlanStore`). Never hand-edit. TodoWrite is a UI mirror,
+   not a substitute.
 2. **Plan IDs are globally monotonic.** `p1, p2, ...` from
-   `progress.json.next_pid`. Never reuse, never skip.
+   `state.next_pid`. Never reuse, never skip.
 3. **Every `pN` either settles (KEEP / DISCARD / FAIL in `history.jsonl`)
    or is silently dropped at a REPLAN/DIAGNOSE boundary** — pid counter
    still advances, no synthetic DISCARD row written.
 4. **Phase transitions are owned by `workflow.PhaseController`.** Never
-   write `.ar_state/.phase` manually. The hook (`hooks/post_bash.py`)
+   write `state.json` manually. The hook (`hooks/post_bash.py`)
    triggers the controller after activation and after `create_plan.py`
    validates; the engine scripts (`workflow.run_baseline_init` inside
    `engine/baseline.py`, `_post_settle` inside `engine/pipeline.py`)
@@ -82,8 +83,8 @@ filename in plan rationales.
 9. **AR scripts run as direct top-level Bash invocations only.**
    To *invoke* a blessed CLI the command must be a single foreground
    call: `python scripts/engine/<name>.py <task_dir>
-   [args...]` (pipeline, baseline, create_plan, quick_check, settle,
-   parse_args). The top-level lifecycle scripts use the flat path:
+   [args...]` (pipeline, baseline, create_plan, parse_args). The
+   top-level lifecycle scripts use the flat path:
    `python scripts/<name>.py` (scaffold, resume,
    dashboard). Env-var prefixes, Python flags, and FD redirection
    (`> log 2>&1`) are fine. Wrappers (`nohup`, `bash -lc`, `sh -c`,
@@ -93,10 +94,10 @@ filename in plan rationales.
    tool calls.
 
    *Reading* AR scripts (e.g. `cat scripts/engine/pipeline.py`,
-   `git diff -- scripts/engine/settle.py`) is allowed
-   because the classifier sees those heads as read-only and the args
-   don't execute. The Read tool is still preferred — it's the idiomatic
-   way to inspect file contents in Claude Code.
+   `git diff -- scripts/engine/baseline.py`) is allowed because the
+   classifier sees those heads as read-only and the args don't execute.
+   The Read tool is still preferred — it's the idiomatic way to inspect
+   file contents in Claude Code.
 10. **DIAGNOSE phase ends with a new plan.** Two paths to that end:
    - **Preferred (subagent route).** Call `Task(subagent_type='ar-diagnosis')`;
      the subagent's prompt asks it to Write a structured artifact at

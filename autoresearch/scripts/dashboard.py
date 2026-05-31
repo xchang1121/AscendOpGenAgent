@@ -145,7 +145,7 @@ def render(task_dir, history_offset=0, history_window=None):
     history_window: how many rounds to show (None = auto based on terminal height).
     """
     # Progress fields now live in state.json (single per-task record).
-    # load_state returns the same dict the old progress.json carried,
+    # load_state returns the Progress dict embedded in state.json,
     # plus the new control fields (owner / phase / pending_settle).
     # The dashboard only reads progress-related keys, so this swap is
     # one-line.
@@ -196,7 +196,7 @@ def render(task_dir, history_offset=0, history_window=None):
     # Was a hardcoded 20 that drifted from the rest of the framework
     # after e4aa13e + 71b968a moved max_rounds to single-source in
     # config.yaml. Tasks scaffolded after those commits pin the value in
-    # progress.json, so this fallback only fires on legacy progress.json
+    # state.json, so this fallback only fires on incomplete state
     # files lacking the field — defer to settings so a missing field
     # still displays a sane number consistent with what the scheduler
     # actually uses.

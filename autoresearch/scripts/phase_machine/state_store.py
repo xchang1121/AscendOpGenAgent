@@ -16,11 +16,6 @@ Files this module reads (artifacts written elsewhere):
   - <task_dir>/.ar_state/history.jsonl   append-only round records
   - <task_dir>/.ar_state/plan.md         agent-facing plan
   - <task_dir>/.ar_state/diagnose_v<N>.md / plan_items.xml / .edit_started
-
-No backwards-compat: callers that still reference the retired sidecars
-(.phase / progress.json / .pending_settle.json / .heartbeat / .txn /
-.active_task) get an ImportError on missing constants. Migrate to the
-state.json helpers.
 """
 import json
 import os
@@ -179,7 +174,7 @@ def diagnose_marker(plan_version: int) -> str:
 #                                         driving the task
 #   last_touched               ISO    bumped by touch_heartbeat / save_state
 #
-#   # Progress accounting (was progress.json; Progress dataclass fields)
+#   # Progress accounting (Progress dataclass fields)
 #   task, eval_rounds, max_rounds, consecutive_failures,
 #   best_metric, best_commit, baseline_metric, baseline_source,
 #   baseline_outcome, baseline_error_source, baseline_per_shape_us,
@@ -187,7 +182,7 @@ def diagnose_marker(plan_version: int) -> str:
 #   num_cases, per_shape_descs, diagnose_attempts,
 #   diagnose_attempts_for_version, last_diagnose_failure_reason
 #
-#   # Pending settle (was .pending_settle.json; None when no replay needed)
+#   # Pending settle (None when no replay needed)
 #   pending_settle             dict|None  kd_json from a round whose
 #                                         settle hasn't committed yet
 #
@@ -279,9 +274,9 @@ def _now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Ownership (was .active_task at repo level; now embedded in state.owner)
+# Ownership — embedded in state.owner
 # ---------------------------------------------------------------------------
-# .active_task is gone. "Which task is the current Claude session
+# "Which task is the current Claude session
 # driving?" is answered by scanning ar_tasks/ and matching state.json's
 # owner.session_id against the env's CLAUDE_CODE_SESSION_ID. Supervisors
 # (batch/run.py) have no Claude session and pass expected_task_dir to
@@ -734,7 +729,7 @@ def task_summary(task_dir: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Phase R/W (was .phase; now state.json.phase)
+# Phase R/W (state.json.phase field)
 # ---------------------------------------------------------------------------
 
 def read_phase(task_dir: str) -> str:
@@ -765,7 +760,7 @@ def write_phase(task_dir: str, phase: str):
 
 
 # ---------------------------------------------------------------------------
-# Progress R/W (was progress.json; now Progress fields embedded in state)
+# Progress R/W (Progress fields embedded in state)
 # ---------------------------------------------------------------------------
 
 def load_progress(task_dir: str) -> Optional[Progress]:

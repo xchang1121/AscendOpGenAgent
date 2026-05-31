@@ -101,18 +101,22 @@ _CANONICAL_AR_RE = re.compile(
 # regex-OK but pipeline.py lives at engine/pipeline.py, so the bash
 # would 404 and post_bash would still announce "Pipeline complete").
 # The classifier rejects the wrong location before that can happen.
+#
+# Invariant: this set MUST equal hooks/guard_bash._BLESSED_SCRIPTS.
+# guard_bash rejects un-blessed names before this map is consulted, so
+# any name here that isn't blessed is unreachable. Internal subprocesses
+# (e.g. pipeline.py → eval_kernel.py) don't go through the Bash tool
+# and therefore don't appear in this map.
 _CANONICAL_LOCATION = {
     # engine/ — AR scripts (subprocess pipeline) and parse_args lifecycle.
     "baseline.py":     "engine",
     "create_plan.py":  "engine",
-    "eval_kernel.py":  "engine",
     "parse_args.py":   "engine",
     "pipeline.py":     "engine",
-    "quick_check.py":  "engine",
-    "settle.py":       "engine",
-    # scripts/ root — LIFECYCLE scripts.
+    # scripts/ root — LIFECYCLE scripts. report.py is auto-invoked by
+    # pipeline.py at FINISH (not by the agent), so it's omitted here
+    # and from guard_bash._BLESSED_SCRIPTS for the same reason.
     "dashboard.py": "root",
-    "report.py":    "root",
     "resume.py":    "root",
     "scaffold.py":  "root",
 }
@@ -395,27 +399,11 @@ def is_single_foreground_ar_invocation(command: str, *, script: str) -> tuple:
 
 # === LAYER 2: PHASE TABLE ==============================================
 
-# Subprocess-only AR scripts: never user-callable. The check fires
-# only when classify() returns AR(name) with name in this set — i.e.,
-# someone tried `python scripts/<x>.py task` directly.
-# An earlier version did substring-banning on the raw command, but
-# that falsely blocked harmless mentions like `echo quick_check.py`
-# or `git diff -- autoresearch/scripts/engine/settle.py` (READONLY shapes
-# that mention the name in args, not invocations).
-_SUBPROCESS_ONLY_AR_SCRIPTS = {
-    "quick_check.py":  "subprocess-only (invoked by pipeline.py)",
-    # settle.py was removed: pipeline.py inlines its body (_run_settle)
-    # and the "manual replay" path is documented inside pipeline.py
-    # itself (re-run pipeline.py; the .pending_settle.json sentinel
-    # makes it skip quick_check/eval/record_round). The old standalone
-    # CLI was guarded out by this very table — keeping both was a
-    # contradiction the operator could not resolve.
-}
-
 # Per-phase: which AR script names may run.
 # LIFECYCLE scripts are always allowed (handled separately, not duplicated).
-# Subprocess-only scripts above are blocked everywhere.
-# EDIT-recovery (create_plan.py while .pending_settle.json exists) is
+# Subprocess-only scripts (in guard_bash._LIBRARY_NOT_CLI) are blocked
+# at the LNC layer before reaching here.
+# EDIT-recovery (create_plan.py while state.pending_settle is set) is
 # layered on top by hooks/guard_bash; this table reflects the normal path.
 _AR_ALLOWED_BY_PHASE = {
     INIT:     frozenset(),
@@ -439,9 +427,8 @@ _EDIT_RULES = {
 _CANONICAL_FORM_REJECTION = (
     "AR scripts must be invoked directly: "
     "`python scripts/engine/<name>.py <task_dir> [args...]` "
-    "for blessed CLIs (pipeline, baseline, create_plan, "
-    "quick_check, settle, parse_args), or "
-    "`python scripts/<name>.py` for top-level scripts "
+    "for blessed CLIs (pipeline, baseline, create_plan, parse_args), "
+    "or `python scripts/<name>.py` for top-level scripts "
     "(scaffold, resume, dashboard). "
     "Allowed alongside: env-var assignments, real Python flags "
     "(`-O`, `-u`, `-X dev`, ...), and FD redirection (`> log`, `2>&1`). "
@@ -486,9 +473,10 @@ def check_bash(phase: str, command: str) -> tuple:
         return True, ""
 
     if shape.klass == "AR":
-        if shape.name in _SUBPROCESS_ONLY_AR_SCRIPTS:
-            return False, (f"'{shape.name}' — "
-                           f"{_SUBPROCESS_ONLY_AR_SCRIPTS[shape.name]}")
+        # Subprocess-only AR scripts (quick_check.py, eval_kernel.py)
+        # are caught earlier by guard_bash._LIBRARY_NOT_CLI before
+        # reaching this layer — they never appear in BS so classify()
+        # wouldn't return AR(name) for them at all.
         allowed = _AR_ALLOWED_BY_PHASE.get(phase)
         if allowed is None:
             return False, f"unknown phase {phase!r}"
@@ -531,7 +519,7 @@ def check_edit(phase: str, rel_path: str, editable_files,
         which is PLAN / REPLAN / DIAGNOSE (gated on diagnose_action) and
         EDIT under pending-settle recovery. Caller hooks are expected to
         compute diagnose_action via `diagnose_state(...).action` and
-        pending_settle from `.pending_settle.json` existence.
+        pending_settle from state.json's `pending_settle` field.
       - .ar_state/diagnose_v<N>.md: the DIAGNOSE-phase artifact. The
         ar-diagnosis subagent is the intended writer (per the prompt
         contract), but hook payloads do NOT distinguish main agent from
@@ -563,8 +551,9 @@ def check_edit(phase: str, rel_path: str, editable_files,
                     f"writable. (current diagnose_action={diagnose_action!r})"
                 )
             if phase == EDIT and pending_settle:
-                # settle.py crashed mid-round; create_plan.py is allowed
-                # as recovery, so plan_items.xml input is too.
+                # pipeline.py's inlined settle step crashed mid-round;
+                # create_plan.py is allowed as recovery, so
+                # plan_items.xml input is too.
                 return True, ""
             return False, (
                 f".ar_state/{PLAN_ITEMS_FILE} is only writable when "
@@ -611,7 +600,7 @@ def compute_next_phase(task_dir: str) -> str:
     """
     progress = load_progress(task_dir)
     if not progress:
-        return FINISH  # error fallback: corrupt/missing progress.json
+        return FINISH  # error fallback: corrupt/missing state.json
 
     consecutive_failures = progress.get("consecutive_failures", 0)
     eval_rounds = progress.get("eval_rounds", 0)

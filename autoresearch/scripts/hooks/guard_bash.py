@@ -12,8 +12,8 @@ contract:
      subagent's diagnose_v<N>.md validates (or the attempts cap relaxes
      the gate).
   3. EDIT-recovery gate — create_plan.py is allowed in EDIT iff
-     `.pending_settle.json` exists, as the recovery path out of a
-     settle.py deadlock.
+     state.pending_settle is set, as the recovery path when pipeline.py's
+     inlined settle step keeps failing on a malformed plan.md.
   4. Turning check_bash's (False, reason) into the `{decision: block}`
      wire format Claude Code expects.
 """
@@ -32,52 +32,51 @@ from phase_machine import (
 
 
 def _has_pending_settle(task_dir: str) -> bool:
-    """state.pending_settle is the new home of the kd_json sentinel
-    that used to live in .pending_settle.json. Used by guard_bash /
-    guard_edit to recognise the create_plan.py-in-EDIT recovery
-    branch."""
+    """state.pending_settle carries the kd_json sentinel. Used by
+    guard_bash / guard_edit to recognise the create_plan.py-in-EDIT
+    recovery branch."""
     state = load_state(task_dir)
     return bool(state and state.get("pending_settle"))
 from utils.settings import hallucinated_scripts
 
-# Real CLI scripts under autoresearch/scripts/. Anything not listed
-# here (and not in _LIBRARY_NOT_CLI / hallucinated_scripts aliases) is
-# treated as an unknown script and rejected with a sorted list of
-# valid names.
+# Scripts the AGENT is allowed to invoke directly from Bash. report.py
+# is intentionally absent: it's auto-invoked by pipeline.py at FINISH,
+# not by the agent. eval_kernel.py is also absent: pipeline.py spawns
+# it as an internal subprocess (doesn't go through the Bash tool).
+# Anything not listed here (and not in _LIBRARY_NOT_CLI /
+# hallucinated_scripts aliases) is treated as an unknown script and
+# rejected with a sorted list of valid names. Must stay aligned with
+# phase_policy._CANONICAL_LOCATION (same set).
 _BLESSED_SCRIPTS = {
-    "quick_check.py",
     "scaffold.py", "baseline.py", "dashboard.py",
     "create_plan.py", "pipeline.py", "resume.py",
     "parse_args.py",
 }
 
-# Library modules under autoresearch/scripts/ that are not CLI-invocable.
-# Each entry maps the module name to a pointed message so the LLM gets a
-# specific nudge instead of the generic "unknown script" rejection.
+# Pointed rejections for scripts the agent SHOULDN'T invoke but might
+# try. The key must match what parse_script_names() extracts as the
+# basename (currently it only descends into `engine/` — so nested-
+# package modules like utils/X.py can't be keyed here and would just
+# get the generic "Unknown script" rejection; that's fine, they're
+# never hinted-at in any agent-facing doc).
 _LIBRARY_NOT_CLI = {
-    "phase_machine.py": (
-        "phase_machine.py is a library used by hooks, not a CLI. "
-        "Guidance ([AR Phase: ...]) is auto-emitted on stderr after every "
-        "legal Bash/Edit. If you haven't seen a fresh guidance message, "
-        "wait for the next hook output — do not try to fetch it manually."
-    ),
-    "task_config.py": "task_config.py is a library, not a CLI.",
-    "settings.py": "settings.py is a library, not a CLI.",
-    "hw_detect.py": "hw_detect.py is a library, not a CLI.",
-    "utils.py": "hooks/utils.py is a library, not a CLI.",
-    "failure_extractor.py": "failure_extractor.py is a library, not a CLI.",
-    "validate_triton_impl.py": (
-        "validate_triton_impl.py is a library used by quick_check.py "
-        "(also runnable directly as the skill `kernel-verifier`'s Step 0)."
-    ),
     "eval_kernel.py": (
         "eval_kernel.py is a subprocess child of utils.eval_runner.local_eval, "
         "not a CLI. Run `python scripts/engine/baseline.py "
         "<task_dir>` instead — it drives eval_kernel.py for you via "
         "task_config.run_eval."
     ),
-    "eval_runner.py": ("eval_runner.py is a library used by "
-                       "task_config.eval_client, not a CLI."),
+    "quick_check.py": (
+        "quick_check.py is a subprocess child of pipeline.py "
+        "(EDIT-phase smoke check), not a CLI. Run `python "
+        "scripts/engine/pipeline.py <task_dir>` after your edit — it "
+        "calls quick_check.py for you before running eval."
+    ),
+    "report.py": (
+        "report.py is auto-invoked by pipeline.py at FINISH; you don't "
+        "run it manually. The generated report lives at "
+        "<task_dir>/.ar_state/report.md after the FINISH-phase pipeline."
+    ),
 }
 
 # Alias → real script mapping lives in autoresearch/config.yaml under
@@ -146,12 +145,12 @@ def main():
                 f"relaxed and you may write the plan directly.)"
             )
 
-    # EDIT-phase recovery gate: when settle.py keeps failing on a malformed
-    # plan.md, the agent has no legal action under normal EDIT rules
-    # (kernel.py edits don't help; create_plan.py isn't in EDIT's
-    # allowlist). If `.pending_settle.json` exists, allow create_plan.py
-    # as a recovery path; hooks/post_bash clears the sidecar on successful
-    # create_plan validation.
+    # EDIT-phase recovery gate: when pipeline.py's inlined settle step
+    # keeps failing on a malformed plan.md, the agent has no legal action
+    # under normal EDIT rules (kernel.py edits don't help; create_plan.py
+    # isn't in EDIT's allowlist). If state.pending_settle is set, allow
+    # create_plan.py as a recovery path; hooks/post_bash clears the
+    # pending_settle field on successful create_plan validation.
     #
     # is_single_foreground_ar_invocation reuses the canonical-form regex
     # from phase_policy, so "single foreground call" stays defined in one
@@ -165,8 +164,8 @@ def main():
         if not ok:
             block_decision(
                 f"[AR] Recovery path requires a single foreground "
-                f"create_plan.py invocation while .pending_settle.json "
-                f"exists: {reason}. Re-issue without chaining; FD "
+                f"create_plan.py invocation while state.pending_settle "
+                f"is set: {reason}. Re-issue without chaining; FD "
                 f"redirects (`2>&1`, `> log.txt`) are fine."
             )
         ok, reason = check_bash(REPLAN, command)

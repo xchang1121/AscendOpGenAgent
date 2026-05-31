@@ -185,10 +185,8 @@ def recover_stale_running(progress: dict) -> int:
 
     Demoting all "running" indiscriminately means --retry-errored
     later re-launches a case that's still in flight, putting two
-    Claude processes on the same task and the same worker — the exact
-    silent double-run footgun the previous .heartbeat-sidecar check
-    was meant to prevent (and broke when .heartbeat retired into
-    state.json). Check before demoting:
+    Claude processes on the same task and the same worker — a silent
+    double-run footgun. Check before demoting:
       - if the case carries a `runner_pid` and that pid is alive,
         it's not orphaned — skip.
       - if the task_dir is_task_active (owner + fresh heartbeat in
@@ -196,9 +194,7 @@ def recover_stale_running(progress: dict) -> int:
       - otherwise the case is a real orphan; demote with a note.
     """
     # Route through the phase_machine facade so the "is this task
-    # still live" judgement has one owner. The previous direct read of
-    # <task_dir>/.ar_state/.heartbeat mtime broke silently when
-    # .heartbeat moved into state.json.last_touched.
+    # still live" judgement has one owner (reads state.last_touched).
     import sys as _sys
     _scripts = str(Path(__file__).resolve().parent.parent)
     if _scripts not in _sys.path:
@@ -299,15 +295,15 @@ def run_one(batch_dir: Path, case: dict,
     bound_task_dir: Path | None = None
 
     # Release the previous op's owner record before launching the
-    # next claude --print. The repo-level .active_task pointer is
-    # gone; ownership now lives in <task_dir>/.ar_state/state.json's
-    # owner field and the per-session index. Pass our just-finished
-    # task_dir as expected_task_dir so the ownership branch fires
-    # instead of the heartbeat-fresh defence (the previous op's last
-    # hook touched the heartbeat seconds ago and a heartbeat-only
-    # check would refuse every legitimate transition). First op of
-    # the run (prev_task_dir is None) falls through to the heartbeat
-    # defence, which protects against a manual Claude session
+    # next claude --print. Ownership lives in <task_dir>/.ar_state/
+    # state.json's owner field and the per-session index. Pass our
+    # just-finished task_dir as expected_task_dir so the ownership
+    # branch fires instead of the heartbeat-fresh defence (the
+    # previous op's last hook touched state.last_touched seconds ago
+    # and a heartbeat-only check would refuse every legitimate
+    # transition). First op of the run (prev_task_dir is None) falls
+    # through to the heartbeat defence, which protects against a
+    # manual Claude session
     # already running against this checkout.
     from phase_machine import clear_active_task
     if not clear_active_task(expected_task_dir=prev_task_dir):
@@ -670,7 +666,7 @@ def main() -> int:
         rc_final = 0
         # Carry the previous op's task_dir into the next iteration so
         # run_one can pass it as expected_task_dir to clear_active_task
-        # — the only signal we have that .active_task's current pointer
+        # — the only signal we have that the task's owner record
         # belongs to us (a batch op we ourselves drove) versus to an
         # unrelated concurrent session.
         prev_task_dir: Optional[str] = None

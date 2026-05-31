@@ -224,7 +224,7 @@ def main():
                                           get_guidance(task_dir)))
 
     elif invoked == "pipeline.py":
-        # pipeline.py writes .phase itself; just project state + notify.
+        # pipeline.py updates state.json phase itself; just project state + notify.
         new_phase = read_phase(task_dir)
         emit_status(f"[AR] Pipeline complete. Phase -> {new_phase}. {get_guidance(task_dir)}")
         emit_todowrite_context(task_dir, f"[AR] Round settled. Phase -> {new_phase}.")

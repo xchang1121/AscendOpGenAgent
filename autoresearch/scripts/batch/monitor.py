@@ -38,7 +38,7 @@ DASHBOARD_PY = mf.repo_root() / "scripts" / "dashboard.py"
 def task_state(task_dir: Path) -> dict:
     """Snapshot of one task for the monitor TUI. Goes through
     phase_machine.task_summary so the schema has one owner; the
-    monitor used to read .ar_state/progress.json and .heartbeat
+    monitor reads .ar_state/state.json
     directly and silently went blank on every field after both
     moved into state.json."""
     import sys as _sys
@@ -63,9 +63,8 @@ def task_state(task_dir: Path) -> dict:
     out["max_rounds"]  = summary.get("max_rounds") or 0
     out["consecutive_failures"] = summary.get("consecutive_failures") or 0
     out["plan_version"] = summary.get("plan_version") or 0
-    # task_summary exposes baseline_outcome (which used to live on
-    # progress.json as `status`); keep the old key name so render()
-    # doesn't have to know about the rename.
+    # Expose baseline_outcome as `status` so render() can stay agnostic
+    # of the underlying field name.
     if summary.get("baseline_outcome") is not None:
         out["status"] = summary.get("baseline_outcome")
     if summary.get("progress_initialized"):
@@ -283,7 +282,7 @@ def main() -> int:
             td = Path(args.task_dir).resolve()
         else:
             # Pull the running case's task_dir from THIS batch's
-            # progress.json — not the repo-wide active pointer, which
+            # state.json — not the repo-wide active pointer, which
             # could belong to a sibling batch or a manual session
             # sharing `ar_tasks/`.
             td = mf.find_running_case_task_dir(batch_dir)

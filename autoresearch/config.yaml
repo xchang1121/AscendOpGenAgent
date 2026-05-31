@@ -283,12 +283,12 @@ metrics:
 # ---------------------------------------------------------------------------
 # Resume heartbeat freshness window (scripts/resume.py).
 #
-# /autoresearch writes <task_dir>/.ar_state/.heartbeat on each tool call.
-# A task whose heartbeat mtime is FRESHER than this many seconds is
-# treated as still owned by another live session — resume refuses to
-# attach (which would race the live writer). Bump if a slow Edit round
-# can take longer than this; shrink to recover from killed sessions
-# faster.
+# /autoresearch bumps <task_dir>/.ar_state/state.json's `last_touched`
+# field on each tool call. A task whose last_touched is FRESHER than
+# this many seconds is treated as still owned by another live session
+# — resume refuses to attach (which would race the live writer). Bump
+# if a slow Edit round can take longer than this; shrink to recover
+# from killed sessions faster.
 #
 # Field reference:
 #   heartbeat_fresh_seconds  (int seconds)  freshness window described

@@ -391,7 +391,7 @@ def main():
         #   4 = task NOT activatable (INFRA_FAIL — operator must intervene)
         # Anything else here is an unexpected baseline crash.
         if rc == 4:
-            # progress.json is gone; baseline_error_source lives in
+            # baseline_error_source lives in
             # state.json via the task_summary facade. summary is None
             # only when baseline never wrote state at all (older crashes
             # before the first save_state), in which case err_source

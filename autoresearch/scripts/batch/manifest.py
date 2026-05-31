@@ -223,10 +223,10 @@ def _ensure_phase_machine_on_path() -> None:
 def read_task_state(task_dir: Path) -> dict:
     """Pull the result block from this task's state.json via the
     task_summary facade. Returns a dict with whichever fields could be
-    read; None for unknown values. progress.json is gone — every
-    Progress field now lives inside state.json gated by
-    `progress_initialized` (False before baseline.py has committed
-    anything), and the facade is the only place callers should reach in."""
+    read; None for unknown values. Every Progress field lives inside
+    state.json gated by `progress_initialized` (False before baseline.py
+    has committed anything), and the facade is the only place callers
+    should reach in."""
     out: dict = {
         "baseline_metric": None,
         "best_metric": None,
@@ -239,8 +239,8 @@ def read_task_state(task_dir: Path) -> dict:
     if summary is None:
         return out
     # progress_initialized=False means baseline never landed: leave the
-    # output Nones (matches old "missing progress.json" semantics) so
-    # run.py's batch_progress shows blanks rather than misleading 0s.
+    # output Nones so run.py's batch_progress shows blanks rather than
+    # misleading 0s.
     if not summary.get("progress_initialized"):
         return out
     out["baseline_metric"] = summary.get("baseline_metric")
@@ -254,8 +254,7 @@ def read_phase(task_dir: Path) -> str:
     """Return the task's current phase, or "UNKNOWN" when state.json
     is missing / corrupt (matches this module's historical contract;
     run.py and monitor treat UNKNOWN as "not done yet"). Goes through
-    phase_machine.read_phase so the state.json schema has a single
-    owner — the old `.ar_state/.phase` gate is gone."""
+    phase_machine.read_phase so the state.json schema has a single owner."""
     _ensure_phase_machine_on_path()
     from phase_machine import read_phase as _pm_read_phase, load_state, INIT
     # Distinguish "no state.json at all" (truly unknown) from "state
@@ -268,8 +267,7 @@ def read_phase(task_dir: Path) -> str:
         return "UNKNOWN"
     phase = _pm_read_phase(str(task_dir))
     # INIT after state.json exists means a task that was claimed but
-    # hasn't advanced — treat as UNKNOWN for run.py's done-check
-    # purposes (same as the old `.phase` missing case).
+    # hasn't advanced — treat as UNKNOWN for run.py's done-check.
     return "UNKNOWN" if phase == INIT else phase
 
 
@@ -398,10 +396,10 @@ def find_running_case_task_dir(batch_dir: Path) -> Path | None:
     on `claude --print` flushing the scaffold line to stdout and can lag
     by tens of minutes.
 
-    Primary source: `<autoresearch_root>/.active_task`, written by the
-    post_bash hook the instant Claude runs `export AR_TASK_DIR=...`.
-    Scoped to this batch by verifying the pointed dir's name matches
-    the running case's op (so a sibling batch / manual session sharing
+    Primary source: phase_machine.find_active_task_dir(), which scans
+    ar_tasks/ for the state.json owned by the current session. Scoped
+    to this batch by verifying the pointed dir's name matches the
+    running case's op (so a sibling batch / manual session sharing
     `ar_tasks/` can't bleed into this view)."""
     progress = load_progress(batch_dir)
     if not progress:
@@ -415,8 +413,7 @@ def find_running_case_task_dir(batch_dir: Path) -> Path | None:
 
     # phase_machine.find_active_task_dir scans ar_tasks/ for state.json
     # owned by the current session (or, failing that, the most-recently
-    # touched). Repo-level .active_task is gone; ownership lives in
-    # each task's state.json.owner field.
+    # touched).
     import sys as _sys, os as _os
     _scripts = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
     if _scripts not in _sys.path:

@@ -6,12 +6,10 @@ Dependency direction (top depends on lower):
             → state_store
 
 Public surface centers on a single per-task state record
-(<task_dir>/.ar_state/state.json). The retired sidecars
-(.phase / progress.json / .pending_settle.json / .heartbeat / .txn /
-autoresearch/.active_task) are gone — every piece of control state
-lives in state.json, atomic write of state.json IS the transaction
-commit, and cross-file consistency with the two durable artifacts
-(plan.md, history.jsonl) is checked via state.expected_* fields.
+(<task_dir>/.ar_state/state.json). Every piece of control state lives
+in state.json, atomic write of state.json IS the transaction commit,
+and cross-file consistency with the two durable artifacts (plan.md,
+history.jsonl) is checked via state.expected_* fields.
 """
 # fmt: off
 from .models import Progress
@@ -33,7 +31,7 @@ from .state_store import (
     # Typed views over state.json
     read_phase, write_phase,
     load_progress, save_progress, append_history, update_progress,
-    # Ownership (was repo-level .active_task; now per-task owner field)
+    # Ownership (per-task owner field in state.json)
     get_task_dir, set_task_dir, clear_active_task, touch_heartbeat,
     find_active_task_dir, current_session_task_dir,
     # Per-op task_dir pointer (scaffold -> batch.run.py handoff)
@@ -42,9 +40,7 @@ from .state_store import (
     check_state_consistency, format_state_inconsistency,
     require_state_consistency,
     # Outward-facing facade — preferred over direct state.json reads in
-    # batch / resume / dashboard / scaffold (those used to poke
-    # progress.json / .heartbeat / .phase directly and skew on schema
-    # changes).
+    # batch / resume / dashboard / scaffold.
     task_summary, is_task_fresh, is_task_active, task_owner_info,
 )
 from .validators import (

@@ -23,11 +23,11 @@ follow the latest `[AR Phase: ...]` message and never stop between phases.
   Ascend NPU id(s) for eval; arch is auto-derived from the picked card
   via `npu-smi`.
 
-  `--worker-url` routes eval to a remote HTTP worker instead of running
-  it locally (orchestrator on dev box, NPU on the worker side). Start
-  the worker via `python scripts/ar_cli.py worker --remote-host <alias>
-  --start ...` first; that command also opens the local `ssh -L` tunnel
-  so `127.0.0.1:<port>` transparently reaches the remote daemon.
+  `--worker-url` routes eval to a remote HTTP worker. The worker must
+  already be running and reachable at that URL when eval starts. If it
+  isn't, stop with an actionable error — do NOT try to start, restart,
+  or repair the worker from inside the agent loop. Worker lifecycle is
+  the operator's concern, not yours.
 
   Convention: source files live in `workspace/<op_name>_ref.py` and
   `workspace/<op_name>_kernel.py`.
@@ -38,7 +38,7 @@ follow the latest `[AR Phase: ...]` message and never stop between phases.
 
 | flags | initial phase |
 |-------|---------------|
-| `--ref X.py --kernel Y.py` | `BASELINE` runs first; on PASS → `PLAN`; on FAIL → also `PLAN` (first plan items rewrite the seed) |
+| `--ref X.py --kernel Y.py` | `BASELINE` runs first; OK / KERNEL_FAIL (ref measured) → `PLAN`; INFRA_FAIL / no valid ref → task parks at `BASELINE` with no committed progress, fix env/ref and re-run |
 
 ## Step 1 — Parse `$ARGUMENTS`
 
@@ -68,10 +68,16 @@ missing, dispatch via `mode: "ask"`.
 - **`resume`** / **`scaffold`** — run `command` verbatim. Last line of
   stdout is the resolved task_dir. Non-zero exit → stop and report.
 
-Scaffold's `--run-baseline` runs the seed and writes `.phase = PLAN`
-on success — the next activation drops straight into PLAN. If the seed
-fails, `.phase` is also set to PLAN and the first plan items rewrite
-the kernel.
+Scaffold's `--run-baseline` runs the seed eval at scaffold time. The
+outcome decides the next activation's starting phase (all written to
+`state.json`, single source of truth):
+
+- **OK / KERNEL_FAIL** (ref baseline measured) → phase = `PLAN`; the
+  next activation drops into PLAN. KERNEL_FAIL means the first plan
+  items must rewrite the broken seed.
+- **INFRA_FAIL / no valid ref baseline** → phase stays at `BASELINE`
+  with no committed progress (baseline pending). Fix env / ref /
+  worker, then `/autoresearch --resume <task_dir>` re-runs baseline.
 
 ## Step 3 — Activate
 
@@ -108,6 +114,6 @@ Follow the phase guidance. Never stop between phases.
 - Keep going between phases.
 - Hooks block wrong actions and tell you what to do next — read their
   messages.
-- Never hand-edit `plan.md` or `.ar_state/.phase`; always go through
+- Never hand-edit `plan.md` or `.ar_state/state.json`; always go through
   the scripts.
 - Never invent flag values not produced by `parse_args.py`.
