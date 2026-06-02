@@ -17,11 +17,17 @@ __pycache__/
 *.pyc
 *.egg-info/
 
-# --- AutoResearch (claude-autoresearch framework) runtime state ---
+# --- AutoResearch runtime state (under autoresearch/) ---
 ar_tasks/
 .ar_state/.heartbeat
 .ar_state/.edit_started
-.autoresearch/.active_task
+autoresearch/.task_dir_pointers
+autoresearch/.session_tasks/
+autoresearch/.claude/settings.local.json
+autoresearch/.claude/scheduled_tasks.lock
+/autoresearch/workspace
+workspace/
+
+# Outer .claude/ (used by triton-coder / ascendc setup mv chains)
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
-workspace/
